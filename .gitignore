@@ -1,0 +1,59 @@
+# Node.js / Next.js
+node_modules/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+
+# Java / Gradle / Maven
+.gradle/
+build/
+target/
+*.class
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+application-local.properties
+application-local.yml
+application-local.yaml
+application-secrets.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Local database files and backups; keep schema, migration, and seed SQL
+.local/
+postgres-data/
+mongo-data/
+mongodb-data/
+**/[Dd]atabase/data/
+**/[Dd]atabase/backups/
+*.dump
+*.backup
+
+# Logs and deployment caches
+logs/
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.vercel/
+.railway/
+
+# Personal editor and operating system files
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
