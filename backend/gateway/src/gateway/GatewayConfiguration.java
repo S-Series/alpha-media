@@ -66,6 +66,8 @@ public class GatewayConfiguration {
                 .disableAutomaticRetries()
                 // Service의 리다이렉트를 대신 따라가지 않고 호출자에게 그대로 돌려준다.
                 .disableRedirectHandling()
+                // 프록시는 압축 본문과 Content-Encoding을 함께 그대로 전달해야 한다.
+                .disableContentCompression()
                 // 여러 사용자가 같은 HTTP 클라이언트를 쓰므로 Gateway 내부에 쿠키를 저장하지 않는다.
                 .disableCookieManagement()
                 .build();
