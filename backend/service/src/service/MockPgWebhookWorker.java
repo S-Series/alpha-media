@@ -21,9 +21,11 @@ public class MockPgWebhookWorker {
     private final PaymentSettings settings;
     private final ObjectMapper mapper;
     private final HttpClient http;
+    private final WebhookSecurity signatures;
 
-    public MockPgWebhookWorker(JdbcTemplate jdbc, PaymentSettings settings, ObjectMapper mapper) {
+    public MockPgWebhookWorker(JdbcTemplate jdbc, PaymentSettings settings, ObjectMapper mapper, WebhookSecurity signatures) {
         this.jdbc = jdbc; this.settings = settings; this.mapper = mapper;
+        this.signatures=signatures;
         http = HttpClient.newBuilder().connectTimeout(Duration.ofMillis(settings.httpTimeoutMs()))
                 .followRedirects(HttpClient.Redirect.NEVER).build();
     }
@@ -44,14 +46,16 @@ public class MockPgWebhookWorker {
         if (claimed.isEmpty()) return;
         PgResult result = claimed.getFirst();
         boolean delivered = false;
+        long retryAfter=0;
         try {
             byte[] body = mapper.writeValueAsBytes(result);
             var request = HttpRequest.newBuilder(URI.create(settings.webhookUrl()))
                     .timeout(Duration.ofMillis(settings.httpTimeoutMs()))
                     .header("Content-Type", "application/json")
-                    .header("X-Signature", PgSignature.sign(body, settings.webhookSecret()))
+                    .headers(signatures.headers("PG",body))
                     .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
-            int status = http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode();
+            var response=http.send(request, HttpResponse.BodyHandlers.discarding());
+            int status=response.statusCode(); retryAfter=WebhookRetry.delay(response);
             delivered = status >= 200 && status < 300;
         } catch (InterruptedException exception) { Thread.currentThread().interrupt(); }
         catch (Exception exception) { /* 영속 작업에 실패를 남겨 제한된 횟수만 다시 보낸다. */ }
@@ -65,9 +69,9 @@ public class MockPgWebhookWorker {
             jdbc.update("""
                     UPDATE mock_pg_payments SET webhook_failures=webhook_failures+1,
                         webhook_next_at=CASE WHEN webhook_failures+1 >= 6 THEN NULL ELSE clock_timestamp()
-                            + (LEAST(30000, ? * POWER(2,webhook_failures)) * INTERVAL '1 millisecond') END,
+                            + (GREATEST(?,LEAST(30000, ? * POWER(2,webhook_failures))) * INTERVAL '1 millisecond') END,
                         webhook_lease_token=NULL WHERE payment_id=? AND webhook_lease_token=?
-                    """, settings.retryBaseMs(), result.paymentId(), token);
+                    """, retryAfter, settings.retryBaseMs(), result.paymentId(), token);
         }
     }
 

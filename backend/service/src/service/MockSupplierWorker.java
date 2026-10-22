@@ -21,8 +21,10 @@ public class MockSupplierWorker {
     private final ObjectMapper mapper;
     private final HttpClient http;
     private final MockProfileService profiles;
-    public MockSupplierWorker(JdbcTemplate jdbc, IssuanceSettings settings, ObjectMapper mapper,MockProfileService profiles) {
+    private final WebhookSecurity signatures;
+    public MockSupplierWorker(JdbcTemplate jdbc, IssuanceSettings settings, ObjectMapper mapper,MockProfileService profiles,WebhookSecurity signatures) {
         this.jdbc = jdbc; this.settings = settings; this.mapper = mapper; this.profiles=profiles;
+        this.signatures=signatures;
         http = HttpClient.newBuilder().connectTimeout(Duration.ofMillis(settings.httpTimeoutMs())).followRedirects(HttpClient.Redirect.NEVER).build();
     }
     @Scheduled(fixedDelayString = "${issuance.worker-delay-ms}", initialDelayString = "${issuance.worker-delay-ms}")
@@ -47,12 +49,14 @@ public class MockSupplierWorker {
         if (claimed.isEmpty()) return;
         var result = claimed.getFirst();
         boolean delivered = false;
+        long retryAfter=0;
         try {
             byte[] body = mapper.writeValueAsBytes(result);
             var request = HttpRequest.newBuilder(URI.create(settings.webhookUrl())).timeout(Duration.ofMillis(settings.httpTimeoutMs()))
-                .header("Content-Type", "application/json").header("X-Signature", PgSignature.sign(body, settings.webhookSecret()))
+                .header("Content-Type", "application/json").headers(signatures.headers("SUPPLIER",body))
                 .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
-            int status = http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode();
+            var response=http.send(request, HttpResponse.BodyHandlers.discarding());
+            int status=response.statusCode(); retryAfter=WebhookRetry.delay(response);
             delivered = status >= 200 && status < 300;
         } catch (InterruptedException exception) { Thread.currentThread().interrupt(); }
         catch (Exception exception) { /* 전송 실패는 원장에 남겨 제한된 횟수만 재시도한다. */ }
@@ -66,9 +70,9 @@ public class MockSupplierWorker {
             jdbc.update("""
                 UPDATE mock_supplier_orders SET callback_failures=callback_failures+1,
                     callback_next_at=CASE WHEN callback_failures+1<6 THEN clock_timestamp()
-                        +(LEAST(30000,? * POWER(2,callback_failures)) * INTERVAL '1 millisecond') END,
+                        +(GREATEST(?,LEAST(30000,? * POWER(2,callback_failures))) * INTERVAL '1 millisecond') END,
                     callback_lease_token=NULL WHERE request_id=? AND callback_lease_token=?
-                """, settings.pollMs(), result.requestId(), token);
+                """, retryAfter, settings.pollMs(), result.requestId(), token);
         }
     }
     @PreDestroy void close() { http.shutdownNow(); }

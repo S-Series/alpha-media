@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHmac, pbkdf2Sync, randomBytes, randomInt, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { createServer as createHttpServer } from "node:http";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { once } from "node:events";
 import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
@@ -119,7 +119,7 @@ function startService(extra = {}) {
     PAYMENT_WORKER_DELAY_MS: "100", WEBHOOK_WORKER_DELAY_MS: "50", WEBHOOK_LEASE_MS: "3000",
     WEBHOOK_RETRY_BASE_MS: "100", WEBHOOK_INBOX_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
     RECOVERY_WORKER_DELAY_MS: "100", RECOVERY_LEASE_MS: "1200", RECOVERY_RETRY_BASE_MS: "100",
-    MONITORING_ENABLED: "false", MONITORING_INTERVAL_MS: "500",
+    MONITORING_ENABLED: "false", MONITORING_INTERVAL_MS: "500", REQUEST_RATE_LIMIT_ENABLED: "false",
     RECONCILIATION_SCHEDULE_ENABLED: "false", RECONCILIATION_WORKER_DELAY_MS: "100",
     RECONCILIATION_LEASE_MS: "3000", RECONCILIATION_RETRY_BASE_MS: "100",
     ...accountHashes, ...extra });
@@ -378,11 +378,17 @@ async function pg(path, body, key = randomUUID()) {
   });
 }
 
+function signedHeaders(body, source = "PG", valid = true, overrides = {}) {
+  const keyId = overrides.keyId || source.toLowerCase() + "-v1";
+  const timestamp = String(overrides.timestamp ?? Math.floor(Date.now() / 1000));
+  return { "Content-Type": "application/json", "X-Key-Id": keyId, "X-Signature-Timestamp": timestamp,
+    "X-Signature": valid ? createHmac("sha256", overrides.secret || secret)
+      .update(`v1\n${source}\n${keyId}\n${timestamp}\n`).update(body).digest("hex") : "0".repeat(64) };
+}
 async function notify(result, signature = true) {
   const body = JSON.stringify(result);
   return fetch(base + "/webhooks/pg", { method: "POST", body,
-    headers: { "Content-Type": "application/json", "X-Signature": signature
-      ? createHmac("sha256", secret).update(body).digest("hex") : "0".repeat(64) } });
+    headers: signedHeaders(body,"PG",signature) });
 }
 
 function inboundRow(id) {
@@ -513,7 +519,7 @@ test("webhook inbox persists one encrypted receipt for twenty concurrent deliver
     assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
     const body = JSON.stringify(Object.fromEntries(Object.entries(result).reverse()), null, 2);
     const formatted = await fetch(base + "/webhooks/pg", { method: "POST", body,
-      headers: { "Content-Type": "application/json", "X-Signature": createHmac("sha256", secret).update(body).digest("hex") } });
+      headers: signedHeaders(body) });
     assert.equal(formatted.status, 200); assert.equal((await formatted.json()).id, receipt.id);
     assert.equal(inboundRow(receipt.id).body, before.body); assert.equal(inboundRow(receipt.id).receive_count, 21);
     sql(`UPDATE inbound_events SET body='tampered'::bytea WHERE id='${receipt.id}'`, true, true);
@@ -1008,8 +1014,7 @@ async function supplier(path, body) {
 async function supplierNotify(result, valid = true) {
   const body = JSON.stringify(result);
   return fetch(base + "/webhooks/supplier", { method: "POST", body,
-    headers: { "Content-Type": "application/json", "X-Signature": valid
-      ? createHmac("sha256", secret).update(body).digest("hex") : "0".repeat(64) } });
+    headers: signedHeaders(body,"SUPPLIER",valid) });
 }
 
 function issuanceRow(orderId) {
@@ -1661,7 +1666,7 @@ async function trackingChange(profile, body, key = randomUUID(), client = alice)
 async function profileNotify(signal, valid = true) {
   const body = JSON.stringify(signal);
   return fetch(base + "/webhooks/supplier/profiles", { method: "POST", body,
-    headers: { "Content-Type": "application/json", "X-Signature": valid ? createHmac("sha256", secret).update(body).digest("hex") : "0".repeat(64) } });
+    headers: signedHeaders(body,"SUPPLIER",valid) });
 }
 const installedChange = { state: "INSTALLED", activatedAt: null, callbackCopies: 1, callbackDelayMs: 0 };
 
@@ -3561,4 +3566,268 @@ test("monitoring heartbeat storage failure cannot prevent business processing or
     assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
     assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
   } finally { sql("GRANT UPDATE(last_seen_at) ON worker_heartbeats TO alpha_media_app"); await restart(); }
+});
+
+function securityPayload(source="PG") {
+  const shared={eventId:randomUUID(),orderId:randomUUID()};
+  if (source==="PG") return {...shared,paymentId:randomUUID(),amount:15900,currency:"KRW",status:"APPROVED",transactionId:"test-"+randomUUID(),declineCode:null};
+  if (source==="SUPPLIER") return {...shared,requestId:randomUUID(),supplierOrderNo:"test-"+randomUUID(),status:"FAILED",revision:2,iccid:null,activationCode:null,reason:"MOCK_ISSUANCE_FAILED"};
+  return {...shared,requestId:randomUUID(),iccid:"0".repeat(19),state:"RELEASED",revision:1,observedAt:"2020-01-01T00:00:00Z",installedAt:null,activatedAt:null};
+}
+const securityPath=source=>source==="PG"?"/webhooks/pg":source==="SUPPLIER"?"/webhooks/supplier":"/webhooks/supplier/profiles";
+async function securityPost(source,payload,overrides={},headers={}) {
+  const body=typeof payload==="string"?payload:JSON.stringify(payload);
+  return fetch(base+securityPath(source),{method:"POST",body,headers:{...signedHeaders(body,source==="PG"?"PG":"SUPPLIER",true,overrides),...headers}});
+}
+async function freshRateWindow() {
+  const seconds=Number(sql("SELECT EXTRACT(SECOND FROM clock_timestamp())::int"));
+  if (seconds>45) await delay((61-seconds)*1000);
+  sql("TRUNCATE request_rate_buckets");
+}
+async function stopChild(child) {
+  if (child && child.exitCode===null && child.signalCode===null) { const exited=once(child,"exit"); child.kill(); await exited; }
+}
+function rawChunked(url,body,headers={}) {
+  return new Promise((resolve,reject)=>{
+    const request=httpRequest(url,{method:"POST",headers:{"Content-Type":"application/json",...headers}},response=>{
+      let data=""; response.on("data",part=>data+=part); response.on("end",()=>resolve({status:response.statusCode,body:data}));
+    });
+    request.on("error",reject); request.write(body.slice(0,8000)); request.end(body.slice(8000));
+  });
+}
+test("request security bounds declared and chunked bodies before Gateway and Service parsing while form login survives",{timeout:60000},async()=>{
+  const large=" ".repeat(16385),exact=" ".repeat(16384);
+  for (const origin of [base,"http://127.0.0.1:"+servicePort]) {
+    for (const path of ["/api/auth/login","/api/orders","/webhooks/pg","/webhooks/supplier/profiles"]) {
+      const response=await fetch(origin+path,{method:"POST",body:large,headers:{"Content-Type":"application/json"}});
+      assert.equal(response.status,413); assert.equal((await response.json()).code,"BODY_TOO_LARGE");
+      assert.equal((await rawChunked(origin+path,large)).status,413);
+    }
+    const bounded=await fetch(origin+"/webhooks/pg",{method:"POST",body:exact,headers:{"X-Gateway-Token":secret,...signedHeaders(exact)}});
+    assert.equal(bounded.status,400);
+    assert.equal((await fetch(origin+"/webhooks/pg",{method:"POST",body:"{}",headers:{"Content-Encoding":"gzip"}})).status,415);
+  }
+  const c=new Client(),form=new URLSearchParams({username:"customer1",password}).toString();
+  const response=await c.request("/api/auth/login",{method:"POST",headers:{...await c.csrf(),"Content-Type":"application/x-www-form-urlencoded"},
+    body:form+"&pad="+"x".repeat(16384-form.length-5)});
+  assert.equal(response.status,200);
+});
+test("request security shares thirty member writes across two instances and retains the budget after restart",{timeout:120000},async()=>{
+  const config={REQUEST_RATE_LIMIT_ENABLED:"true"};
+  await restart(config); let second;
+  try {
+    const otherPort=await port();
+    second=await startService({...config,PORT:String(otherPort),MOCK_PG_ENABLED:"false",MOCK_SUPPLIER_ENABLED:"false"});
+    const key=randomUUID(),headers={...await alice.csrf(),"Idempotency-Key":key,"Content-Type":"application/json"};
+    const cookie=[...alice.cookies].map(([k,v])=>k+"="+v).join("; ");
+    const body=JSON.stringify({planId:"jp-esim-7d",travelStartDate:future});
+    await freshRateWindow();
+    const replies=await Promise.all(Array.from({length:40},(_,index)=>fetch(
+      index%2?base+"/api/orders":"http://127.0.0.1:"+otherPort+"/api/orders",{
+        method:"POST",body,headers:{...headers,Cookie:cookie,"X-Gateway-Token":secret,"X-Gateway-Client-IP":"127.0.0.1"}
+      })));
+    assert.equal(replies.filter(r=>r.status===201).length,1);
+    assert.equal(replies.filter(r=>r.status===200).length,29);
+    assert.equal(replies.filter(r=>r.status===429).length,10);
+    for (const r of replies.filter(r=>r.status===429)) assert.ok(Number(r.headers.get("Retry-After"))>=1 && Number(r.headers.get("Retry-After"))<=60);
+    const window=sql("SELECT max(window_start) FROM request_rate_buckets WHERE scope='WRITE_MEMBER'");
+    await stopChild(second); await restart(config);
+    assert.equal(sql("SELECT max(window_start) FROM request_rate_buckets WHERE scope='WRITE_MEMBER'"),window);
+    assert.equal((await alice.request("/api/orders",{method:"POST",headers:{...await alice.csrf(),"Idempotency-Key":key},body:JSON.parse(body)})).status,429);
+    assert.equal((await bob.create()).status,201);
+    assert.equal(sql("SELECT max(hits) FROM request_rate_buckets WHERE scope='WRITE_MEMBER'"),"31");
+    sql("UPDATE request_rate_buckets SET window_start=window_start-INTERVAL '1 minute'");
+    assert.equal((await alice.request("/api/orders",{method:"POST",headers:{...await alice.csrf(),"Idempotency-Key":key},body:JSON.parse(body)})).status,200);
+  } finally { await stopChild(second); await restart(); }
+});
+test("request security login enforces five attempts per account and thirty per IP despite spoofed forwarding headers",{timeout:120000},async()=>{
+  await restart({REQUEST_RATE_LIMIT_ENABLED:"true"});
+  try {
+    const c=new Client(),csrf=await c.csrf();
+    const login=(username,index=0)=>c.request("/api/auth/login",{method:"POST",
+      headers:{...csrf,"Content-Type":"application/x-www-form-urlencoded","X-Forwarded-For":"198.51.100."+index,"Forwarded":"for=198.51.100."+index,
+        "X-Gateway-Client-IP":"198.51.100."+index},
+      body:new URLSearchParams({username,password:"incorrect"}).toString()});
+    await freshRateWindow();
+    for(let i=0;i<5;i++) assert.equal((await login("customer1",i)).status,401);
+    assert.equal((await login("customer1",6)).status,429);
+    assert.equal((await login("customer2",7)).status,401);
+    assert.equal(sql("SELECT count(*) FROM request_rate_buckets WHERE scope='LOGIN_IP'"),"1");
+    sql("TRUNCATE request_rate_buckets");
+    for(let i=0;i<30;i++) assert.equal((await login("unknown-"+i,i)).status,401);
+    assert.equal((await login("fresh-account",31)).status,429);
+    assert.equal(sql("SELECT count(*) FROM request_rate_buckets WHERE scope='LOGIN_ACCOUNT'"),"30");
+    assert.equal(sql("SELECT count(*) FROM request_rate_buckets WHERE subject_hash LIKE '%customer%'"),"0");
+  } finally { await restart(); }
+});
+test("request security read webhook and write budgets are separate and IP limits cover shared accounts",{timeout:90000},async()=>{
+  await restart({REQUEST_RATE_LIMIT_ENABLED:"true",REQUEST_READ_IP_LIMIT:"3",REQUEST_WEBHOOK_IP_LIMIT:"2",REQUEST_WRITE_IP_LIMIT:"2"});
+  try {
+    const a=await alice.csrf(),b=await bob.csrf(); await freshRateWindow();
+    for(let i=0;i<3;i++) assert.equal((await fetch(base+"/api/plans")).status,200);
+    const read=await fetch(base+"/api/plans",{headers:{"X-Gateway-Client-IP":"10.0.0.1"}});
+    assert.equal(read.status,429); assert.ok(read.headers.get("Retry-After"));
+    assert.equal((await fetch("http://127.0.0.1:"+servicePort+"/health")).status,200);
+    for (const [client,csrf] of [[alice,a],[bob,b]]) assert.equal((await client.request("/api/orders",{method:"POST",
+      headers:{...csrf,"Idempotency-Key":randomUUID()},body:{planId:"jp-esim-7d",travelStartDate:future}})).status,201);
+    assert.equal((await alice.request("/api/orders",{method:"POST",headers:{...a,"Idempotency-Key":randomUUID()},body:{}})).status,429);
+    for(let i=0;i<2;i++) assert.equal((await securityPost("PG",securityPayload())).status,202);
+    assert.equal((await securityPost("PG",securityPayload())).status,429);
+  } finally { await restart(); }
+});
+test("request security limiter DB failure refuses business execution and the same request key succeeds after repair",{timeout:60000},async()=>{
+  await restart({REQUEST_RATE_LIMIT_ENABLED:"true"});
+  const key=randomUUID(),headers={...await alice.csrf(),"Idempotency-Key":key};
+  const body={planId:"jp-esim-7d",travelStartDate:future},before=sql("SELECT count(*) FROM orders");
+  try {
+    sql("REVOKE INSERT ON request_rate_buckets FROM alpha_media_app");
+    const response=await alice.request("/api/orders",{method:"POST",headers,body});
+    assert.equal(response.status,503); assert.equal((await response.json()).code,"REQUEST_GUARD_UNAVAILABLE");
+    assert.equal(sql("SELECT count(*) FROM orders"),before);
+    sql("GRANT INSERT ON request_rate_buckets TO alpha_media_app");
+    assert.equal((await alice.request("/api/orders",{method:"POST",headers,body})).status,201);
+    assert.equal((await alice.request("/api/orders",{method:"POST",headers,body})).status,200);
+  } finally { sql("GRANT INSERT ON request_rate_buckets TO alpha_media_app"); await restart(); }
+});
+test("request security webhook signature binds bytes key ID provider and timestamp without creating inbox or business evidence",async()=>{
+  const payload=securityPayload(),body=JSON.stringify(payload),valid=signedHeaders(body),before=sql("SELECT count(*) FROM inbound_events");
+  for(const headers of [
+    {...valid,"X-Signature":"0".repeat(64)},{...valid,"X-Key-Id":"unknown"},{...valid,"X-Signature-Timestamp":"bad"},
+    signedHeaders(body,"PG",true,{timestamp:Math.floor(Date.now()/1000)-301}),
+    signedHeaders(body,"PG",true,{timestamp:Math.floor(Date.now()/1000)+7}),
+    signedHeaders(body,"SUPPLIER"),{...valid,"X-Key-Id":valid["X-Key-Id"]+", "+valid["X-Key-Id"]},
+    {"Content-Type":"application/json","X-Signature":createHmac("sha256",secret).update(body).digest("hex")}
+  ]) assert.equal((await fetch(base+"/webhooks/pg",{method:"POST",body,headers})).status,401);
+  assert.equal((await fetch(base+"/webhooks/pg",{method:"POST",body:body+" ",headers:valid})).status,401);
+  assert.equal(sql("SELECT count(*) FROM inbound_events"),before);
+  assert.ok(Number(sql("SELECT sum(hits) FROM request_security_counts WHERE source='PG'"))>=9);
+  const accepted=await securityPost("PG",payload); assert.equal(accepted.status,202);
+  const receipt=await accepted.json();
+  const replay=await securityPost("PG",JSON.stringify(Object.fromEntries(Object.entries(payload).reverse()),null,2));
+  assert.equal(replay.status,200); assert.equal((await replay.json()).id,receipt.id);
+});
+test("request security rotates PG and supplier keys with overlap expiry and deduplicated signed receipts across restart",{timeout:90000},async()=>{
+  const rotated=randomBytes(32).toString("hex"),futureUntil=new Date(Date.now()+3600000).toISOString();
+  const config={PG_WEBHOOK_SECRET:rotated,PG_WEBHOOK_KEY_ID:"pg-v2",PG_WEBHOOK_PREVIOUS_KEY_ID:"pg-v1",
+    PG_WEBHOOK_PREVIOUS_SECRET:secret,PG_WEBHOOK_PREVIOUS_VALID_UNTIL:futureUntil,
+    SUPPLIER_WEBHOOK_SECRET:rotated,SUPPLIER_WEBHOOK_KEY_ID:"supplier-v2",SUPPLIER_WEBHOOK_PREVIOUS_KEY_ID:"supplier-v1",
+    SUPPLIER_WEBHOOK_PREVIOUS_SECRET:secret,SUPPLIER_WEBHOOK_PREVIOUS_VALID_UNTIL:futureUntil,WEBHOOK_WORKER_DELAY_MS:"60000"};
+  await restart(config);
+  try {
+    for(const source of ["PG","SUPPLIER","PROFILE"]) {
+      const payload=securityPayload(source),old=await securityPost(source,payload);
+      assert.equal(old.status,202); const receipt=await old.json();
+      const current=await securityPost(source,payload,{keyId:source==="PG"?"pg-v2":"supplier-v2",secret:rotated});
+      assert.equal(current.status,200); assert.equal((await current.json()).id,receipt.id);
+      assert.equal(sql("SELECT count(*) FROM inbound_verifications WHERE inbound_id='"+receipt.id+"'"),"2");
+      sql("UPDATE inbound_verifications SET signed_at=clock_timestamp() WHERE inbound_id='"+receipt.id+"'",true,true);
+    }
+    await restart({...config,PG_WEBHOOK_PREVIOUS_VALID_UNTIL:"2020-01-01T00:00:00Z",SUPPLIER_WEBHOOK_PREVIOUS_VALID_UNTIL:"2020-01-01T00:00:00Z"});
+    for(const source of ["PG","SUPPLIER","PROFILE"]) {
+      const payload=securityPayload(source);
+      assert.equal((await securityPost(source,payload)).status,401);
+      assert.equal((await securityPost(source,payload,{keyId:source==="PG"?"pg-v2":"supplier-v2",secret:rotated})).status,202);
+    }
+    const settings=await admin.request("/api/admin/request-security"); assert.equal(settings.status,200);
+    const text=await settings.text(); assert.ok(!text.includes(rotated) && !text.includes(secret) && !text.includes("fingerprint"));
+    const contract=JSON.parse(text);
+    assert.deepEqual(contract.requests.limits,{LOGIN_IP:30,LOGIN_ACCOUNT:5,WRITE_IP:300,WRITE_MEMBER:30,READ_IP:600,READ_MEMBER:300,WEBHOOK_IP:600,WEBHOOK_SOURCE:3000});
+    assert.ok(contract.requests.history.length>0);
+    sql("UPDATE request_guard_history SET enabled=false",true,true);
+    assert.equal((await alice.request("/api/admin/request-security")).status,403);
+    assert.equal((await new Client().request("/api/admin/request-security")).status,401);
+    assert.ok(Number(sql("SELECT count(*) FROM webhook_key_history WHERE valid_until='2020-01-01T00:00:00Z'"))>=2);
+  } finally { await restart(); }
+});
+test("request security signature evidence and inbox roll back together after DB error and survive restart",{timeout:60000},async()=>{
+  const payload=securityPayload();
+  try {
+    sql("REVOKE INSERT ON inbound_verifications FROM alpha_media_app");
+    assert.ok((await securityPost("PG",payload)).status>=500);
+    assert.equal(sql("SELECT count(*) FROM inbound_events WHERE event_id='"+payload.eventId+"'"),"0");
+    await restart();
+    assert.ok((await securityPost("PG",payload)).status>=500);
+    sql("GRANT INSERT ON inbound_verifications TO alpha_media_app");
+    const response=await securityPost("PG",payload); assert.equal(response.status,202); const receipt=await response.json();
+    await restart();
+    assert.equal((await securityPost("PG",payload)).status,200);
+    assert.equal(sql("SELECT count(*) FROM inbound_verifications WHERE inbound_id='"+receipt.id+"'"),"1");
+    sql("DELETE FROM inbound_verifications WHERE inbound_id='"+receipt.id+"'",true,true);
+  } finally { sql("GRANT INSERT ON inbound_verifications TO alpha_media_app"); await restart(); }
+});
+test("request security mock PG delivery honors Retry-After and retries with fresh signed headers",{timeout:60000},async()=>{
+  const calls=[];
+  const server=createHttpServer((request,response)=>{
+    let body=""; request.on("data",chunk=>body+=chunk); request.on("end",()=>{
+      calls.push({at:Date.now(),headers:request.headers,body});
+      response.writeHead(calls.length===1?429:200,{"Retry-After":"2"}); response.end("{}");
+    });
+  });
+  server.listen(0,"127.0.0.1"); await once(server,"listening");
+  try {
+    await restart({PG_WEBHOOK_URL:"http://127.0.0.1:"+server.address().port+"/webhooks/pg"});
+    const order=await newOrder(),attempt=await(await alice.pay(order.id,randomUUID(),"APPROVE",{webhookCopies:1})).json();
+    await until(()=>calls.length>=2);
+    assert.ok(calls[1].at-calls[0].at>=1900);
+    assert.equal(calls[0].body,calls[1].body);
+    assert.notEqual(calls[0].headers["x-signature-timestamp"],calls[1].headers["x-signature-timestamp"]);
+    await until(()=>sql("SELECT webhook_sent FROM mock_pg_payments WHERE payment_id='"+attempt.id+"'")==="1");
+    assert.equal(sql("SELECT approval_executions FROM mock_pg_payments WHERE payment_id='"+attempt.id+"'"),"1");
+  } finally { await restart(); server.closeAllConnections(); await new Promise(resolve=>server.close(resolve)); }
+});
+
+test("request security trusts only configured proxy hops and ignores a forged leftmost client IP",{timeout:60000},async()=>{
+  await restart({REQUEST_RATE_LIMIT_ENABLED:"true",REQUEST_READ_IP_LIMIT:"2"});
+  let gateway;
+  try {
+    const p=await port();
+    gateway=await startJava("gateway",{PORT:String(p),SERVICE_BASE_URL:"http://127.0.0.1:"+servicePort,GATEWAY_TRUSTED_PROXY_CIDRS:"127.0.0.1/32"});
+    await freshRateWindow();
+    const request=(chain)=>fetch("http://127.0.0.1:"+p+"/api/plans",{headers:{"X-Forwarded-For":chain,"X-Gateway-Client-IP":randomUUID()}});
+    assert.equal((await request("198.51.100.1, 203.0.113.9")).status,200);
+    assert.equal((await request("198.51.100.2, 203.0.113.9")).status,200);
+    assert.equal((await request("198.51.100.3, 203.0.113.9")).status,429);
+    assert.equal((await request("198.51.100.3, 203.0.113.10")).status,200);
+    assert.equal(sql("SELECT count(*) FROM request_rate_buckets WHERE scope='READ_IP'"),"2");
+  } finally { await stopChild(gateway); await restart(); }
+});
+test("request security provider webhook budget spans client IPs and preserves twenty normal duplicate deliveries",{timeout:60000},async()=>{
+  await restart({REQUEST_RATE_LIMIT_ENABLED:"true",REQUEST_WEBHOOK_SOURCE_LIMIT:"20"});
+  try {
+    await freshRateWindow();
+    const payload=securityPayload(),body=JSON.stringify(payload);
+    const replies=await Promise.all(Array.from({length:20},(_,i)=>fetch("http://127.0.0.1:"+servicePort+"/webhooks/pg",{
+      method:"POST",body,headers:{...signedHeaders(body),"X-Gateway-Token":secret,"X-Gateway-Client-IP":"198.51.100."+i}
+    })));
+    assert.equal(replies.filter(r=>r.status===202).length,1); assert.equal(replies.filter(r=>r.status===200).length,19);
+    assert.equal((await securityPost("PG",payload)).status,429);
+    assert.equal((await securityPost("SUPPLIER",securityPayload("SUPPLIER"))).status,202);
+    assert.equal(sql("SELECT receive_count FROM inbound_events WHERE event_id='"+payload.eventId+"'"),"20");
+    assert.equal(sql("SELECT count(*) FROM inbound_verifications v JOIN inbound_events e ON e.id=v.inbound_id WHERE e.event_id='"+payload.eventId+"'"),"1");
+  } finally { await restart(); }
+});
+test("request security supplier and profile callback deliveries honor Retry-After without duplicate provisioning",{timeout:60000},async()=>{
+  const calls=new Map();
+  const server=createHttpServer((request,response)=>{
+    let body=""; request.on("data",chunk=>body+=chunk); request.on("end",()=>{
+      const parsed=JSON.parse(body),key=request.url+":"+parsed.eventId;
+      const rows=calls.get(key)||[]; rows.push({at:Date.now(),headers:request.headers,body}); calls.set(key,rows);
+      response.writeHead(rows.length===1?503:200,{"Retry-After":"2"}); response.end("{}");
+    });
+  });
+  server.listen(0,"127.0.0.1"); await once(server,"listening");
+  try {
+    await restart({SUPPLIER_WEBHOOK_URL:"http://127.0.0.1:"+server.address().port+"/webhooks/supplier"});
+    const {order,job,profile}=await trackingProfile();
+    const change=await trackingChange(profile,installedChange); assert.equal(change.status,200); const signal=await change.json();
+    await until(()=>Array.from(calls.values()).filter(rows=>rows.length>=2).length>=2);
+    for(const rows of calls.values()) {
+      assert.ok(rows[1].at-rows[0].at>=1900);
+      assert.equal(rows[0].body,rows[1].body);
+      assert.notEqual(rows[0].headers["x-signature-timestamp"],rows[1].headers["x-signature-timestamp"]);
+    }
+    await until(()=>sql("SELECT callback_sent FROM mock_profile_notifications WHERE event_id='"+signal.eventId+"'")==="1");
+    assert.equal(sql("SELECT issue_executions FROM mock_supplier_orders WHERE request_id='"+job.id+"'"),"1");
+    assert.equal(sql("SELECT count(*) FROM sim_profiles WHERE order_id='"+order.id+"'"),"1");
+  } finally { await restart(); server.closeAllConnections(); await new Promise(resolve=>server.close(resolve)); }
 });

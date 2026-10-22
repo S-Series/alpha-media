@@ -544,6 +544,21 @@ flowchart TD
 - 운영자 `GET /api/admin/monitoring`과 `/admin/reconciliation`의 장애 감시 영역에 워커 신호·실행 대기열·연속 실패·최근 50개 사건 변경 알림을 표시한다. 알림에서 해당 사건의 조사 이력으로 이동한다. 마지막 점검이 30초 넘게 갱신되지 않으면 `STALE`, DB 조회가 불가능하면 `503 MONITORING_UNAVAILABLE`다. 화면 조회 실패 시 지난 결과를 현재 정상으로 표시하지 않는다.
 - `MONITORING_ENABLED=true`, `MONITORING_INTERVAL_MS=5000`이 기본값이다. Service 전체 종료·DB 전체 장애 중에는 내부 감시가 새 사건을 저장하거나 외부로 통지할 수 없다. 별도 외부 가용성 감시·이메일·Slack 연결은 이번 변경에 포함하지 않는다. 외부 메시지 전송이나 배포 환경 설정은 수행하지 않는다. 로컬 검증은 임시 DB의 시간·장애를 제어하며, 실제 외부 사업자와 전체 DB 복원 검증은 아니다.
 
+### 6단계 구현: 요청 제한과 웹훅 서명 계약
+
+- Gateway와 Service의 읽기 필터가 본문을 최대 16,385바이트만 읽고 16,384바이트(16 KiB) 초과를 `413 BODY_TOO_LARGE`로 거절한다. Content-Length와 chunked 전송 모두 적용하며 JSON·로그인 폼·웹훅·내부 모의 API도 같은 상한이다. 압축 요청은 `415 UNSUPPORTED_CONTENT_ENCODING`로 거절하여 압축 해제 우회를 막는다. 서명은 캐시한 원본 바이트로 검증한다.
+- Service는 DB 시각 기준 60초 고정 구간 카운터로 업무 변경 회원당 30회/IP당 300회, 로그인 계정당 5회/IP당 30회를 제한한다. 읽기는 회원당 300회/IP당 600회, 웹훅은 IP당 600회/사업자당 3,000회다. 웹훅의 사업자 범위는 PG와 SUPPLIER이며 공급사 발급·프로필 통지는 같은 예산이다. 각 범위는 독립적이므로 읽기·웹훅 폭주가 로그인·업무 변경 예산을 소모하지 않는다. 같은 IP의 여러 회원은 IP 한도를 공유한다.
+- Gateway 인증·CSRF 검사를 통과해 제한 필터에 도달한 시도는 예산에 포함하며 같은 멱등 키의 재전송도 제외하지 않는다. IP 한도를 먼저 검사해 차단된 IP가 무작위 계정별 카운터를 계속 만들지 못하게 한다. 해당 범위 한도를 넘으면 `429 RATE_LIMITED`와 남은 구간의 `Retry-After` 초를 반환한다. 구간 경계에는 두 구간의 요청이 몰릴 수 있는 고정 구간 방식이며, 연속 60초 슬라이딩 제한이나 네트워크 DDoS 방어를 의미하지 않는다. 선행 보안 검사에서 거절된 요청은 이 카운터에 포함하지 않는다.
+- 제한 카운터는 모든 Service 인스턴스가 공유하며 업무 트랜잭션 전에 별도로 커밋한다. 서버 재시작·업무 DB 롤백으로 횟수가 초기화되지 않는다. 카운터 DB 오류는 `503 REQUEST_GUARD_UNAVAILABLE`로 거절하고 업무를 시작하지 않는다. 2분 지난 구간은 1분 간격으로 정리한다. `REQUEST_RATE_LIMIT_ENABLED=true`가 기본이며 적용 한도·활성화 여부·기동 시각은 변경 불가능한 `request_guard_history`에 저장한다.
+- Gateway는 외부의 `X-Gateway-Client-IP`를 항상 교체한다. 기본 IP는 소켓 상대 주소다. `GATEWAY_TRUSTED_PROXY_CIDRS`에 검증한 프록시 CIDR을 명시한 경우에만 X-Forwarded-For를 오른쪽부터 읽고 최초 비신뢰 홉에서 멈춘다. Forwarded/X-Forwarded-For를 클라이언트 선언만으로 신뢰하지 않는다. 호스팅 프록시 주소를 설정하지 않으면 사용자들이 프록시 IP 예산을 공유할 수 있으므로 실제 배포 전 신뢰 경계를 확인해야 한다. 이번 작업은 원격 환경변수를 변경하지 않는다.
+- 서명 계약은 `X-Key-Id`, `X-Signature-Timestamp`(Unix 초), `X-Signature`(소문자 HMAC-SHA256 hex)를 사용한다. 서명 입력은 UTF-8 `v1\n{PG 또는 SUPPLIER}\n{keyId}\n{timestamp}\n` 뒤에 원본 본문 바이트를 그대로 붙인 값이다. 누락·다중 헤더·잘못된 키·서명·시각은 401이다. 본문에만 서명하는 이전 계약은 허용하지 않는다. 송신자와 수신자를 함께 갱신해야 하며 모의 PG·공급사 송신 코드도 이번 변경에 포함한다.
+- 전송 시각은 과거 300초·미래 5초 이내만 허용한다. 이는 이벤트의 업무 발생 시각 제한이 아니다. 지연 이벤트는 원래 이벤트 ID·업무 시각을 유지하고 재전송할 때마다 현재 시각으로 다시 서명한다. 같은 ID·같은 내용은 기존 수신을 반환하며 다른 내용은 기존 거래 충돌 경로로 차단한다. 운영자 수신함 재처리는 최초 검증된 암호화 원문을 사용하므로 이전 키 만료 후에도 가능하다.
+- 현재 키는 `PG_WEBHOOK_KEY_ID`/`SUPPLIER_WEBHOOK_KEY_ID`(기본 pg-v1/supplier-v1), 비밀은 기존 `*_WEBHOOK_SECRET`이다. 교체 시 서로 다른 이전 key ID·비밀·UTC ISO-8601 만료 시각을 `*_WEBHOOK_PREVIOUS_KEY_ID`, `*_WEBHOOK_PREVIOUS_SECRET`, `*_WEBHOOK_PREVIOUS_VALID_UNTIL`에 함께 설정한다. 이전 키의 만료 시각 이상에서는 거부하고, 재시작으로 허용 기간을 연장하지 않는다. 새로운 송신은 현재 키만 사용한다.
+- 키 ID·fingerprint·검증 허용 종료·최초 기록 시각은 `webhook_key_history`에, 최초 수신별 키·전송 시각·검증 시각은 `inbound_verifications`에 변경 불가로 보존한다. 수신함과 검증 근거는 같은 트랜잭션이어서 저장 오류에 성공 응답을 하지 않는다. 정상 반복 수신은 같은 키의 검증 이력을 늘리지 않는다. 원문·서명·비밀은 감사 응답에 포함하지 않는다.
+- 잘못된 서명과 요청 제한은 분 단위 `request_security_counts`에 보안 집계한다. 서명은 유효하지만 거래 내용이 다른 경우는 기존 업무 충돌·운영 사건으로 구분한다. 집계는 7일 보존하며 `GET /api/admin/request-security`는 운영자만 최근 24시간 집계(최대 200행), 적용 한도·최근 20개 설정 기록, 현재 키의 허용 기간·최근 50개 키 기록을 조회한다. 새 화면은 추가하지 않는다.
+- 모의 PG·공급사·프로필 송신은 429/503의 정수형 Retry-After(1~300초 범위)를 기존 지수 지연과 비교해 더 긴 시간을 기다린다. 기존 최대 6회 전송 예산은 유지한다. 제한을 넘긴 정상 통지가 최종 소진되면 기존 조회·대사로 결과를 복구한다.
+- 검증은 격리된 임시 PostgreSQL과 Gateway/Service에서 수행한다. 실사업자 서명 포맷·재전송 기한·프록시 CIDR 계약 검증, WAF·외부 가용성 감시, 운영 배포는 포함하지 않는다. `REQUEST_..._LIMIT` 초기값은 실제 공유 IP·정상 트래픽 부하에 맞춰 추후 조정해야 한다.
+
 구현 참고:
 
 - [주문·기한 검사](../backend/service/src/service/OrderRepository.java), [결제 접수](../backend/service/src/service/PaymentService.java), [결제 워커](../backend/service/src/service/PaymentWorker.java), [결제 결과 반영](../backend/service/src/service/PaymentTransitions.java).
@@ -556,4 +571,4 @@ flowchart TD
 - [운영자 조치](../backend/service/src/service/AdminActionService.java), [환불 워커](../backend/service/src/service/RefundWorker.java), [환불 반영](../backend/service/src/service/RefundService.java).
 - [설치 반영](../backend/service/src/service/ProfileTrackingService.java), [SIM 생명주기](sim-lifecycle.md), [데이터 계약](data-contract.md), [기존 통합 테스트](../tests/orders.integration.test.mjs).
 
-위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계는 통합 테스트의 `retry policy`, `conflict policy`, 2단계는 `webhook inbox`, 3단계는 `operator recovery`, 4단계는 `reconciliation`, 5단계는 `monitoring` 시나리오로 검증한다.
+위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계는 통합 테스트의 `retry policy`, `conflict policy`, 2단계는 `webhook inbox`, 3단계는 `operator recovery`, 4단계는 `reconciliation`, 5단계는 `monitoring`, 6단계는 `request security` 시나리오로 검증한다.

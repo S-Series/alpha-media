@@ -36,7 +36,7 @@ public class GatewayConfiguration {
     // 이처럼 필요한 객체를 직접 new 하지 않고 전달받는 방식을 의존성 주입이라고 한다.
     @Bean
     RouterFunction<ServerResponse> serviceRoutes(GatewayProperties properties,
-            @Value("${INTERNAL_GATEWAY_TOKEN:}") String internalToken, Environment environment) {
+            @Value("${INTERNAL_GATEWAY_TOKEN:}") String internalToken, Environment environment, ClientAddress addresses) {
         if (environment.matchesProfiles("render") || !internalToken.isEmpty()) {
             Assert.isTrue(internalToken.length() >= 32, "INTERNAL_GATEWAY_TOKEN must contain at least 32 characters");
         }
@@ -46,7 +46,7 @@ public class GatewayConfiguration {
                 // Service 주소만 지정하며, /api 등의 요청 경로를 지우지 않고 전달한다.
                 .before(uri(properties.serviceUrl().toString()))
                 // 중계 요청과 응답에 추적 ID를 붙이고, 연결 오류를 처리할 필터다.
-                .filter(new ProxyExchangeFilter(internalToken))
+                .filter(new ProxyExchangeFilter(internalToken, addresses))
                 .build();
     }
 
@@ -94,7 +94,7 @@ public class GatewayConfiguration {
         cors.setAllowedMethods(List.of("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         // 브라우저가 요청에 담을 수 있는 헤더와 응답에서 JavaScript로 읽을 수 있는 헤더를 구분한다.
         cors.setAllowedHeaders(List.of("Content-Type", "Authorization", "Idempotency-Key", "X-Request-Id", "X-CSRF-TOKEN"));
-        cors.setExposedHeaders(List.of("X-Request-Id"));
+        cors.setExposedHeaders(List.of("X-Request-Id", "Retry-After"));
         // 명시적으로 허용한 출처에서 쿠키 등 자격 정보를 사용하는 요청을 허용한다.
         cors.setAllowCredentials(true);
         // 브라우저가 사전 확인 요청(OPTIONS)의 허용 결과를 600초 동안 재사용할 수 있다.

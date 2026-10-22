@@ -20,9 +20,11 @@ final class ProxyExchangeFilter implements HandlerFilterFunction<ServerResponse,
     private static final Logger log = LoggerFactory.getLogger(ProxyExchangeFilter.class);
     private static final String REQUEST_ID = "X-Request-Id";
     private final String internalToken;
+    private final ClientAddress addresses;
 
-    ProxyExchangeFilter(String internalToken) {
+    ProxyExchangeFilter(String internalToken, ClientAddress addresses) {
         this.internalToken = internalToken;
+        this.addresses = addresses;
     }
 
     @Override
@@ -35,6 +37,9 @@ final class ProxyExchangeFilter implements HandlerFilterFunction<ServerResponse,
             // 사용자가 지정한 신원을 신뢰하지 않는다. 회원 인증은 Service가 검사한다.
             headers.remove("X-User-Id");
             headers.remove("X-Admin-Id");
+            headers.remove("Forwarded");
+            headers.remove("X-Forwarded-For");
+            headers.set("X-Gateway-Client-IP", addresses.resolve(request.servletRequest()));
             // 외부에서 보낸 내부 키를 제거한 뒤 서버의 키로 교체한다.
             headers.remove("X-Gateway-Token");
             if (!internalToken.isEmpty()) {

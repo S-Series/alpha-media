@@ -43,11 +43,12 @@ public class SecurityConfiguration {
     @Bean
     SecurityFilterChain securityFilterChain(HttpSecurity http, MemberRepository members,
             ObjectMapper mapper, @Value("${INTERNAL_GATEWAY_TOKEN:}") String internalToken,
-            Environment environment) throws Exception {
+            Environment environment, RequestRateLimits rates) throws Exception {
         if (environment.matchesProfiles("render") || !internalToken.isEmpty()) {
             Assert.isTrue(internalToken.length() >= 32, "INTERNAL_GATEWAY_TOKEN must contain at least 32 characters");
             http.addFilterBefore(new GatewayAccessFilter(internalToken, mapper), SecurityContextHolderFilter.class);
         }
+        http.addFilterBefore(new RequestRateLimitFilter(rates,mapper,!internalToken.isEmpty()),org.springframework.security.web.authentication.logout.LogoutFilter.class);
         http
                 .httpBasic(basic -> basic.disable())
                 .requestCache(cache -> cache.disable())

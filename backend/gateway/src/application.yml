@@ -14,6 +14,8 @@ server:
   port: ${PORT:8080}
   # 외부 요청의 Forwarded 헤더를 근거로 서버가 인식하는 주소를 자동으로 바꾸지 않는다.
   forward-headers-strategy: none
+  # ClientAddress는 GATEWAY_TRUSTED_PROXY_CIDRS에 명시한 직접 프록시만 신뢰한다.
+  # 기본값은 비어 있으며 실제 소켓 IP를 사용한다. 모든 주소를 신뢰하도록 설정하지 않는다.
 
 # 아래는 Spring 기본 항목이 아니라 우리가 정의한 설정이며 GatewayProperties가 읽는다.
 gateway:

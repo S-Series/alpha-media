@@ -17,13 +17,15 @@ public class InboundEventService {
     private final JdbcTemplate jdbc;
     private final OrderRepository orders;
     private final OrderConflicts conflicts;
+    private final WebhookSecurity security;
     public InboundEventService(InboundEventRepository events, InboundPayloadCodec codec, ObjectMapper mapper,
-            JdbcTemplate jdbc, OrderRepository orders, OrderConflicts conflicts) {
+            JdbcTemplate jdbc, OrderRepository orders, OrderConflicts conflicts, WebhookSecurity security) {
         this.events=events; this.codec=codec; this.mapper=mapper; this.jdbc=jdbc; this.orders=orders; this.conflicts=conflicts;
+        this.security=security;
     }
 
     @Transactional
-    public Receipt accept(String source, Object parsed, byte[] body) {
+    public Receipt accept(String source, Object parsed, byte[] body, WebhookSecurity.Verified verified) {
         UUID eventId, targetId;
         switch (parsed) {
             case PgResult result -> { eventId=result.eventId(); targetId=result.paymentId(); }
@@ -33,9 +35,13 @@ public class InboundEventService {
         }
         String hash=hash(mapper.writeValueAsBytes(parsed));
         var inserted=events.insert(source,eventId,targetId,owner(source,targetId),codec.encrypt(source,eventId,body),hash);
-        if (inserted.isPresent()) return receipt(inserted.get(),false,false);
+        if (inserted.isPresent()) {
+            security.record(inserted.get().id(),verified);
+            return receipt(inserted.get(),false,false);
+        }
         // Keep inbox -> order lock ordering, including contradictory duplicate deliveries.
         var existing=events.lockByKey(source,eventId);
+        security.record(existing.id(),verified);
         events.duplicate(existing.id());
         if (existing.payloadHash().equals(hash)) return receipt(existing,true,false);
         events.conflict(existing.id(),hash);
