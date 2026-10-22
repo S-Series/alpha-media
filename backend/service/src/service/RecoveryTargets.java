@@ -12,7 +12,7 @@ import service.OrderService.OrderException;
 
 @Repository
 public class RecoveryTargets {
-    public enum Kind { PAYMENT, ISSUANCE, REFUND, INBOUND }
+    public enum Kind { PAYMENT, ISSUANCE, REFUND, INBOUND, PROTECTION }
     private final JdbcTemplate jdbc;
     private final OrderRepository orders;
     public RecoveryTargets(JdbcTemplate jdbc,OrderRepository orders) { this.jdbc=jdbc; this.orders=orders; }
@@ -57,7 +57,7 @@ public class RecoveryTargets {
     }
     static String table(Kind kind) {
         return switch(kind) { case PAYMENT -> "payment_attempts"; case ISSUANCE -> "issuance_jobs";
-            case REFUND -> "refunds"; case INBOUND -> "inbound_events"; };
+            case PROTECTION -> "refund_protection_jobs"; case REFUND -> "refunds"; case INBOUND -> "inbound_events"; };
     }
     static String hash(String value) {
         try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))); }

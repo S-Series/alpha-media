@@ -7,7 +7,7 @@ import { kst } from "@/lib/format";
 
 type Draft = { key: string; path: string; body: string; uncertain: boolean };
 type Receipt = { action: RecoveryAction; replayed: boolean };
-const targets: Record<RecoveryTarget["kind"], string> = { PAYMENT: "결제", ISSUANCE: "발급", REFUND: "환불", INBOUND: "웹훅" };
+const targets: Record<RecoveryTarget["kind"], string> = { PAYMENT: "결제", ISSUANCE: "발급", REFUND: "환불", INBOUND: "웹훅", PROTECTION: "SIM 차단·종료·해제" };
 const states: Record<RecoveryAction["status"], string> = { QUEUED: "접수·처리 대기", PROCESSING: "처리 중", RETRY: "조회 재시도 대기",
   SUCCEEDED: "조치 완료", REVIEW_REQUIRED: "확인 필요", STALE: "상태 변경으로 중단" };
 const outcomes: Record<string, string> = { RESUME_ALLOWED: "같은 번호로 처리 재개 가능", REPLAY_ALLOWED: "저장된 웹훅 재처리 가능",
@@ -94,7 +94,7 @@ export default function AdminOrderRecovery({ orderId, items, actions, blocked, n
   return <section className="home-panel"><h2>확인 필요 건 재조회·재처리</h2>
     <p>먼저 PG·공급사 결과를 조회합니다. 확정된 결과는 기존 주문에 반영하고, 재개가 허용된 경우에만 같은 결제·발급·환불 번호로 처리합니다.</p>
     <p>재개는 조회 완료 후 60초 이내, 상태가 그대로인 경우에만 가능합니다. 실행 회차는 최초 포함 최대 3회이며 누적 시도·조치 이력을 보존합니다.</p>
-    {items.length === 0 ? <p>현재 재조회가 필요한 결제·발급·환불·웹훅 대상이 없습니다.</p> : <>
+    {items.length === 0 ? <p>현재 재조회가 필요한 결제·발급·환불·공급사 차단·웹훅 대상이 없습니다.</p> : <>
       <div className="screen-form">
         <label>확인 대상 <select value={target ? `${target.kind}:${target.id}` : ""} disabled={busy} onChange={event => setSelected(event.target.value)}>
           {items.map(item => <option key={`${item.kind}:${item.id}`} value={`${item.kind}:${item.id}`}>

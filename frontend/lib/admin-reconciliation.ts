@@ -8,7 +8,7 @@ export type ReconciliationRun = { id: string; mode: "PENDING" | "LEDGER";
   actor: string | null; reason: string; fromAt: string | null; toAt: string | null; phase: string;
   pageCount: number; itemCount: number; processedCount: number; issueCount: number; attemptCount: number;
   lastError: string | null; createdAt: string; completedAt: string | null };
-export type ReconciliationItem = { id: string; kind: "PAYMENT" | "ISSUANCE" | "REFUND"; targetId: string;
+export type ReconciliationItem = { id: string; kind: "PAYMENT" | "ISSUANCE" | "REFUND" | "PROTECTION"; targetId: string;
   orderId: string | null; status: string; outcome: string | null; attemptCount: number; lastError: string | null;
   externalStatus: string | null; externalReference: string | null; evidenceHash: string | null; checkedAt: string | null };
 export type ReconciliationRuns = { items: ReconciliationRun[]; lastSuccessfulAt: string | null; checkedAt: string };
@@ -20,7 +20,7 @@ export type Incident = { id: string; orderId: string | null; kind: Reconciliatio
 export type IncidentPage = { items: Incident[]; page: number; size: number; hasNext: boolean; checkedAt: string };
 export type IncidentDetail = { incident: Incident;
   events: { id: string; status: IncidentStatus; actor: string | null; reason: string | null; evidenceHash: string | null; recordedAt: string }[] };
-export const reconciliationKinds = { PAYMENT: "결제", ISSUANCE: "발급", REFUND: "환불", WORKER: "워커", QUEUE: "작업 대기열", PROFILE: "SIM 추적", INBOUND: "웹훅" };
+export const reconciliationKinds = { PAYMENT: "결제", ISSUANCE: "발급", REFUND: "환불", PROTECTION: "SIM 차단·정리", WORKER: "워커", QUEUE: "작업 대기열", PROFILE: "SIM 추적", INBOUND: "웹훅" };
 export const incidentStatuses: Record<IncidentStatus, string> = { OPEN: "미확인", INVESTIGATING: "조사 중", RESOLVED: "해결 확인" };
 export const runStatuses: Record<ReconciliationRun["status"], string> = { QUEUED: "접수·대기", SCANNING: "대상 수집 중",
   PROCESSING: "결과 확인 중", SUCCEEDED: "대사 완료", REVIEW_REQUIRED: "실행 확인 필요" };

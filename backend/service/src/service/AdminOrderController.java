@@ -28,11 +28,13 @@ public class AdminOrderController {
     private final InboundEventRepository inboundEvents;
     private final RecoveryRepository recoveryActions;
     private final RecoveryTargets recoveryTargets;
+    private final RefundBalance balance;
+    private final RefundProtection protection;
 
     public AdminOrderController(OrderRepository orders, PaymentRepository payments, IssuanceService issuances,
             RefundRepository refunds,AdminActionRepository actions,OrderConflicts conflicts,InboundEventRepository inboundEvents,
-            RecoveryRepository recoveryActions,RecoveryTargets recoveryTargets) {
-        this.orders = orders; this.payments = payments; this.issuances = issuances; this.refunds=refunds; this.actions=actions; this.conflicts=conflicts;
+            RecoveryRepository recoveryActions,RecoveryTargets recoveryTargets,RefundBalance balance,RefundProtection protection) {
+        this.balance=balance; this.protection=protection; this.orders = orders; this.payments = payments; this.issuances = issuances; this.refunds=refunds; this.actions=actions; this.conflicts=conflicts;
         this.inboundEvents=inboundEvents;
         this.recoveryActions=recoveryActions; this.recoveryTargets=recoveryTargets;
     }
@@ -47,7 +49,7 @@ public class AdminOrderController {
             @RequestParam(required = false) String issuanceStatus,
             @RequestParam(required = false) String installStatus) {
         if (page < 0 || size < 1 || size > 100 || (status != null && !Set.of(
-                "PENDING_PAYMENT", "PAYMENT_PROCESSING", "PAID", "EXPIRED","REFUND_PROCESSING","REFUNDED").contains(status))
+                "PENDING_PAYMENT", "PAYMENT_PROCESSING", "PAID", "EXPIRED","REFUND_PROCESSING","REFUNDED","PARTIALLY_REFUNDED").contains(status))
                 || (simType != null && !Set.of("ESIM", "USIM").contains(simType))
                 || (paymentStatus!=null && !Set.of("NOT_STARTED","QUEUED","PROCESSING","UNKNOWN","APPROVED","DECLINED","REVIEW_REQUIRED").contains(paymentStatus))
                 || (issuanceStatus!=null && !Set.of("NOT_STARTED","QUEUED","PROCESSING","WAITING_CALLBACK","ISSUED","FAILED","REVIEW_REQUIRED").contains(issuanceStatus))
@@ -67,7 +69,7 @@ public class AdminOrderController {
                 () -> new OrderService.OrderException(404, "ORDER_NOT_FOUND", "주문을 찾을 수 없습니다."));
         return ResponseEntity.ok().header("Cache-Control", "no-store").body(new Detail(order, payments.list(orderId), issuances.forOrder(orderId),
             refunds.find(orderId).orElse(null),actions.list(orderId),actions.events(orderId),timeline(orderId,null,50),Instant.now(),conflicts.list(orderId),inboundEvents.forOrder(orderId),
-            recoveryTargets.list(orderId),recoveryActions.list(orderId)));
+            recoveryTargets.list(orderId),recoveryActions.list(orderId),refunds.list(orderId),balance.summary(orderId),protection.list(orderId)));
     }
 
     @GetMapping("/{orderId}/history")
@@ -86,5 +88,5 @@ public class AdminOrderController {
     public record Detail(OrderRepository.AdminOrder order, List<PaymentAttempt> payments, IssuanceService.View issuance,
         Refund refund,List<AdminActionRepository.Action> actions,List<AdminActionRepository.Event> actionEvents,HistoryPage timeline,Instant checkedAt,
         List<OrderConflicts.Conflict> conflicts,List<InboundEventRepository.View> inboundEvents,
-        List<RecoveryTargets.View> recoveryTargets,List<RecoveryRepository.Action> recoveryActions) {}
+        List<RecoveryTargets.View> recoveryTargets,List<RecoveryRepository.Action> recoveryActions,List<Refund> refunds,RefundBalance.Summary refundBalance,List<RefundProtection.Job> protectionJobs) {}
 }

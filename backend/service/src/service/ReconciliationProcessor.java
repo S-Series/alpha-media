@@ -19,6 +19,9 @@ public class ReconciliationProcessor {
     private final OrderRepository orders;
     private final IssuanceRepository jobs;
     private final RefundRepository refunds;
+    private final RefundBalance balance;
+    private final RefundProtection protection;
+    private final RefundProtectionService protectionResults;
     private final PaymentTransitions paymentResults;
     private final IssuanceService issuanceResults;
     private final RefundService refundResults;
@@ -29,8 +32,8 @@ public class ReconciliationProcessor {
     private final ObjectMapper mapper;
     public ReconciliationProcessor(ReconciliationRepository runs,IncidentRepository incidents,RecoveryTargets targets,PaymentRepository payments,
             OrderRepository orders,IssuanceRepository jobs,RefundRepository refunds,PaymentTransitions paymentResults,IssuanceService issuanceResults,
-            RefundService refundResults,OrderConflicts conflicts,ObjectProvider<PgClient> pg,ObjectProvider<SupplierClient> supplier,JdbcTemplate jdbc,ObjectMapper mapper) {
-        this.runs=runs; this.incidents=incidents; this.targets=targets; this.payments=payments; this.orders=orders; this.jobs=jobs; this.refunds=refunds;
+            RefundService refundResults,OrderConflicts conflicts,ObjectProvider<PgClient> pg,ObjectProvider<SupplierClient> supplier,JdbcTemplate jdbc,ObjectMapper mapper,RefundBalance balance,RefundProtection protection,RefundProtectionService protectionResults) {
+        this.balance=balance; this.protection=protection; this.protectionResults=protectionResults; this.runs=runs; this.incidents=incidents; this.targets=targets; this.payments=payments; this.orders=orders; this.jobs=jobs; this.refunds=refunds;
         this.paymentResults=paymentResults; this.issuanceResults=issuanceResults; this.refundResults=refundResults; this.conflicts=conflicts;
         this.pg=pg; this.supplier=supplier; this.jdbc=jdbc; this.mapper=mapper;
     }
@@ -41,8 +44,11 @@ public class ReconciliationProcessor {
     Observation lookup(ReconciliationRepository.Item item) throws IOException,InterruptedException {
         UUID order=internalOrder(item.kind(),item.targetId());
         String version=order==null?null:targets.read(order,RecoveryTargets.Kind.valueOf(item.kind()),item.targetId(),false).view().version();
-        Object payload; ExternalLedger.PaymentSnapshot funding=null;
-        if ("ISSUANCE".equals(item.kind())) {
+        Object payload; ExternalLedger.PaymentSnapshot funding=null; MockPgService.Cancellation cancellation=null;
+        if ("PROTECTION".equals(item.kind())) {
+            payload=supplier.getObject().protection(protection.get(item.targetId()),false).orElse(null);
+        }
+        else if ("ISSUANCE".equals(item.kind())) {
             payload=supplier.getObject().lookup(item.targetId()).orElse(null);
             if (order!=null) {
                 var approved=payments.list(order).stream().filter(p->"APPROVED".equals(p.status())).findFirst();
@@ -52,14 +58,15 @@ public class ReconciliationProcessor {
         else {
             UUID payment=item.targetId();
             if ("REFUND".equals(item.kind())) {
-                if (order==null) return new Observation(null,null,null,false,null);
-                payment=refunds.find(order).orElseThrow().paymentId();
+                if (order==null) return new Observation(null,null,null,false,null,null);
+                var refund=refunds.findById(item.targetId()).orElseThrow();
+                payment=refund.paymentId(); cancellation=pg.getObject().lookupCancellation(refund).orElse(null);
             }
             payload=pg.getObject().financial(payment).orElse(null);
         }
         boolean externalFulfillment=payload instanceof ExternalLedger.PaymentSnapshot p && "APPROVED".equals(p.payment().status())
             && order!=null && jobs.find(order).isEmpty() && !supplier.getObject().ordersForOrder(order).isEmpty();
-        return new Observation(order,version,payload,externalFulfillment,funding);
+        return new Observation(order,version,payload,externalFulfillment,funding,cancellation);
     }
     @Transactional
     public void complete(ReconciliationRepository.Item claim,Observation observed) {
@@ -71,9 +78,9 @@ public class ReconciliationProcessor {
             if (!current.view().version().equals(observed.version())) { runs.finish(item,order,"STALE_TARGET",null,null,null,null); return; }
         }
         Object payload=observed.payload();
-        String hash=payload==null?null:RecoveryTargets.hash(mapper.writeValueAsString(new Object[]{payload,observed.funding()}));
-        String status=payload instanceof ExternalLedger.PaymentSnapshot p?p.payment().status():payload instanceof SupplierResult s?s.status():"NOT_FOUND";
-        String reference=payload instanceof ExternalLedger.PaymentSnapshot p?p.payment().transactionId():payload instanceof SupplierResult s?s.supplierOrderNo():null;
+        String hash=payload==null?null:RecoveryTargets.hash(mapper.writeValueAsString(new Object[]{payload,observed.funding(),observed.cancellation()}));
+        String status=payload instanceof ExternalLedger.PaymentSnapshot p?p.payment().status():payload instanceof SupplierResult s?s.status():payload instanceof RefundProtection.Result h?h.state():"NOT_FOUND";
+        String reference=payload instanceof ExternalLedger.PaymentSnapshot p?p.payment().transactionId():payload instanceof SupplierResult s?s.supplierOrderNo():payload instanceof RefundProtection.Result h?h.operationId().toString():null;
         String code=null;
         orders.historyContext(null,"RECONCILIATION",null);
         try {
@@ -88,7 +95,14 @@ public class ReconciliationProcessor {
                 conflicts.reject(order,"PAYMENT",((ExternalLedger.PaymentSnapshot)payload).payment().paymentId(),"MISSING_FULFILLMENT_LINK","RECONCILIATION",null,"ISSUED",hash);
                 code="MISSING_FULFILLMENT_LINK";
             }
-            else if (payload instanceof ExternalLedger.PaymentSnapshot payment) code=payment(item,order,payment);
+            else if (payload instanceof RefundProtection.Result hold) protectionResults.reconcile(protection.get(item.targetId()),hold);
+            else if (payload instanceof ExternalLedger.PaymentSnapshot payment) {
+                code=payment(item,order,payment);
+                if (observed.cancellation()!=null && (code==null || "PROVIDER_PENDING".equals(code))) {
+                    refundResults.reconcile(refunds.findById(item.targetId()).orElseThrow(),observed.cancellation());
+                    code=consistent(order)?null:"INTERNAL_STATE_INCONSISTENT";
+                }
+            }
             else code=issuance(item,order,(SupplierResult)payload,observed.funding());
         } catch (OrderConflicts.ConflictException e) { code="RESULT_CONFLICT"; }
         // Only domain conflicts are caught here. Storage failures roll back business changes and item completion together.
@@ -98,30 +112,30 @@ public class ReconciliationProcessor {
     }
     private String payment(ReconciliationRepository.Item item,UUID orderId,ExternalLedger.PaymentSnapshot snapshot) {
         var result=snapshot.payment();
-        UUID paymentId="PAYMENT".equals(item.kind())?item.targetId():refunds.find(orderId).orElseThrow().paymentId();
+        UUID paymentId="REFUND".equals(item.kind())?refunds.findById(item.targetId()).orElseThrow().paymentId():result.paymentId();
         var payment=payments.lock(paymentId); var order=orders.lock(orderId);
         if (!payment.id().equals(result.paymentId()) || !result.matches(payment))
             throw conflicts.reject(orderId,"PAYMENT",payment.id(),"PG_RESULT_MISMATCH","RECONCILIATION",payment.status(),result.status(),mapper.writeValueAsString(result));
-        var refund=refunds.find(orderId);
         if (snapshot.cancelledTotal()>0) {
-            // Never enqueue issuance from an approval snapshot which already includes a cancellation.
-            if (refund.isEmpty() || snapshot.cancellations().size()!=1 || snapshot.cancelledTotal()!=payment.amount()
-                    || !snapshot.cancellations().getFirst().idempotencyKey().equals(refund.get().id())
-                    || !"APPROVED".equals(payment.status())) {
+            if (!"APPROVED".equals(payment.status())) {
                 conflicts.reject(orderId,"PAYMENT",payment.id(),"EXTERNAL_CANCELLATION_UNMATCHED","RECONCILIATION",payment.status(),"CANCELLED",mapper.writeValueAsString(snapshot));
                 return "EXTERNAL_CANCELLATION_UNMATCHED";
             }
-            var cancellation=snapshot.cancellations().getFirst();
-            if ("SUCCEEDED".equals(refund.get().status())) {
-                if (!cancellation.id().equals(refund.get().pgCancellationId()) || !"REFUNDED".equals(order.status())) return "INTERNAL_STATE_INCONSISTENT";
-            } else {
-                if (!"REFUND_PROCESSING".equals(order.status()) || jobs.profile(orderId).isPresent()
-                        || jobs.find(orderId).filter(j->"FAILED".equals(j.status())).isEmpty()) return "INTERNAL_STATE_INCONSISTENT";
-                refundResults.reconcile(refund.get(),cancellation);
+            boolean unmatched=false;
+            for (var cancellation:snapshot.cancellations()) {
+                var refund=refunds.findById(cancellation.idempotencyKey());
+                if (refund.isEmpty() || !refund.get().orderId().equals(orderId)) {
+                    balance.record(cancellation); unmatched=true;
+                } else refundResults.reconcile(refund.get(),cancellation);
+            }
+            balance.refresh(orderId);
+            if (unmatched || balance.summary(orderId).overReserved()) {
+                conflicts.reject(orderId,"PAYMENT",payment.id(),"EXTERNAL_CANCELLATION_UNMATCHED","RECONCILIATION",payment.status(),"CANCELLED",mapper.writeValueAsString(snapshot));
+                return "EXTERNAL_CANCELLATION_UNMATCHED";
             }
             return consistent(orderId)?null:"INTERNAL_STATE_INCONSISTENT";
         }
-        if (refund.isPresent() && "SUCCEEDED".equals(refund.get().status())) return "INTERNAL_STATE_INCONSISTENT";
+        if (refunds.list(orderId).stream().anyMatch(r->"SUCCEEDED".equals(r.status()))) return "INTERNAL_STATE_INCONSISTENT";
         if ("REFUND".equals(item.kind())) return "PROVIDER_PENDING";
         if ("APPROVED".equals(payment.status()) && jobs.find(orderId).isEmpty()) {
             conflicts.reject(orderId,"PAYMENT",payment.id(),"MISSING_FULFILLMENT_LINK","RECONCILIATION",payment.status(),result.status(),mapper.writeValueAsString(snapshot));
@@ -145,16 +159,8 @@ public class ReconciliationProcessor {
             return "RESULT_CONFLICT";
         }
         if (funding.cancelledTotal()>0) {
-            var refund=refunds.find(orderId);
-            boolean matched=refund.isPresent() && funding.cancellations().size()==1 && "FAILED".equals(result.status())
-                && refund.get().id().equals(funding.cancellations().getFirst().idempotencyKey()) && refund.get().amount()==funding.cancelledTotal();
-            if (!matched) {
-                conflicts.reject(orderId,"PAYMENT",payment.get().id(),"EXTERNAL_CANCELLATION_UNMATCHED","RECONCILIATION","APPROVED","CANCELLED",mapper.writeValueAsString(funding));
-                return "EXTERNAL_CANCELLATION_UNMATCHED";
-            }
-            if (!"SUCCEEDED".equals(refund.get().status())) return "PROVIDER_PENDING";
-            if (!funding.cancellations().getFirst().id().equals(refund.get().pgCancellationId()) || !"REFUNDED".equals(orders.lock(orderId).status()))
-                return "INTERNAL_STATE_INCONSISTENT";
+            String problem=payment(item,orderId,funding);
+            if (problem!=null) return problem;
         }
         if ("ACCEPTED".equals(result.status())) return "PROVIDER_PENDING";
         if ("ISSUED".equals(job.status()) && jobs.profile(orderId).isEmpty()) {
@@ -169,9 +175,13 @@ public class ReconciliationProcessor {
     }
     private boolean consistent(UUID orderId) {
         if (conflicts.blocked(orderId)) return false;
-        var order=orders.lock(orderId); var refund=refunds.find(orderId); var job=jobs.find(orderId); var profile=jobs.profile(orderId);
-        if (refund.isPresent()) return "SUCCEEDED".equals(refund.get().status()) && "REFUNDED".equals(order.status())
-            && profile.isEmpty() && job.filter(j->"FAILED".equals(j.status())).isPresent();
+        var order=orders.lock(orderId); var job=jobs.find(orderId); var profile=jobs.profile(orderId);
+        if (!refunds.list(orderId).isEmpty()) {
+            var totals=balance.summary(orderId);
+            String expected=totals.reserved()>0?"REFUND_PROCESSING":totals.confirmed()==totals.approved()?"REFUNDED":totals.confirmed()>0?"PARTIALLY_REFUNDED":"PAID";
+            return !totals.overReserved() && expected.equals(order.status()) && job.isPresent()
+                && (profile.isPresent()?"ISSUED".equals(job.get().status()):"FAILED".equals(job.get().status()));
+        }
         if (!"PAID".equals(order.status()) || job.isEmpty()) return false;
         return profile.isPresent()=="ISSUED".equals(job.get().status());
     }
@@ -195,5 +205,5 @@ public class ReconciliationProcessor {
         boolean noProvision=jobs.find(orderId).isEmpty() && jobs.profile(orderId).isEmpty() && refunds.find(orderId).isEmpty();
         return noProvision && (active.isPresent()?"PAYMENT_PROCESSING".equals(order.status()):List.of("PENDING_PAYMENT","EXPIRED").contains(order.status()));
     }
-    record Observation(UUID order,String version,Object payload,boolean externalFulfillment,ExternalLedger.PaymentSnapshot funding) {}
+    record Observation(UUID order,String version,Object payload,boolean externalFulfillment,ExternalLedger.PaymentSnapshot funding,MockPgService.Cancellation cancellation) {}
 }

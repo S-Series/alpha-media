@@ -11,7 +11,7 @@ export type Order = {
   travelStartDate: string;
   amount: number;
   currency: "KRW";
-  status: "PENDING_PAYMENT" | "PAYMENT_PROCESSING" | "PAID" | "EXPIRED" | "REFUND_PROCESSING" | "REFUNDED";
+  status: "PENDING_PAYMENT" | "PAYMENT_PROCESSING" | "PAID" | "EXPIRED" | "REFUND_PROCESSING" | "REFUNDED" | "PARTIALLY_REFUNDED";
   createdAt: string;
   expiresAt: string;
   updatedAt: string;
@@ -27,5 +27,5 @@ export async function createOrder(planId: string, travelStartDate: string, key: 
 
 export function orderStatus(status: Order["status"]) {
   return { PENDING_PAYMENT: "결제 대기", PAYMENT_PROCESSING: "결제 확인 중", PAID: "결제 완료", EXPIRED: "주문 만료",
-    REFUND_PROCESSING: "환불 확인 중", REFUNDED: "환불 완료" }[status];
+    REFUND_PROCESSING: "환불 확인 중", REFUNDED: "전액 환불 완료", PARTIALLY_REFUNDED: "부분 환불 완료" }[status];
 }

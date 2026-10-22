@@ -82,7 +82,7 @@ public final class ExternalLedger {
         var ids=new HashSet<UUID>(); var keys=new HashSet<UUID>(); long total=0;
         for (var cancellation:value.cancellations().stream()
                 .sorted(java.util.Comparator.comparingLong(MockPgService.Cancellation::cancelledTotal)).toList()) {
-            if (cancellation.id()==null || !ids.add(cancellation.id()) || cancellation.idempotencyKey()==null
+            if (!"SUCCEEDED".equals(cancellation.status()) || cancellation.id()==null || !ids.add(cancellation.id()) || cancellation.idempotencyKey()==null
                     || !keys.add(cancellation.idempotencyKey()) || !expected.equals(cancellation.paymentId()) || cancellation.amount()<=0
                     || value.cancellationTimes().get(cancellation.id())==null)
                 throw new IllegalArgumentException("Invalid financial cancellation");

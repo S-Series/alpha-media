@@ -1,6 +1,6 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { createHmac, pbkdf2Sync, randomBytes, randomInt, randomUUID } from "node:crypto";
+import { createHash, createHmac, pbkdf2Sync, randomBytes, randomInt, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
@@ -1477,7 +1477,7 @@ test("refund admin actions require administrator, CSRF, reason and a confirmed c
   }
   assert.equal((await adminAction(randomUUID(),"refunds",body)).status,404);
   const issued = await issueOrder(); await until(() => issuanceRow(issued.order.id).status === "ISSUED");
-  assert.equal((await adminAction(issued.order.id,"refunds",refundRequest(issued.job))).status,409);
+  assert.equal((await adminAction(issued.order.id,"refunds",refundRequest(issued.job))).status,202);
   assert.equal((await adminAction(issued.order.id,"issuance-retries",retryRequest(issued.job))).status,409);
   const pending = await newOrder();
   assert.equal((await adminAction(pending.id,"refunds",body)).status,409);
@@ -1487,7 +1487,7 @@ test("refund admin actions require administrator, CSRF, reason and a confirmed c
 });
 
 test("refund twenty simultaneous identical requests cancel once and retain one immutable audit action", async () => {
-  const { order, job, attempt } = await failedOrder(), key = randomUUID(), body = { ...refundRequest(job), amount: 1, currency: "USD", actor: "customer2" };
+  const { order, job, attempt } = await failedOrder(), key = randomUUID(), body = { ...refundRequest(job), amount: order.amount, currency: "USD", actor: "customer2" };
   const headers = { ...await admin.csrf(), "Idempotency-Key": key };
   const responses = await Promise.all(Array.from({ length: 20 }, () => admin.request(`/api/admin/orders/${order.id}/refunds`, { method: "POST", headers, body })));
   assert.equal(responses.filter(r => r.status === 202).length,1);
@@ -3297,7 +3297,8 @@ test("reconciliation issuance-only pending lookup checks cancelled funding befor
     assert.equal(reconciliationItem(run.id, job.id).kind, "ISSUANCE");
     assert.equal(reconciliationItem(run.id, attempt.id), null);
     assert.ok(incidentFor("ISSUANCE", job.id, "EXTERNAL_CANCELLATION_UNMATCHED"));
-    assert.equal(issuanceRow(order.id).status, "QUEUED"); assert.equal(orderState(order.id), "PAID");
+    assert.equal(issuanceRow(order.id).status, "QUEUED"); assert.equal(orderState(order.id), "REFUNDED");
+    assert.equal(sql(`SELECT sum(amount) FROM refund_ledger WHERE payment_id='${attempt.id}'`),String(order.amount));
     assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
     assert.equal(sql(`SELECT count(*) FROM refunds WHERE order_id='${order.id}'`), "0");
     assert.equal(sql(`SELECT count(*) FROM external_cancellations WHERE id='${cancellation.id}'`), "1");
@@ -3343,7 +3344,7 @@ async function monitorScan() {
 }
 async function pausedMonitor(extra = {}) {
   await restart({ ...monitoringPaused, ...extra });
-  await until(() => sql("SELECT count(*) FROM worker_heartbeats") === "7");
+  await until(() => sql("SELECT count(*) FROM worker_heartbeats") === "8");
   sql("UPDATE worker_heartbeats SET initialized_at=clock_timestamp(),last_seen_at=clock_timestamp()");
   await monitorScan();
 }
@@ -3362,7 +3363,7 @@ test("monitoring admin-only snapshots expose thresholds and worker signals witho
     await until(async () => (await monitoringView()).workers.every(worker => !worker.enabled || worker.lastSeenAt));
     const data = await monitoringView();
     assert.equal(data.heartbeatThresholdSeconds, 60); assert.equal(data.backlogThresholdSeconds, 120);
-    assert.equal(data.supplierThresholdSeconds, 300); assert.equal(data.workers.length, 7);
+    assert.equal(data.supplierThresholdSeconds, 300); assert.equal(data.workers.length, 8);
     assert.ok(!/activationCode|password|apiKey|leaseToken/.test(JSON.stringify(data)));
     const issued = await trackingProfile(); assert.equal(issuanceRow(issued.order.id).status, "ISSUED");
     const failed = await failedOrder();
@@ -3830,4 +3831,285 @@ test("request security supplier and profile callback deliveries honor Retry-Afte
     assert.equal(sql("SELECT issue_executions FROM mock_supplier_orders WHERE request_id='"+job.id+"'"),"1");
     assert.equal(sql("SELECT count(*) FROM sim_profiles WHERE order_id='"+order.id+"'"),"1");
   } finally { await restart(); server.closeAllConnections(); await new Promise(resolve=>server.close(resolve)); }
+});
+
+
+function refundById(id) { return JSON.parse(sql(`SELECT row_to_json(r) FROM refunds r WHERE id='${id}'`)); }
+function protectionRows(order) { return JSON.parse(sql(`SELECT COALESCE(json_agg(j ORDER BY created_at,id),'[]') FROM refund_protection_jobs j WHERE order_id='${order}'`)); }
+async function requestPartial(data, overrides = {}, key = randomUUID(), client = admin) {
+  const response = await adminAction(data.order.id, "refunds", { ...refundRequest(data.job), ...overrides }, key, client);
+  assert.equal(response.status, 202, await response.clone().text());
+  return (await response.json()).action.refundId;
+}
+async function protectedDone(data, phase = "TERMINATE") {
+  await until(() => protectionRows(data.order.id).some(j => j.phase === phase && j.status === "SUCCEEDED"));
+}
+
+test("partial refund validates integer amount and serializes different administrators without overspending", {timeout:60000}, async()=>{
+  await restart();
+  const data=await failedOrder(), other=await member("admin2");
+  for (const amount of [0,-1,0.5,1.5,1e25]) assert.equal((await adminAction(data.order.id,"refunds",{...refundRequest(data.job),amount})).status,400);
+  const key=randomUUID(), body={...refundRequest(data.job),amount:10000};
+  const send1=await recoveryPoster(data.order.id,"refunds",body),send2=await recoveryPoster(data.order.id,"refunds",body,other);
+  const replies=await Promise.all([send1(key),send2()]);
+  assert.deepEqual(replies.map(r=>r.status).sort(),[202,409]);
+  const accepted=await replies.find(r=>r.status===202).json();
+  await until(()=>refundById(accepted.action.refundId).status==="SUCCEEDED");
+  assert.equal(orderState(data.order.id),"PARTIALLY_REFUNDED");
+  // The losing administrator may have won; replay the persisted request key.
+  const savedKey=sql(`SELECT idempotency_key FROM admin_actions WHERE refund_id='${accepted.action.refundId}'`);
+  assert.equal((await adminAction(data.order.id,"refunds",body,savedKey)).status,200);
+  assert.equal((await adminAction(data.order.id,"refunds",{...body,amount:9999},savedKey)).status,409);
+  assert.equal((await adminAction(data.order.id,"issuance-retries",retryRequest(data.job))).status,409);
+  let view=await recoveryDetail(data.order.id);
+  assert.equal(view.refundBalance.confirmed,10000); assert.equal(view.refundBalance.available,data.order.amount-10000);
+  const second=await requestPartial(data,{amount:data.order.amount-10000,scenario:"RESPONSE_LOST"});
+  await until(()=>refundById(second).status==="SUCCEEDED");
+  assert.equal(orderState(data.order.id),"REFUNDED");
+  view=await recoveryDetail(data.order.id); assert.equal(view.refunds.length,2); assert.equal(view.refundBalance.available,0);
+  assert.equal(sql(`SELECT sum(amount) FROM refund_ledger WHERE payment_id='${data.attempt.id}'`),String(data.order.amount));
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"2");
+  await runReconciliation({mode:"LEDGER"});
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${data.order.id}'`),"0");
+});
+
+test("partial refund reserves every unknown amount and excludes it from a second cancellation", {timeout:45000},async()=>{
+  await restart(); const data=await failedOrder();
+  const first=await requestPartial(data,{amount:10000,scenario:"UNAVAILABLE"});
+  await until(()=>refundById(first).status==="REVIEW_REQUIRED");
+  assert.equal((await adminAction(data.order.id,"refunds",{...refundRequest(data.job),amount:6000})).status,409);
+  const second=await requestPartial(data,{amount:data.order.amount-10000});
+  await until(()=>refundById(second).status==="SUCCEEDED");
+  const view=await recoveryDetail(data.order.id);
+  assert.equal(view.refundBalance.reserved,10000); assert.equal(view.refundBalance.available,0);
+  assert.equal(orderState(data.order.id),"REFUND_PROCESSING");
+  await restart(); assert.equal(refundById(first).round_attempt_count,3);
+  assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${data.attempt.id}'`),String(data.order.amount-10000));
+});
+
+test("partial refund blocks an unused SIM before PG cancellation and permanently terminates it even for a partial amount", {timeout:60000},async()=>{
+  await restart(); const data=await trackingProfile();
+  const id=await requestPartial(data,{amount:1000,holdScenario:"RESPONSE_LOST",cleanupScenario:"RESPONSE_LOST",scenario:"RESPONSE_LOST"});
+  await protectedDone(data);
+  assert.equal(refundById(id).status,"SUCCEEDED"); assert.equal(orderState(data.order.id),"PARTIALLY_REFUNDED");
+  assert.equal((await trackingChange(data.profile,installedChange)).status,409);
+  assert.equal((await trackingView(data.profile)).profile.installStatus,"DELETED");
+  const jobs=protectionRows(data.order.id);
+  assert.equal(jobs.length,2); assert.ok(jobs.every(j=>j.attempt_count===2));
+  assert.equal(sql(`SELECT count(*) FROM mock_supplier_hold_operations WHERE refund_id='${id}'`),"2");
+  const rest=await requestPartial(data,{amount:data.order.amount-1000});
+  await until(()=>refundById(rest).status==="SUCCEEDED");
+  await until(()=>protectionRows(data.order.id).filter(j=>j.phase==="TERMINATE"&&j.status==="SUCCEEDED").length===2);
+  assert.equal(orderState(data.order.id),"REFUNDED");
+  await runReconciliation({mode:"LEDGER"});
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${data.order.id}'`),"0");
+});
+
+test("partial refund definitive PG rejection releases both reservation and supplier hold without cancelling money", {timeout:60000},async()=>{
+  await restart(); const data=await trackingProfile();
+  const id=await requestPartial(data,{scenario:"DECLINED",cleanupScenario:"RESPONSE_LOST"});
+  await protectedDone(data,"RELEASE");
+  assert.equal(refundById(id).status,"FAILED"); assert.equal(orderState(data.order.id),"PAID");
+  const view=await recoveryDetail(data.order.id); assert.equal(view.refundBalance.available,data.order.amount);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"0");
+  assert.equal((await pg(`/payments/${data.attempt.id}/cancel`,{amount:data.order.amount,scenario:"SUCCESS"},id)).status,409);
+  assert.equal((await trackingChange(data.profile,installedChange)).status,200);
+  await until(async()=>(await trackingView(data.profile)).profile.installStatus==="INSTALLED");
+  assert.equal((await adminAction(data.order.id,"refunds",refundRequest(data.job))).status,409);
+});
+
+test("partial refund supplier installation wins before hold despite a stale unused local snapshot", {timeout:45000},async()=>{
+  await restart(); const data=await trackingProfile();
+  await restart({PAYMENT_WORKER_DELAY_MS:"60000"});
+  const id=await requestPartial(data);
+  const direct=await fetch(`http://127.0.0.1:${servicePort}/internal/mock-supplier/profiles/${data.profile.iccid}/simulate`,{
+    method:"POST",headers:{"X-Gateway-Token":secret,Authorization:`Bearer ${secret}`,"Content-Type":"application/json","Idempotency-Key":randomUUID()},
+    body:JSON.stringify({...installedChange,callbackCopies:0})});
+  assert.equal(direct.status,200);
+  await restart();
+  await until(()=>refundById(id).status==="FAILED");
+  assert.equal(protectionRows(data.order.id)[0].status,"REJECTED");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"0");
+  assert.equal((await recoveryDetail(data.order.id)).refundBalance.reserved,0);
+});
+
+test("partial refund hold storage and error-recording failures retain the reservation and six-attempt budget across restart", {timeout:90000},async()=>{
+  await restart(); const data=await trackingProfile(); let restore;
+  try {
+    restore=rejectTransitions("refund_protection_jobs",data.order.id,["SUCCEEDED","UNKNOWN","REVIEW_REQUIRED"]);
+    const id=await requestPartial(data);
+    await until(()=>protectionRows(data.order.id)[0]?.attempt_count>=2);
+    await restart();
+    await until(()=>protectionRows(data.order.id)[0]?.attempt_count===6,35000);
+    await restart(); await delay(1000);
+    assert.equal(protectionRows(data.order.id)[0].attempt_count,6);
+    assert.equal(refundById(id).status,"WAITING_GUARD");
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"0");
+    assert.equal((await trackingChange(data.profile,installedChange)).status,409);
+    restore(); restore=null;
+    await until(()=>protectionRows(data.order.id)[0].status==="REVIEW_REQUIRED");
+    const job=protectionRows(data.order.id)[0];
+    assert.ok(incidentFor("PROTECTION",job.id));
+    const run=await runReconciliation({mode:"PENDING"});
+    assert.equal(reconciliationItem(run.id,job.id).external_status,"BLOCKED");
+    await protectedDone(data);
+    assert.equal(incidentFor("PROTECTION",job.id).status,"RESOLVED");
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"1");
+    assert.equal(sql(`SELECT count(*) FROM mock_supplier_hold_operations WHERE refund_id='${id}' AND phase='HOLD'`),"1");
+  } finally { if(restore)restore(); await restart(); }
+});
+
+for (const phase of ["HOLD","TERMINATE","RELEASE"]) test(`partial refund ${phase} outage has bounded durable recovery and separate financial state`,{timeout:120000},async()=>{
+  const proxy=await providerProxy("mock-supplier"); let down=true;
+  proxy.intercept=call=>down && call.method==="POST" && call.body?.phase===phase?{status:503}:null;
+  try {
+    await restart({SUPPLIER_BASE_URL:proxy.url,PAYMENT_RETRY_BASE_MS:"100"});
+    const data=await trackingProfile();
+    const id=await requestPartial(data,{scenario:phase==="RELEASE"?"DECLINED":"SUCCESS"});
+    await until(()=>protectionRows(data.order.id).some(j=>j.phase===phase && j.status==="REVIEW_REQUIRED"));
+    let job=protectionRows(data.order.id).find(j=>j.phase===phase);
+    assert.equal(job.attempt_count,6); assert.ok(incidentFor("PROTECTION",job.id));
+    assert.equal(refundById(id).status,phase==="HOLD"?"WAITING_GUARD":phase==="RELEASE"?"FAILED":"SUCCEEDED");
+    if(phase!=="HOLD") assert.equal((await trackingChange(data.profile,installedChange)).status,409);
+    await restart({SUPPLIER_BASE_URL:proxy.url,PAYMENT_RETRY_BASE_MS:"100"}); await delay(300);
+    assert.equal(protectionRows(data.order.id).find(j=>j.id===job.id).attempt_count,6);
+    const target=await recoveryTarget(data.order.id,"PROTECTION",job.id), evidence=await reconcile(data.order.id,target);
+    assert.equal(evidence.outcome,"RESUME_ALLOWED");
+    const fresh=await recoveryTarget(data.order.id,"PROTECTION",job.id), second=await member("admin2");
+    const body=recoveryRequest(fresh,{evidenceId:evidence.id});
+    const firstPost=await recoveryPoster(data.order.id,"recoveries",body), secondPost=await recoveryPoster(data.order.id,"recoveries",body,second);
+    down=false;
+    const replies=await Promise.all([firstPost(),secondPost()]); assert.deepEqual(replies.map(r=>r.status).sort(),[202,409]);
+    await until(()=>protectionRows(data.order.id).find(j=>j.id===job.id).status==="SUCCEEDED");
+    job=protectionRows(data.order.id).find(j=>j.id===job.id);
+    assert.equal(job.execution_round,2); assert.equal(job.attempt_count,7);
+    await protectedDone(data,phase==="RELEASE"?"RELEASE":"TERMINATE");
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),phase==="RELEASE"?"0":"1");
+    assert.equal(sql(`SELECT count(*) FROM mock_supplier_hold_operations WHERE refund_id='${id}' AND phase='${phase}'`),"1");
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("partial refund external manual cancellation is counted once and quarantines over-reserved pending refunds",{timeout:60000},async()=>{
+  await restart(); const data=await failedOrder();
+  const id=await requestPartial(data,{scenario:"UNAVAILABLE"});
+  await until(()=>refundById(id).status==="REVIEW_REQUIRED");
+  assert.equal((await pg(`/payments/${data.attempt.id}/cancel`,{amount:1000})).status,200);
+  await runReconciliation({mode:"PENDING"});
+  let view=await recoveryDetail(data.order.id);
+  assert.equal(view.refundBalance.confirmed,1000); assert.equal(view.refundBalance.reserved,data.order.amount);
+  assert.equal(view.refundBalance.overReserved,true); assert.ok(view.conflicts.length);
+  await runReconciliation({mode:"PENDING"});
+  assert.equal(sql(`SELECT count(*) FROM refund_ledger WHERE payment_id='${data.attempt.id}'`),"1");
+  assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${data.attempt.id}'`),"1000");
+  assert.equal((await adminAction(data.order.id,"refunds",{...refundRequest(data.job),amount:1})).status,409);
+});
+
+
+test("partial refund unknown holds never expire and stop after three rounds of six attempts",{timeout:90000},async()=>{
+  await restart({PAYMENT_RETRY_BASE_MS:"100"}); const data=await trackingProfile();
+  const id=await requestPartial(data,{holdScenario:"UNAVAILABLE"});
+  for(let round=1;round<=3;round++) {
+    await until(()=>protectionRows(data.order.id)[0]?.status==="REVIEW_REQUIRED");
+    const job=protectionRows(data.order.id)[0]; assert.equal(job.attempt_count,round*6); assert.equal(job.execution_round,round);
+    const target=await recoveryTarget(data.order.id,"PROTECTION",job.id),evidence=await reconcile(data.order.id,target);
+    assert.equal(evidence.outcome,"RESUME_ALLOWED");
+    const response=await resumeRecovery(data.order.id,await recoveryTarget(data.order.id,"PROTECTION",job.id),evidence);
+    assert.equal(response.status,round<3?202:409);
+  }
+  await restart(); await delay(500);
+  assert.equal(protectionRows(data.order.id)[0].attempt_count,18);
+  assert.equal(refundById(id).status,"WAITING_GUARD");
+  assert.equal((await recoveryDetail(data.order.id)).refundBalance.reserved,data.order.amount);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"0");
+});
+
+test("partial refund simultaneous install and hold never both permit installation and cancellation",{timeout:60000},async()=>{
+  await restart();
+  for(let i=0;i<3;i++) {
+    const data=await trackingProfile();
+    const [intake,installed]=await Promise.all([
+      adminAction(data.order.id,"refunds",refundRequest(data.job)),trackingChange(data.profile,installedChange)]);
+    assert.ok([202,409].includes(intake.status)); assert.ok([200,409].includes(installed.status));
+    if(intake.status===202) {
+      const id=(await intake.json()).action.refundId;
+      await until(()=>["FAILED","SUCCEEDED"].includes(refundById(id).status));
+      if(installed.status===200) {
+        assert.equal(refundById(id).status,"FAILED");
+        assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${data.attempt.id}'`),"0");
+      } else { assert.equal(refundById(id).status,"SUCCEEDED"); await protectedDone(data); }
+    } else assert.equal(installed.status,200);
+  }
+});
+
+test("partial refund unknown PG result keeps a confirmed hold and mismatched protection results never reach PG",{timeout:60000},async()=>{
+  await restart(); const data=await trackingProfile();
+  const id=await requestPartial(data,{scenario:"UNAVAILABLE"});
+  await until(()=>refundById(id).status==="REVIEW_REQUIRED");
+  assert.equal(protectionRows(data.order.id).length,1);
+  assert.equal(sql(`SELECT state FROM mock_supplier_holds WHERE refund_id='${id}'`),"BLOCKED");
+  await restart(); assert.equal((await trackingChange(data.profile,installedChange)).status,409);
+  assert.equal((await recoveryDetail(data.order.id)).refundBalance.reserved,data.order.amount);
+  const proxy=await providerProxy("mock-supplier");
+  try {
+    const bad=await trackingProfile();
+    proxy.intercept=call=>call.method==="POST" && call.body?.phase==="HOLD"?{status:200,body:{
+      operationId:call.path.split("/").at(-1),refundId:call.body.refundId,orderId:randomUUID(),iccid:bad.profile.iccid,phase:"HOLD",state:"BLOCKED",profile:null}}:null;
+    await restart({SUPPLIER_BASE_URL:proxy.url});
+    await requestPartial(bad);
+    await until(()=>protectionRows(bad.order.id)[0]?.status==="REVIEW_REQUIRED");
+    assert.equal(protectionRows(bad.order.id)[0].attempt_count,1);
+    assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${bad.attempt.id}'`),"0");
+  } finally { await restart(); await proxy.close(); }
+});
+
+
+test("partial refund reconciliation recovers a definitive PG rejection after DB failure without a new cancellation",{timeout:60000},async()=>{
+  await restart(); const data=await failedOrder(); let restore;
+  try {
+    restore=rejectTransitions("refunds",data.order.id,["FAILED"]);
+    const id=await requestPartial(data,{scenario:"DECLINED"});
+    await until(()=>refundById(id).status==="REVIEW_REQUIRED");
+    restore(); restore=null; await restart();
+    await runReconciliation({mode:"PENDING"});
+    assert.equal(refundById(id).status,"FAILED"); assert.equal(orderState(data.order.id),"PAID");
+    assert.equal((await recoveryDetail(data.order.id)).refundBalance.available,data.order.amount);
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancel_rejections WHERE payment_id='${data.attempt.id}'`),"1");
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"0");
+  } finally {if(restore)restore(); await restart();}
+});
+
+test("partial refund termination completion DB failure leaves money confirmed and recovers cleanup read only after restart",{timeout:90000},async()=>{
+  await restart({PAYMENT_RETRY_BASE_MS:"100"}); const data=await trackingProfile();
+  sql(`CREATE FUNCTION reject_cleanup_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.order_id='${data.order.id}' AND NEW.phase='TERMINATE' AND NEW.status='SUCCEEDED' THEN RAISE EXCEPTION 'cleanup commit failed'; END IF; RETURN NEW; END $$;
+    CREATE TRIGGER reject_cleanup_completion BEFORE UPDATE ON refund_protection_jobs FOR EACH ROW EXECUTE FUNCTION reject_cleanup_completion();`);
+  let removed=false;
+  try {
+    const id=await requestPartial(data);
+    await until(()=>protectionRows(data.order.id).some(j=>j.phase==="TERMINATE" && j.status==="REVIEW_REQUIRED"));
+    assert.equal(refundById(id).status,"SUCCEEDED"); assert.equal(orderState(data.order.id),"REFUNDED");
+    assert.equal(sql(`SELECT state FROM mock_supplier_holds WHERE refund_id='${id}'`),"TERMINATED");
+    sql("DROP TRIGGER reject_cleanup_completion ON refund_protection_jobs; DROP FUNCTION reject_cleanup_completion();");removed=true;
+    await restart(); await runReconciliation({mode:"PENDING"});
+    await protectedDone(data);
+    assert.equal(sql(`SELECT count(*) FROM mock_supplier_hold_operations WHERE refund_id='${id}' AND phase='TERMINATE'`),"1");
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"1");
+    assert.equal((await trackingView(data.profile)).profile.installStatus,"DELETED");
+  } finally {
+    if(!removed)sql("DROP TRIGGER reject_cleanup_completion ON refund_protection_jobs; DROP FUNCTION reject_cleanup_completion();");
+    await restart();
+  }
+});
+
+
+test("partial refund preserves the legacy full-refund request fingerprint for retries after upgrade",{timeout:45000},async()=>{
+  await restart(); const data=await failedOrder(),key=randomUUID(),body=refundRequest(data.job);
+  const response=await adminAction(data.order.id,"refunds",body,key); assert.equal(response.status,202);
+  const action=(await response.json()).action;
+  const legacyHash=createHash("sha256").update(JSON.stringify(["REFUND",body])).digest("hex");
+  assert.equal(sql(`SELECT payload_hash FROM admin_actions WHERE id='${action.id}'`),legacyHash);
+  await until(()=>refundById(action.refundId).status==="SUCCEEDED");
+  await restart();
+  assert.equal((await adminAction(data.order.id,"refunds",body,key)).status,200);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"1");
 });

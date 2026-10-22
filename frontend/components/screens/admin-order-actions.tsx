@@ -13,7 +13,7 @@ import AdminConcurrencyDemo from "./admin-concurrency-demo";
 import AdminOrderRecovery from "./admin-order-recovery";
 
 type Draft = { key: string; path: string; body: string };
-const states: Record<string, string> = { REQUESTED: "환불 접수", QUEUED: "발급 재시도 접수", UNKNOWN: "PG 취소 결과 확인 중",
+const states: Record<string, string> = { WAITING_GUARD: "미사용 SIM 차단 확인 중", REQUESTED: "환불 접수", QUEUED: "발급 재시도 접수", UNKNOWN: "PG 취소 결과 확인 중",
   PROCESSING: "PG 취소 확인 중", SUCCEEDED: "환불 완료", REVIEW_REQUIRED: "운영자 확인 필요", ISSUED: "발급 완료", FAILED: "발급 실패" };
 const inboundStates: Record<InboundEvent["status"], string> = { PENDING: "저장 완료·처리 대기", PROCESSING: "처리 중",
   RETRY: "재처리 대기", PROCESSED: "처리 완료", REVIEW_REQUIRED: "운영자 확인 필요" };
@@ -23,6 +23,9 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
   const [view, setView] = useState(initial);
   const [reason, setReason] = useState("");
   const [scenario, setScenario] = useState("SUCCESS");
+  const [amount, setAmount] = useState("");
+  const [holdScenario, setHoldScenario] = useState("SUCCESS");
+  const [cleanupScenario, setCleanupScenario] = useState("SUCCESS");
   const [issueScenario, setIssueScenario] = useState("SUCCEED");
   const [duplicate, setDuplicate] = useState(false);
   const [pending, setPending] = useState(false);
@@ -52,7 +55,8 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
           if (saved && typeof saved.key === "string" && typeof saved.body === "string"
             && [`/api/admin/orders/${id}/refunds`, `/api/admin/orders/${id}/issuance-retries`].includes(saved.path)) setDraft(saved);
         } catch { /* 저장할 수 없어도 같은 화면에서는 요청 키를 유지한다. */ }
-        const active = ["REQUESTED", "PROCESSING", "UNKNOWN"].includes(data.refund?.status || "")
+        const active = (data.refunds || []).some(refund => ["WAITING_GUARD", "REQUESTED", "PROCESSING", "UNKNOWN"].includes(refund.status))
+          || (data.protectionJobs || []).some(job => ["QUEUED", "PROCESSING", "UNKNOWN"].includes(job.status))
           || ["QUEUED", "PROCESSING", "WAITING_CALLBACK"].includes(data.issuance?.issuance?.status || "")
           || (data.inboundEvents || []).some(event => ["PENDING", "PROCESSING", "RETRY"].includes(event.status))
           || (data.recoveryActions || []).some(action => ["QUEUED", "PROCESSING", "RETRY"].includes(action.status));
@@ -86,7 +90,7 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
   function submit(type: "refunds" | "issuance-retries") {
     const job = view.issuance?.issuance;
     if (!job || !reason.trim()) return;
-    const body = { issuanceId: job.id, reason: reason.trim(), ...(type === "refunds" ? { scenario } : {
+    const body = { issuanceId: job.id, reason: reason.trim(), ...(type === "refunds" ? { scenario, amount: amount === "" ? view.refundBalance.available : Number(amount), holdScenario, cleanupScenario } : {
       simulation: { scenario: issueScenario, callbackCopies: 1, callbackDelayMs: 2000 },
     }) };
     const request = { key: crypto.randomUUID(), path: `/api/admin/orders/${id}/${type}`, body: JSON.stringify(body) };
@@ -100,6 +104,11 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
   const conflicts = view.conflicts || [];
   const age = now === null || !view.checkedAt ? null : Math.max(0, Math.floor((now - Date.parse(view.checkedAt)) / 1000));
   const canAct = view.order.order.status === "PAID" && job?.status === "FAILED" && !view.issuance?.profile && !view.refund && conflicts.length === 0;
+  const available = view.refundBalance?.available ?? 0;
+  const requested = amount === "" ? available : Number(amount);
+  const canRefund = conflicts.length === 0 && ["PAID", "PARTIALLY_REFUNDED", "REFUND_PROCESSING"].includes(view.order.order.status)
+    && (job?.status === "FAILED" && !profile || job?.status === "ISSUED" && profile && !profile.installedAt && !profile.activatedAt)
+    && Number.isSafeInteger(requested) && requested > 0 && requested <= available;
   return <>
     <p>서버 마지막 조회: {view.checkedAt ? kst(view.checkedAt) : "조회 시각 확인 대기"}{age !== null && ` · ${age}초 전`} · 처리 중 1.5초, 그 외 5초 간격 갱신</p>
     {pollError && <p role="alert">{pollError}</p>}
@@ -152,20 +161,31 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
     <AdminOrderTimeline orderId={id} latest={view.timeline} />
     <section className="home-panel"><h2>운영자 조치</h2>
       <p>현재 주문: {orderStatus(view.order.order.status)} · 발급: {job ? issuanceStatus(job.status) : "작업 없음"}</p>
-      <p>발급 실패가 확정되고 SIM이 없는 주문만 재시도 또는 전액 환불할 수 있습니다. 환불 접수 후 발급 재시도는 차단됩니다.</p>
+      <p>발급 실패 주문 또는 미사용 SIM을 환불할 수 있습니다. 발급된 SIM은 공급사 차단 확인 후 환불하며, 부분 환불도 SIM 사용을 영구 종료합니다. 설치·개통된 SIM은 일반 환불할 수 없습니다.</p>
       <div className="screen-form">
       <label>조치 사유 <textarea value={reason} onChange={e => setReason(e.target.value)} maxLength={300} disabled={pending} /></label>
       <label>재시도 발급 결과 <select value={issueScenario} onChange={e => setIssueScenario(e.target.value)} disabled={pending}>
         <option value="SUCCEED">발급 성공</option><option value="FAIL">발급 실패</option>
       </select></label>
+      <label>환불 금액 (KRW, 빈칸은 남은 잔액 전체)
+        <input type="number" min={1} max={available} step={1} value={amount} placeholder={String(available)} onChange={e => setAmount(e.target.value)} disabled={pending} />
+      </label>
+      {profile && <>
+        <label>미사용 차단 시연 <select value={holdScenario} onChange={e => setHoldScenario(e.target.value)} disabled={pending}>
+          <option value="SUCCESS">차단 성공</option><option value="RESPONSE_LOST">차단 후 응답 유실</option><option value="UNAVAILABLE">차단 장애, 6회 후 확인 필요</option>
+        </select></label>
+        <label>환불 후 종료·거절 후 해제 시연 <select value={cleanupScenario} onChange={e => setCleanupScenario(e.target.value)} disabled={pending}>
+          <option value="SUCCESS">정리 성공</option><option value="RESPONSE_LOST">정리 후 응답 유실</option><option value="UNAVAILABLE">정리 장애, 6회 후 확인 필요</option>
+        </select></label>
+      </>}
       <label>환불 시연 상황 <select value={scenario} onChange={e => setScenario(e.target.value)} disabled={pending}>
-        <option value="SUCCESS">취소 성공</option><option value="RESPONSE_LOST">취소 후 응답 유실</option><option value="UNAVAILABLE">PG 취소 장애, 3회 후 확인 필요</option>
+        <option value="SUCCESS">취소 성공</option><option value="DECLINED">취소 거절 확정, 차단 해제</option><option value="RESPONSE_LOST">취소 후 응답 유실</option><option value="UNAVAILABLE">PG 취소 장애, 3회 후 확인 필요</option>
       </select></label>
       <label><input type="checkbox" checked={duplicate} onChange={e => setDuplicate(e.target.checked)} disabled={pending} />같은 요청을 동시에 2회 전송</label>
       </div>
       <div className="page-actions">
         <button disabled={pending || !canAct || !reason.trim()} onClick={() => submit("issuance-retries")}>발급 재시도</button>
-        <button disabled={pending || !canAct || !reason.trim()} onClick={() => submit("refunds")}>전액 환불 접수</button>
+        <button disabled={pending || !canRefund || !reason.trim()} onClick={() => submit("refunds")}>환불 접수</button>
         <button disabled={pending || !draft || conflicts.length > 0} onClick={() => draft && void send(draft, 1)}>동일 요청 다시 전송</button>
         <button disabled={pending} onClick={() => setRefresh(value => value + 1)}>조치 결과 다시 확인</button>
       </div>
@@ -174,22 +194,29 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
     </section>
     {conflicts.length === 0 && <AdminConcurrencyDemo orderId={id} issuanceId={job?.id} eligible={!!canAct} />}
     <section className="home-panel"><h2>환불 처리</h2>
-      {view.refund ? <>
-        <p>{states[view.refund.status] || view.refund.status} · {money(view.refund.amount)} KRW</p>
-        <p>환불번호: {view.refund.id}<br />PG 취소번호: {view.refund.pgCancellationId || "확인 중"}</p>
-        <p>누적 PG 처리·확인 시도 {view.refund.attemptCount}회</p>
-        {view.refund.executionRound !== undefined && <p>실행 회차 {view.refund.executionRound} · 이번 회차 시도 {view.refund.roundAttemptCount ?? view.refund.attemptCount}/3회</p>}
-        {view.refund.lastError && <p>확인 사유: {view.refund.lastError}</p>}
-        {view.refund.status === "REVIEW_REQUIRED" && <p role="alert">자동 처리를 중단했습니다. 환불 완료로 간주하지 않으며 새 환불·발급을 막습니다. PG 원장 확인이 필요합니다.</p>}
-      </> : <p>환불 접수 없음</p>}
+      {view.refundBalance && <p>승인 {money(view.refundBalance.approved)} · 확정 환불 {money(view.refundBalance.confirmed)} · 미확정 예약 {money(view.refundBalance.reserved)} · 추가 환불 가능 {money(available)} KRW</p>}
+      {view.refundBalance?.overReserved && <p role="alert">외부 취소와 예약액이 승인액을 초과합니다. 추가 취소를 중단하고 원장을 확인해야 합니다.</p>}
+      {(view.refunds || []).length === 0 ? <p>환불 접수 없음</p> : view.refunds.map(refund => <article key={refund.id}>
+        <h3>{refund.status === "FAILED" ? "환불 미실행 확정" : states[refund.status] || refund.status} · {money(refund.amount)} KRW</h3>
+        <p>환불번호: {refund.id}<br />PG 취소번호: {refund.pgCancellationId || "없음·미확정"}<br />누적 시도 {refund.attemptCount}회 · 실행 회차 {refund.executionRound} · 이번 회차 {refund.roundAttemptCount}/3회</p>
+        {refund.lastError && <p>확인 사유: {refund.lastError}</p>}
+        {refund.status === "REVIEW_REQUIRED" && <p role="alert">예약액을 유지합니다. 같은 환불번호로 결과를 재조회해 주세요.</p>}
+      </article>)}
+      <h3>공급사 차단·종료·해제</h3>
+      <p>금전 환불 완료와 공급사 정리 완료는 별도입니다. 불확실한 동안 차단은 자동 만료되지 않습니다.</p>
+      {(view.protectionJobs || []).map(job => <article key={job.id}>
+        <p>{{ HOLD: "미사용 차단", RELEASE: "차단 해제", TERMINATE: "영구 사용 종료" }[job.phase]} · {{ SUCCEEDED: "확인 완료", REJECTED: "미사용 조건 불충족", REVIEW_REQUIRED: "운영자 확인 필요", QUEUED: "대기", PROCESSING: "처리 중", UNKNOWN: "결과 확인 중" }[job.status] || job.status}</p>
+        <p>환불번호: {job.refundId}<br />공급사 작업번호: {job.id}<br />누적 {job.attemptCount}회 · 실행 회차 {job.executionRound}/3 · 이번 회차 {job.roundAttemptCount}/6회</p>
+        {job.lastError && <p role="alert">{job.lastError} · 위의 확인 필요 건 재조회에서 처리할 수 있습니다.</p>}
+      </article>)}
     </section>
     <section className="home-panel"><h2>운영자 조치 이력</h2><p>최근 최대 100건입니다. 중복 요청은 기존 조치번호를 반환하며 이력을 추가하지 않습니다.</p>
       {(view.actions || []).length === 0 ? <p>아직 조치 이력이 없습니다.</p> : view.actions?.map(action => <article key={action.id}>
-        <h3>{action.type === "REFUND" ? "전액 환불" : "발급 재시도"} · {action.actor}</h3>
+        <h3>{action.type === "REFUND" ? "환불" : "발급 재시도"} · {action.actor}</h3>
         <p>사유: {action.reason}<br />접수: {kst(action.createdAt)}<br />조치번호: {action.id}</p>
         <p>대상 번호: {action.refundId || action.issuanceId}</p>
         {(view.actionEvents || []).filter(event => event.actionId === action.id).map(event => <p key={event.id}>
-          {kst(event.createdAt)} · {states[event.status] || event.status}{event.detail && ` · ${event.detail}`}
+          {kst(event.createdAt)} · {action.type === "REFUND" && event.status === "FAILED" ? "환불 미실행 확정" : states[event.status] || event.status}{event.detail && ` · ${event.detail}`}
         </p>)}
       </article>)}
     </section>

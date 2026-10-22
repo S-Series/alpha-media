@@ -120,7 +120,7 @@ public class ScenarioService {
             LEFT JOIN orders o ON o.id=g.order_id
             LEFT JOIN LATERAL (SELECT status FROM payment_attempts WHERE order_id=g.order_id ORDER BY created_at DESC,id DESC LIMIT 1) p ON TRUE
             LEFT JOIN issuance_jobs j ON j.order_id=g.order_id AND j.is_current
-            LEFT JOIN refunds r ON r.order_id=g.order_id LEFT JOIN sim_profiles s ON s.order_id=g.order_id
+            LEFT JOIN LATERAL (SELECT * FROM refunds WHERE order_id=g.order_id ORDER BY created_at DESC,id DESC LIMIT 1) r ON TRUE LEFT JOIN sim_profiles s ON s.order_id=g.order_id
             WHERE g.id=?
             """,MAPPER,id).stream().findFirst().orElseThrow(()->new OrderException(404,"GENERATION_NOT_FOUND","생성 요청을 찾을 수 없습니다. 처음 요청 키로 접수를 다시 확인하세요."));
     }

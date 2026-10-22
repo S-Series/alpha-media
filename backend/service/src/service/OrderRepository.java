@@ -99,6 +99,7 @@ public class OrderRepository {
                         OR EXISTS (SELECT 1 FROM order_conflicts c WHERE c.order_id=o.id)
                         OR EXISTS (SELECT 1 FROM inbound_events e WHERE e.order_id=o.id AND e.status='REVIEW_REQUIRED')
                         OR EXISTS (SELECT 1 FROM refunds r WHERE r.order_id=o.id AND r.status='REVIEW_REQUIRED')
+                        OR EXISTS (SELECT 1 FROM refund_protection_jobs r WHERE r.order_id=o.id AND r.status='REVIEW_REQUIRED')
                         OR (o.effective_status='PAID' AND EXISTS (SELECT 1 FROM issuance_jobs j WHERE j.order_id=o.id AND j.is_current
                             AND (j.status IN ('FAILED','REVIEW_REQUIRED') OR
                                 (j.status IN ('QUEUED','PROCESSING','WAITING_CALLBACK') AND j.created_at<clock_timestamp()-INTERVAL '2 minutes')))))

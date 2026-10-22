@@ -34,7 +34,7 @@ public class MonitoringService {
         boolean pg=env.getProperty("payment.mock-enabled",Boolean.class,false);
         boolean supplier=env.getProperty("issuance.mock-enabled",Boolean.class,false);
         workers.put("PAYMENT",pg); workers.put("REFUND",pg); workers.put("ISSUANCE",supplier); workers.put("PROFILE",supplier);
-        workers.put("INBOUND",true); workers.put("RECOVERY",true);
+        workers.put("PROTECTION",supplier); workers.put("INBOUND",true); workers.put("RECOVERY",true);
         workers.put("RECONCILIATION",pg && supplier && env.getProperty("reconciliation.enabled",Boolean.class,true));
     }
     boolean enabled() { return enabled; }
@@ -112,7 +112,7 @@ public class MonitoringService {
     }
     private List<Queue> queues(Instant now) {
         var result=new ArrayList<Queue>();
-        for (String name:List.of("PAYMENT","REFUND","ISSUANCE","PROFILE","INBOUND","RECOVERY","RECONCILIATION_PAGE","RECONCILIATION_ITEM")) {
+        for (String name:List.of("PROTECTION","PAYMENT","REFUND","ISSUANCE","PROFILE","INBOUND","RECOVERY","RECONCILIATION_PAGE","RECONCILIATION_ITEM")) {
             var rows=jdbc.query("""
                 SELECT id,order_id,due_at,count(*) OVER() AS total FROM monitoring_queue_items
                 WHERE queue=? AND due_at<=? ORDER BY due_at,id LIMIT 1

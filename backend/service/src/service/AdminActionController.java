@@ -36,5 +36,9 @@ public class AdminActionController {
             .header("Idempotency-Replayed",Boolean.toString(result.replayed())).body(result);
     }
     public record Retry(@NotNull UUID issuanceId,@NotBlank @Size(max=300) String reason,@NotNull @Valid IssuanceSimulation simulation) {}
-    public record RefundRequest(@NotNull UUID issuanceId,@NotBlank @Size(max=300) String reason,@NotNull Refund.Scenario scenario) {}
+    @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+    public record RefundRequest(@NotNull UUID issuanceId,@NotBlank @Size(max=300) String reason,@NotNull Refund.Scenario scenario,
+        @jakarta.validation.constraints.DecimalMin("1") @jakarta.validation.constraints.Digits(integer=18,fraction=0) java.math.BigDecimal amount,RefundProtection.Scenario holdScenario,RefundProtection.Scenario cleanupScenario) {
+        public RefundRequest(UUID issuanceId,String reason,Refund.Scenario scenario) { this(issuanceId,reason,scenario,null,null,null); }
+    }
 }

@@ -114,6 +114,7 @@ export default function PaymentPanel({ orderId, status, expiresAt }: Pick<Order,
     <p>새 결제 접수 기한: {new Date(expiresAt).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })} (KST)</p>
     {status === "PAID" && <p>결제가 완료됐습니다. 서버가 발급 작업을 이어서 처리합니다.</p>}
     {status === "REFUND_PROCESSING" && <p>전액 환불 결과를 확인 중입니다. 새 결제는 차단됩니다.</p>}
+    {status === "PARTIALLY_REFUNDED" && <p>부분 환불이 완료됐습니다.</p>}
     {status === "REFUNDED" && <p>전액 환불이 완료됐습니다.</p>}
     {status === "PAYMENT_PROCESSING" && <p>기존 결제 결과를 확인 중입니다. 새 결제를 시작할 수 없습니다.</p>}
     {status === "EXPIRED" && <p>주문이 만료되어 새 결제를 시작할 수 없습니다.</p>}

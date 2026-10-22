@@ -39,7 +39,7 @@ export default function IssuancePanel({ orderId, status }: { orderId: string; st
   const job = view?.issuance, profile = view?.profile;
   return <section className="home-panel">
     <h2>eSIM 발급</h2>
-    {status === "REFUND_PROCESSING" || status === "REFUNDED" ? <p>{status === "REFUNDED" ? "환불이 완료된 주문입니다." : "환불 확인 중입니다."} 발급 재시도는 중단됩니다.</p> :
+    {status === "REFUND_PROCESSING" || status === "REFUNDED" || status === "PARTIALLY_REFUNDED" ? <p>{status === "PARTIALLY_REFUNDED" ? "부분 환불된 주문입니다." : status === "REFUNDED" ? "환불이 완료된 주문입니다." : "환불 확인 중입니다."} 발급 재시도는 중단됩니다.</p> :
     status !== "PAID" && status !== "PAYMENT_PROCESSING" ? <p>결제가 승인되면 서버가 자동으로 발급을 요청합니다.</p> : <>
       <p aria-live="polite">{job ? issuanceStatus(job.status) : "발급 작업을 확인 중입니다."}</p>
       {job && <>

@@ -21,6 +21,9 @@ public class RecoveryService {
     private final PaymentRepository payments;
     private final IssuanceRepository jobs;
     private final RefundRepository refunds;
+    private final RefundProtection protection;
+    private final RefundProtectionService protectionResults;
+    private final RefundBalance balance;
     private final InboundEventRepository inbox;
     private final PaymentTransitions paymentResults;
     private final IssuanceService issuanceResults;
@@ -34,9 +37,9 @@ public class RecoveryService {
     public RecoveryService(RecoveryRepository actions,RecoveryTargets targets,OrderRepository orders,PaymentRepository payments,
             IssuanceRepository jobs,RefundRepository refunds,InboundEventRepository inbox,PaymentTransitions paymentResults,
             IssuanceService issuanceResults,RefundService refundResults,OrderConflicts conflicts,ObjectProvider<PgClient> pg,
-            ObjectProvider<SupplierClient> supplier,InboundPayloadCodec codec,ObjectMapper mapper,JdbcTemplate jdbc) {
+            ObjectProvider<SupplierClient> supplier,InboundPayloadCodec codec,ObjectMapper mapper,JdbcTemplate jdbc,RefundProtection protection,RefundProtectionService protectionResults,RefundBalance balance) {
         this.actions=actions; this.targets=targets; this.orders=orders; this.payments=payments; this.jobs=jobs; this.refunds=refunds;
-        this.inbox=inbox; this.paymentResults=paymentResults; this.issuanceResults=issuanceResults; this.refundResults=refundResults;
+        this.protection=protection; this.protectionResults=protectionResults; this.balance=balance; this.inbox=inbox; this.paymentResults=paymentResults; this.issuanceResults=issuanceResults; this.refundResults=refundResults;
         this.conflicts=conflicts; this.pg=pg; this.supplier=supplier; this.codec=codec; this.mapper=mapper; this.jdbc=jdbc;
     }
 
@@ -86,6 +89,7 @@ public class RecoveryService {
         }
         orders.historyContext(actor,"ADMIN_RESUME",request.reason().trim());
         String reset=switch(request.target()) {
+            case PROTECTION -> "status='QUEUED',round_attempt_count=0,next_attempt_at=clock_timestamp(),updated_at=clock_timestamp()";
             case PAYMENT -> "status='QUEUED',round_attempt_count=0,next_attempt_at=clock_timestamp(),updated_at=clock_timestamp()";
             case REFUND -> "status='REQUESTED',round_attempt_count=0,next_attempt_at=clock_timestamp(),updated_at=clock_timestamp()";
             case ISSUANCE -> "status='QUEUED',consecutive_failures=0,round_submission_count=0,waiting_since=NULL,next_check_at=clock_timestamp(),updated_at=clock_timestamp()";
@@ -104,13 +108,15 @@ public class RecoveryService {
         Object result=switch(action.target()) {
             case PAYMENT -> pgClient().lookup(payments.findById(action.targetId()).orElseThrow()).orElse(null);
             case ISSUANCE -> supplierClient().lookup(jobs.findById(action.targetId()).orElseThrow()).orElse(null);
-            case REFUND -> pgClient().lookupCancellation(refunds.find(action.orderId()).orElseThrow()).orElse(null);
+            case REFUND -> pgClient().lookupCancellation(refunds.findById(action.targetId()).orElseThrow()).orElse(null);
+            case PROTECTION -> supplierClient().protection(protection.get(action.targetId()),false).orElse(null);
             case INBOUND -> lookupInbox(inbox.find(action.targetId()).orElseThrow());
         };
         if (result==null) return new Observation(null,"NOT_FOUND",null);
         if (result instanceof PgResult payment) return new Observation(payment,payment.status(),payment.transactionId());
         if (result instanceof SupplierResult issuance) return new Observation(issuance,issuance.status(),issuance.supplierOrderNo());
-        if (result instanceof MockPgService.Cancellation refund) return new Observation(refund,"SUCCEEDED",refund.id()==null?null:refund.id().toString());
+        if (result instanceof MockPgService.Cancellation refund) return new Observation(refund,refund.status(),refund.id()==null?null:refund.id().toString());
+        if (result instanceof RefundProtection.Result hold) return new Observation(hold,hold.state(),hold.operationId().toString());
         var profile=(ProfileSignal)result;
         return new Observation(profile,profile.state(),profile.iccid());
     }
@@ -177,7 +183,8 @@ public class RecoveryService {
                 if ("ACCEPTED".equals(result.status())) return safeToResume(action.orderId(),action.target(),action.targetId())?"RESUME_ALLOWED":"BLOCKED";
                 issuanceResults.result(result,null,"LOOKUP");
             }
-            case REFUND -> refundResults.reconcile(refunds.find(action.orderId()).orElseThrow(),(MockPgService.Cancellation)observation.payload());
+            case PROTECTION -> protectionResults.reconcile(protection.get(action.targetId()),(RefundProtection.Result)observation.payload());
+            case REFUND -> refundResults.reconcile(refunds.findById(action.targetId()).orElseThrow(),(MockPgService.Cancellation)observation.payload());
             default -> throw new IllegalStateException("Unsupported recovery target");
         }
         return "APPLIED";
@@ -188,10 +195,17 @@ public class RecoveryService {
             case PAYMENT -> "PAYMENT_PROCESSING".equals(order.status()) && order.expiresAt().isAfter(Instant.now());
             case ISSUANCE -> "PAID".equals(order.status()) && jobs.find(orderId).map(job->job.id().equals(id)).orElse(false)
                 && jobs.profile(orderId).isEmpty() && refunds.find(orderId).isEmpty();
-            case REFUND -> "REFUND_PROCESSING".equals(order.status()) && jobs.profile(orderId).isEmpty()
-                && jobs.find(orderId).map(job->"FAILED".equals(job.status())).orElse(false)
-                && refunds.find(orderId).map(refund->refund.id().equals(id)).orElse(false)
+            case REFUND -> "REFUND_PROCESSING".equals(order.status()) && protection.ready(id) && !balance.summary(orderId).overReserved()
+                && refunds.findById(id).filter(r->r.orderId().equals(orderId)).isPresent()
                 && payments.list(orderId).stream().anyMatch(payment->"APPROVED".equals(payment.status()));
+            case PROTECTION -> {
+                var job=protection.get(id); var refund=refunds.findById(job.refundId()).orElseThrow();
+                yield switch(job.phase()) {
+                    case "HOLD" -> "WAITING_GUARD".equals(refund.status());
+                    case "RELEASE" -> "FAILED".equals(refund.status());
+                    default -> "SUCCEEDED".equals(refund.status());
+                };
+            }
             case INBOUND -> inbox.find(id).map(this::replayable).orElse(false);
         };
     }
@@ -202,7 +216,7 @@ public class RecoveryService {
     }
     private void enabled(RecoveryTargets.Kind kind,UUID id) {
         if (kind==RecoveryTargets.Kind.PAYMENT || kind==RecoveryTargets.Kind.REFUND) pgClient();
-        else if (kind==RecoveryTargets.Kind.ISSUANCE) supplierClient();
+        else if (kind==RecoveryTargets.Kind.ISSUANCE || kind==RecoveryTargets.Kind.PROTECTION) supplierClient();
         else if ("PG".equals(inbox.find(id).orElseThrow().source())) pgClient(); else supplierClient();
     }
     private PgClient pgClient() {

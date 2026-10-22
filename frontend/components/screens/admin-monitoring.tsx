@@ -4,7 +4,7 @@ import Link from "next/link";
 import { incidentStatuses, useReconciliationRead, type IncidentStatus } from "@/lib/admin-reconciliation";
 import { kst } from "@/lib/format";
 
-const names: Record<string, string> = { PAYMENT: "결제", REFUND: "환불", ISSUANCE: "발급", PROFILE: "SIM 추적", INBOUND: "웹훅",
+const names: Record<string, string> = { PROTECTION: "SIM 차단·정리", PAYMENT: "결제", REFUND: "환불", ISSUANCE: "발급", PROFILE: "SIM 추적", INBOUND: "웹훅",
   RECOVERY: "운영자 복구", RECONCILIATION: "대사", RECONCILIATION_PAGE: "대사 원장 수집", RECONCILIATION_ITEM: "대사 거래 조회" };
 const statuses: Record<string, string> = { HEALTHY: "정상", DEGRADED: "확인 필요", STALE: "감시 결과 지연", STARTING: "첫 점검 대기", DISABLED: "감시 비활성" };
 type Monitoring = { status: string; lastCheckedAt: string | null; checkedAt: string; unresolvedIncidents: number;

@@ -20,11 +20,13 @@ public class AdminActionService {
     private final PaymentSettings paymentSettings;
     private final IssuanceSettings issuanceSettings;
     private final OrderConflicts conflicts;
+    private final RefundBalance balance;
+    private final RefundProtection protection;
     public AdminActionService(OrderRepository orders, IssuanceRepository jobs, RefundRepository refunds,
             AdminActionRepository actions, JdbcTemplate jdbc, ObjectMapper mapper, PaymentSettings paymentSettings,
-            IssuanceSettings issuanceSettings, OrderConflicts conflicts) {
+            IssuanceSettings issuanceSettings, OrderConflicts conflicts,RefundBalance balance,RefundProtection protection) {
         this.orders=orders; this.jobs=jobs; this.refunds=refunds; this.actions=actions; this.jdbc=jdbc;
-        this.mapper=mapper; this.paymentSettings=paymentSettings; this.issuanceSettings=issuanceSettings; this.conflicts=conflicts;
+        this.mapper=mapper; this.paymentSettings=paymentSettings; this.issuanceSettings=issuanceSettings; this.conflicts=conflicts; this.balance=balance; this.protection=protection;
     }
 
     @Transactional
@@ -54,14 +56,36 @@ public class AdminActionService {
         var existing = actions.find(orderId,key);
         if (existing.isPresent()) return replay(existing.get(),hash);
         if (!paymentSettings.mockEnabled()) throw new OrderException(503,"PG_DISABLED","모의 PG가 활성화되지 않았습니다.");
-        eligible(order,request.issuanceId());
+        conflicts.requireClear(order.id());
+        if (!java.util.List.of("PAID","PARTIALLY_REFUNDED","REFUND_PROCESSING").contains(order.status()))
+            throw new OrderException(409,"ACTION_NOT_ALLOWED","환불 가능한 결제 상태가 아닙니다.");
+        var job=jobs.find(order.id()).orElseThrow(()->new OrderException(409,"ISSUANCE_NOT_FAILED","발급 결과를 먼저 확인해 주세요."));
+        job=jobs.lock(job.id());
+        var profile=jobs.profile(order.id());
+        if (!job.id().equals(request.issuanceId()) || !("FAILED".equals(job.status()) && profile.isEmpty() || "ISSUED".equals(job.status()) && profile.isPresent()))
+            throw new OrderException(409,"ISSUANCE_NOT_FAILED","현재 발급 결과가 확정되어야 합니다.");
+        if (profile.isPresent()) {
+            if (!issuanceSettings.mockEnabled()) throw new OrderException(409,"SUPPLIER_HOLD_UNSUPPORTED","원자적 미사용 차단을 지원하는 공급사만 환불할 수 있습니다.");
+            if (profile.get().installedAt()!=null || profile.get().activatedAt()!=null)
+                throw new OrderException(409,"SIM_ALREADY_USED","설치 또는 개통된 SIM은 일반 환불할 수 없습니다.");
+        }
         if (order.amount() <= 0) throw new OrderException(409,"NO_REFUND_AMOUNT","환불할 결제 금액이 없습니다.");
-        var payments = jdbc.queryForList("SELECT id FROM payment_attempts WHERE order_id=? AND status='APPROVED'",order.id());
+        var payments = jdbc.queryForList("SELECT id FROM payment_attempts WHERE order_id=? AND status='APPROVED' FOR UPDATE",order.id());
         if (payments.size()!=1) throw new OrderException(409,"PAYMENT_NOT_APPROVED","승인된 결제를 확인해야 합니다.");
-        Refund refund = refunds.insert(order,(UUID)payments.getFirst().get("id"),request.scenario());
+        UUID payment=(UUID)payments.getFirst().get("id");
+        long available=balance.summary(order.id()).available();
+        long amount=request.amount()==null?available:request.amount().longValueExact();
+        if (amount<=0 || amount>available)
+            throw new OrderException(409,"REFUND_BALANCE_EXCEEDED","확정 환불액과 진행 중 예약액을 제외한 잔액을 초과했습니다.");
+        Refund refund = refunds.insert(order,payment,request.scenario(),amount);
+        if (profile.isPresent()) {
+            refunds.save(refund.id(),"WAITING_GUARD",null,null,0);
+            protection.hold(refund,profile.get().iccid(),request.holdScenario()==null?RefundProtection.Scenario.SUCCESS:request.holdScenario(),
+                request.cleanupScenario()==null?RefundProtection.Scenario.SUCCESS:request.cleanupScenario());
+        }
         jdbc.update("UPDATE orders SET status='REFUND_PROCESSING',updated_at=clock_timestamp() WHERE id=?",order.id());
         var action = actions.insert(order.id(),actor,key,hash,"REFUND",request.reason(),null,refund.id());
-        actions.event(action.id(),"REQUESTED","PAID_TO_REFUND_PROCESSING");
+        actions.event(action.id(),"REQUESTED",order.status()+"_TO_REFUND_PROCESSING");
         return new Receipt(action,false);
     }
 

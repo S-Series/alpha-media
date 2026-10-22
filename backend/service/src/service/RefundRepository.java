@@ -18,12 +18,14 @@ public class RefundRepository {
         r.getObject("pg_cancellation_id",UUID.class),r.getString("last_error"),
         r.getTimestamp("created_at").toInstant(),r.getTimestamp("updated_at").toInstant());
     Optional<Refund> find(UUID orderId) {
-        return jdbc.query("SELECT * FROM refunds WHERE order_id=?",MAPPER,orderId).stream().findFirst();
+        return jdbc.query("SELECT * FROM refunds WHERE order_id=? ORDER BY created_at DESC,id DESC",MAPPER,orderId).stream().findFirst();
     }
-    Refund insert(Order order, UUID paymentId, Refund.Scenario scenario) {
+    Optional<Refund> findById(UUID id) { return jdbc.query("SELECT * FROM refunds WHERE id=?",MAPPER,id).stream().findFirst(); }
+    java.util.List<Refund> list(UUID order) { return jdbc.query("SELECT * FROM refunds WHERE order_id=? ORDER BY created_at,id",MAPPER,order); }
+    Refund insert(Order order, UUID paymentId, Refund.Scenario scenario,long amount) {
         return jdbc.query("""
             INSERT INTO refunds(id,order_id,payment_id,amount,currency,scenario) VALUES(?,?,?,?,?,?) RETURNING *
-            """,MAPPER,UUID.randomUUID(),order.id(),paymentId,order.amount(),order.currency(),scenario.name()).getFirst();
+            """,MAPPER,UUID.randomUUID(),order.id(),paymentId,amount,order.currency(),scenario.name()).getFirst();
     }
     Refund lock(UUID id) { return jdbc.query("SELECT * FROM refunds WHERE id=? FOR UPDATE",MAPPER,id).getFirst(); }
     Optional<Claim> claim(int leaseMs) {

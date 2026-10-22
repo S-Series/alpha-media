@@ -23,7 +23,7 @@ async function Orders({ searchParams }: PageProps<"/admin/orders">) {
       <label>주문 상태 <select name="status" defaultValue={queryText(query.status)}>
         <option value="">전체</option><option value="PENDING_PAYMENT">결제 대기</option>
         <option value="PAYMENT_PROCESSING">결제 확인 중</option><option value="PAID">결제 완료</option><option value="EXPIRED">만료</option>
-        <option value="REFUND_PROCESSING">환불 확인 중</option><option value="REFUNDED">환불 완료</option>
+        <option value="REFUND_PROCESSING">환불 확인 중</option><option value="PARTIALLY_REFUNDED">부분 환불 완료</option><option value="REFUNDED">환불 완료</option>
       </select></label>
       <label>최근 결제 상태 <select name="paymentStatus" defaultValue={queryText(query.paymentStatus)}>
         <option value="">전체</option><option value="NOT_STARTED">결제 전</option><option value="QUEUED">접수</option>

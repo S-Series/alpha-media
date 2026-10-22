@@ -94,6 +94,19 @@ public class SupplierClient {
             return Optional.of(result);
         } catch (RuntimeException exception) { throw new InvalidResult(); }
     }
+    Optional<RefundProtection.Result> protection(RefundProtection.Job job,boolean execute) throws IOException,InterruptedException {
+        var builder=HttpRequest.newBuilder(URI.create(settings.baseUrl()+"/profiles/"+job.iccid()+"/holds/"+job.id()));
+        if (execute) builder.header("Content-Type","application/json").POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(
+            new RefundProtection.Request(job.refundId(),job.orderId(),job.phase(),job.scenario()))));
+        else builder.GET();
+        var response=http.send(builder.timeout(Duration.ofMillis(settings.httpTimeoutMs())).header("Authorization","Bearer "+settings.apiKey())
+            .header("X-Gateway-Token",gatewayToken).build(),HttpResponse.BodyHandlers.ofString());
+        if (!execute && response.statusCode()==404) return Optional.empty();
+        if (response.statusCode()>=500) throw new IOException("SUPPLIER_PROTECTION_UNAVAILABLE");
+        if (response.statusCode()!=200) throw new InvalidResult();
+        try { return Optional.of(mapper.readValue(response.body(),RefundProtection.Result.class)); }
+        catch (RuntimeException e) { throw new InvalidResult(); }
+    }
     @PreDestroy void close() { http.shutdownNow(); }
     static class InvalidResult extends RuntimeException {}
 }

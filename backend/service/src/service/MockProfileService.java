@@ -43,6 +43,8 @@ public class MockProfileService {
             if (!hash.equals(prior.getFirst().get("payload_hash"))) throw new OrderService.OrderException(409,"PROFILE_SIMULATION_CONFLICT","같은 요청 키의 시연 조건이 다릅니다.");
             return mapper.readValue((String)prior.getFirst().get("body"),ProfileSignal.class);
         }
+        if (Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM mock_supplier_holds WHERE iccid=? AND state IN ('BLOCKED','TERMINATED'))",Boolean.class,iccid)))
+            throw new OrderService.OrderException(409,"PROFILE_REFUND_BLOCKED","환불을 위해 사용이 차단된 SIM입니다.");
         String state=change.state().name();
         if (!allowed(old.state(),state)) throw new OrderService.OrderException(409,"PROFILE_STATE_REGRESSION","설치·개통 상태는 되돌릴 수 없습니다. 다른 SIM으로 새 시연을 시작해 주세요.");
         Instant now=Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS), installed=old.installedAt(), activated=old.activatedAt();
