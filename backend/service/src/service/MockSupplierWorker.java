@@ -20,8 +20,9 @@ public class MockSupplierWorker {
     private final IssuanceSettings settings;
     private final ObjectMapper mapper;
     private final HttpClient http;
-    public MockSupplierWorker(JdbcTemplate jdbc, IssuanceSettings settings, ObjectMapper mapper) {
-        this.jdbc = jdbc; this.settings = settings; this.mapper = mapper;
+    private final MockProfileService profiles;
+    public MockSupplierWorker(JdbcTemplate jdbc, IssuanceSettings settings, ObjectMapper mapper,MockProfileService profiles) {
+        this.jdbc = jdbc; this.settings = settings; this.mapper = mapper; this.profiles=profiles;
         http = HttpClient.newBuilder().connectTimeout(Duration.ofMillis(settings.httpTimeoutMs())).followRedirects(HttpClient.Redirect.NEVER).build();
     }
     @Scheduled(fixedDelayString = "${issuance.worker-delay-ms}", initialDelayString = "${issuance.worker-delay-ms}")
@@ -34,6 +35,7 @@ public class MockSupplierWorker {
                 callback_next_at=CASE WHEN callback_copies>0 THEN clock_timestamp()+(callback_delay_ms * INTERVAL '1 millisecond') END
             WHERE request_id IN (SELECT request_id FROM due)
             """);
+        profiles.ensureIssued();
         UUID token = UUID.randomUUID();
         var claimed = jdbc.query("""
             WITH due AS (SELECT request_id FROM mock_supplier_orders WHERE callback_next_at<=clock_timestamp()

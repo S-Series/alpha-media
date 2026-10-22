@@ -52,7 +52,7 @@ public class SecurityConfiguration {
                 .httpBasic(basic -> basic.disable())
                 .requestCache(cache -> cache.disable())
                 // 외부 통지는 세션 대신 본문 HMAC, 내부 모의 PG는 별도 API 키로 인증한다.
-                .csrf(csrf -> csrf.ignoringRequestMatchers("/webhooks/pg", "/webhooks/supplier", "/internal/mock-pg/**", "/internal/mock-supplier/**"))
+                .csrf(csrf -> csrf.ignoringRequestMatchers("/webhooks/pg", "/webhooks/supplier", "/webhooks/supplier/profiles", "/internal/mock-pg/**", "/internal/mock-supplier/**"))
                 .authorizeHttpRequests(auth -> auth
                         .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(HttpMethod.GET, "/health").permitAll()
@@ -60,6 +60,7 @@ public class SecurityConfiguration {
                         .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
                         .requestMatchers(HttpMethod.POST, "/webhooks/pg").permitAll()
                         .requestMatchers(HttpMethod.POST, "/webhooks/supplier").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/webhooks/supplier/profiles").permitAll()
                         .requestMatchers("/internal/mock-pg/**").permitAll()
                         .requestMatchers("/internal/mock-supplier/**").permitAll()
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")

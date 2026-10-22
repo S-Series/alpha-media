@@ -12,7 +12,8 @@ import service.OrderService.OrderException;
 
 @RestControllerAdvice(assignableTypes = { OrderController.class, PaymentController.class,
         PgWebhookController.class, MockPgController.class, AdminOrderController.class, IssuanceController.class,
-        SupplierWebhookController.class, MockSupplierController.class, AdminActionController.class })
+        SupplierWebhookController.class, MockSupplierController.class, AdminActionController.class,
+        MockProfileController.class,ProfileTrackingController.class })
 public class OrderExceptionHandler {
 
     @ExceptionHandler(OrderException.class)

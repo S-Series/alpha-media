@@ -28,9 +28,22 @@ export type SimProfile = {
   supplierOrderNo: string;
   iccid: string;
   activationCode: string;
-  installStatus: "ISSUED";
+  installStatus: "ISSUED" | "QR_VIEWED" | "INSTALLED" | "ACTIVE" | "EXPIRED" | "DELETED";
   issuedAt: string;
+  qrViewedAt: string | null;
+  installedAt: string | null;
+  activatedAt: string | null;
+  expiresAt: string | null;
+  supplierState: "RELEASED" | "INSTALLED" | "ENABLED" | "DELETED" | null;
+  supplierRevision: number;
+  lastSyncedAt: string | null;
+  syncError: string | null;
 };
+
+export function simStatus(status: SimProfile["installStatus"]) {
+  return { ISSUED: "발급 완료", QR_VIEWED: "활성화 정보 열람", INSTALLED: "설치 완료", ACTIVE: "개통·사용 중",
+    EXPIRED: "사용 기간 만료", DELETED: "프로필 삭제" }[status];
+}
 
 export type IssuanceView = { issuance: Issuance | null; profile: SimProfile | null };
 

@@ -16,7 +16,12 @@ public class IssuanceRepository {
         r.getString("last_error"), r.getTimestamp("created_at").toInstant(), r.getTimestamp("updated_at").toInstant());
     static final RowMapper<SimProfile> PROFILE = (r, i) -> new SimProfile(r.getObject("id", UUID.class),
         r.getObject("order_id", UUID.class), r.getObject("issuance_id", UUID.class), r.getString("supplier_order_no"),
-        r.getString("iccid"), r.getString("activation_code"), r.getString("install_status"), r.getTimestamp("issued_at").toInstant());
+        r.getString("iccid"), r.getString("activation_code"), r.getString("install_status"), r.getTimestamp("issued_at").toInstant(),
+        instant(r,"qr_viewed_at"),instant(r,"installed_at"),instant(r,"activated_at"),instant(r,"expires_at"),
+        r.getString("supplier_state"),r.getLong("supplier_revision"),instant(r,"last_synced_at"),r.getString("sync_error"));
+    private static java.time.Instant instant(java.sql.ResultSet row,String column) throws java.sql.SQLException {
+        var value=row.getTimestamp(column); return value==null?null:value.toInstant();
+    }
     private final JdbcTemplate jdbc;
     public IssuanceRepository(JdbcTemplate jdbc) { this.jdbc = jdbc; }
 

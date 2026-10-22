@@ -991,3 +991,132 @@ test("refund mismatched PG cancellation identifiers or amounts never mark an ord
     fake.closeAllConnections(); await new Promise(resolve=>fake.close(resolve)); await restart();
   }
 });
+
+async function trackingProfile() {
+  const data = await issueOrder();
+  await until(() => issuanceRow(data.order.id)?.status === "ISSUED");
+  const profile = JSON.parse(sql(`SELECT row_to_json(p) FROM sim_profiles p WHERE order_id='${data.order.id}'`));
+  return { ...data, profile };
+}
+async function trackingView(profile, client = alice) {
+  const response = await client.request(`/api/sims/${profile.id}/tracking`);
+  assert.equal(response.status, 200); return response.json();
+}
+async function trackingChange(profile, body, key = randomUUID(), client = alice) {
+  return client.request(`/api/sims/${profile.id}/simulation`, { method: "POST", body,
+    headers: { ...await client.csrf(), "Idempotency-Key": key } });
+}
+async function profileNotify(signal, valid = true) {
+  const body = JSON.stringify(signal);
+  return fetch(base + "/webhooks/supplier/profiles", { method: "POST", body,
+    headers: { "Content-Type": "application/json", "X-Signature": valid ? createHmac("sha256", secret).update(body).digest("hex") : "0".repeat(64) } });
+}
+const installedChange = { state: "INSTALLED", activatedAt: null, callbackCopies: 1, callbackDelayMs: 0 };
+
+test("tracking owner authorization, CSRF, validation and activation-information viewing are enforced", async () => {
+  const { profile } = await trackingProfile();
+  assert.equal((await new Client().request(`/api/sims/${profile.id}/tracking`)).status, 401);
+  assert.equal((await bob.request(`/api/sims/${profile.id}/tracking`)).status, 404);
+  assert.equal((await trackingChange(profile, installedChange, randomUUID(), bob)).status, 404);
+  assert.equal((await alice.request(`/api/sims/${profile.id}/simulation`, { method: "POST", body: installedChange,
+    headers: { "Idempotency-Key": randomUUID() } })).status, 403);
+  for (const body of [{ ...installedChange, callbackCopies: 21 }, { ...installedChange, callbackDelayMs: -1 },
+    { ...installedChange, state: "ACTIVE" }, { ...installedChange, state: "ENABLED", activatedAt: "2099-01-01T00:00:00Z" }]) {
+    assert.equal((await trackingChange(profile, body)).status, 400);
+  }
+  const headers = await alice.csrf();
+  const viewed = await Promise.all(Array.from({ length: 20 }, () => alice.request(`/api/sims/${profile.id}/activation-view`, { method: "POST", headers })));
+  assert.ok(viewed.every(response => response.status === 200));
+  const view = await trackingView(profile);
+  assert.equal(view.profile.installStatus, "QR_VIEWED"); assert.ok(view.profile.qrViewedAt);
+  assert.equal(view.profile.installedAt, null); assert.equal(view.profile.activatedAt, null);
+  assert.equal(sql(`SELECT count(*) FROM sim_profile_events WHERE profile_id='${profile.id}' AND source='QR_VIEW'`), "1");
+});
+
+test("tracking delayed duplicate callbacks and concurrent replay apply one supplier version", async () => {
+  const { profile } = await trackingProfile(), key = randomUUID();
+  const body = { ...installedChange, callbackCopies: 3, callbackDelayMs: 1200 };
+  sql(`UPDATE sim_profiles SET next_sync_at=clock_timestamp()+INTERVAL '5 minutes' WHERE id='${profile.id}'`);
+  const response = await trackingChange(profile, body, key); assert.equal(response.status, 200);
+  const signal = await response.json();
+  assert.notEqual((await trackingView(profile)).profile.installStatus, "INSTALLED");
+  const headers = { ...await alice.csrf(), "Idempotency-Key": key };
+  const duplicates = await Promise.all(Array.from({ length: 2 }, () => alice.request(`/api/sims/${profile.id}/simulation`, { method: "POST", headers, body })));
+  assert.ok(duplicates.every(response => response.status === 200));
+  assert.ok((await Promise.all(duplicates.map(response => response.json()))).every(copy => copy.eventId === signal.eventId));
+  await until(async () => (await trackingView(profile)).profile.installStatus === "INSTALLED");
+  const callbacks = await Promise.all(Array.from({ length: 20 }, () => profileNotify(signal)));
+  assert.ok(callbacks.every(response => response.status === 200));
+  await until(() => sql(`SELECT callback_sent FROM mock_profile_notifications WHERE event_id='${signal.eventId}'`) === "3");
+  assert.equal(sql(`SELECT count(*) FROM sim_profile_events WHERE event_id='${signal.eventId}'`), "1");
+  assert.equal((await trackingChange(profile, { ...body, callbackCopies: 4 }, key)).status, 409);
+  assert.equal((await profileNotify(signal, false)).status, 401);
+  assert.equal((await profileNotify({ ...signal, revision: 2.5 })).status, 400);
+  assert.equal((await profileNotify({ ...signal, orderId: randomUUID() })).status, 404);
+});
+
+test("tracking callback omission is reconciled by polling and survives Service restart", async () => {
+  const { profile } = await trackingProfile();
+  const response = await trackingChange(profile, { ...installedChange, callbackCopies: 0 });
+  assert.equal(response.status, 200); const signal = await response.json();
+  await restart();
+  await until(async () => (await trackingView(profile)).profile.installStatus === "INSTALLED");
+  assert.equal(sql(`SELECT callback_sent FROM mock_profile_notifications WHERE event_id='${signal.eventId}'`), "0");
+  assert.equal(sql(`SELECT source FROM sim_profile_events WHERE event_id='${signal.eventId}'`), "LOOKUP");
+  assert.ok((await trackingView(profile)).profile.lastSyncedAt);
+});
+
+test("tracking reordered events cannot regress activation or alter an already known timestamp", async () => {
+  const { profile } = await trackingProfile();
+  const oldResponse = await trackingChange(profile, { ...installedChange, callbackCopies: 0 });
+  assert.equal(oldResponse.status, 200); const old = await oldResponse.json();
+  assert.equal((await trackingChange(profile, { state: "ENABLED", activatedAt: "2020-01-01T00:00:00Z", callbackCopies: 0, callbackDelayMs: 0 })).status, 400);
+  const activatedAt = new Date().toISOString();
+  const activeResponse = await trackingChange(profile, { state: "ENABLED", activatedAt, callbackCopies: 1, callbackDelayMs: 0 });
+  assert.equal(activeResponse.status, 200); const active = await activeResponse.json();
+  await until(async () => (await trackingView(profile)).profile.installStatus === "ACTIVE");
+  assert.equal((await profileNotify(old)).status, 200);
+  assert.equal((await trackingView(profile)).profile.installStatus, "ACTIVE");
+  assert.equal((await profileNotify({ ...old, state: "DELETED" })).status, 409);
+  assert.equal((await profileNotify({ ...active, eventId: randomUUID() })).status, 409);
+  assert.equal((await trackingChange(profile, installedChange)).status, 409);
+  assert.equal((await trackingChange(profile, { state: "ENABLED", activatedAt: "2020-01-01T00:00:00Z", callbackCopies: 0, callbackDelayMs: 0 })).status, 409);
+  assert.equal((await trackingView(profile)).profile.activatedAt, activatedAt);
+});
+
+test("tracking UTC expiry uses exactly seven 24-hour periods and displays the next KST date", async () => {
+  const { profile, order } = await trackingProfile();
+  const response = await trackingChange(profile, { state: "ENABLED", activatedAt: "2026-05-01T15:20:00Z", callbackCopies: 1, callbackDelayMs: 0 });
+  assert.equal(response.status, 200);
+  await until(async () => (await trackingView(profile)).profile.installStatus === "EXPIRED");
+  const view = await trackingView(profile);
+  assert.equal(new Date(view.profile.expiresAt).toISOString(), "2026-05-08T15:20:00.000Z");
+  assert.equal(Date.parse(view.profile.expiresAt) - Date.parse(view.profile.activatedAt), 7 * 24 * 60 * 60 * 1000);
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+    .formatToParts(new Date(view.profile.expiresAt)).map(part => [part.type, part.value]));
+  assert.equal(`${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`, "2026-05-09 00:20");
+  assert.equal((await (await alice.request(`/api/orders/${order.id}`)).json()).travelStartDate, future);
+});
+
+test("tracking expiry transitions at the boundary and persists an expiration event without a callback", async () => {
+  const { profile } = await trackingProfile();
+  const activatedAt = new Date(Date.now() - 7 * 86400000 + 7000).toISOString();
+  const response = await trackingChange(profile, { state: "ENABLED", activatedAt, callbackCopies: 1, callbackDelayMs: 0 });
+  assert.equal(response.status, 200);
+  await until(async () => (await trackingView(profile)).profile.installStatus === "ACTIVE");
+  await until(() => sql(`SELECT install_status FROM sim_profiles WHERE id='${profile.id}'`) === "EXPIRED", 15000);
+  assert.equal((await trackingView(profile)).profile.installStatus, "EXPIRED");
+  assert.equal(sql(`SELECT count(*) FROM sim_profile_events WHERE profile_id='${profile.id}' AND source='EXPIRY'`), "1");
+});
+
+test("tracking deleted profiles retain installation evidence and do not reopen refunds", async () => {
+  const { profile, order, job } = await trackingProfile();
+  assert.equal((await trackingChange(profile, installedChange)).status, 200);
+  await until(async () => (await trackingView(profile)).profile.installStatus === "INSTALLED");
+  const installedAt = (await trackingView(profile)).profile.installedAt;
+  assert.equal((await trackingChange(profile, { state: "DELETED", activatedAt: null, callbackCopies: 1, callbackDelayMs: 0 })).status, 200);
+  await until(async () => (await trackingView(profile)).profile.installStatus === "DELETED");
+  assert.equal((await trackingView(profile)).profile.installedAt, installedAt);
+  assert.equal((await trackingChange(profile, { ...installedChange, state: "RELEASED" })).status, 409);
+  assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 409);
+});
