@@ -1,0 +1,39 @@
+spring:
+  config:
+    # 로컬 접속 정보만 .env에 보관한다. 배포 환경변수가 같은 이름의 값을 덮어쓸 수 있다.
+    import: optional:file:./.env[.properties]
+  application:
+    name: service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://127.0.0.1:5432/alpha_media}
+    username: ${DB_USERNAME:alpha_media_app}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 5
+      connection-timeout: 3000
+  flyway:
+    url: ${DB_URL:jdbc:postgresql://127.0.0.1:5432/alpha_media}
+    user: ${DB_MIGRATION_USERNAME:alpha_media_owner}
+    password: ${DB_MIGRATION_PASSWORD}
+  session:
+    timeout: 30m
+    jdbc:
+      # 테이블 생성은 Flyway 마이그레이션 한 곳에서 관리한다.
+      initialize-schema: never
+  web:
+    error:
+      include-message: never
+      include-stacktrace: never
+
+server:
+  # Gateway는 8080, 업무 API를 처리하는 Service는 8081에서 실행한다.
+  port: ${PORT:8081}
+  forward-headers-strategy: none
+  servlet:
+    session:
+      cookie:
+        name: ALPHA_SESSION
+        path: /
+        http-only: true
+        same-site: lax
+        secure: ${SESSION_COOKIE_SECURE:false}

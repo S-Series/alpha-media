@@ -1,10 +1,11 @@
 import Link from "next/link";
+import AuthForm from "@/components/screens/auth-form";
 
 export default function SignupPage() {
   return (
     <>
       <h1>회원가입</h1>
-      <p>회원가입 입력 영역</p>
+      <AuthForm mode="signup" />
       <Link href="/login">로그인</Link>
     </>
   );

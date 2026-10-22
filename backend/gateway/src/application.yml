@@ -1,0 +1,28 @@
+# Spring Boot가 시작할 때 자동으로 읽는 설정 파일이다. 들여쓰기로 상위·하위 항목을 구분한다.
+# ${환경변수:기본값}은 환경변수가 있으면 그 값을, 없으면 콜론 뒤의 기본값을 사용한다.
+spring:
+  application:
+    # 로그 등에서 사용할 애플리케이션 이름이다.
+    name: gateway
+  web:
+    error:
+      # 기본 오류 응답에 내부 예외 메시지나 호출 경로(stack trace)를 노출하지 않는다.
+      include-message: never
+      include-stacktrace: never
+server:
+  # Gateway가 요청을 받는 포트다. 로컬 기본값은 8080이며 배포 시 PORT로 변경할 수 있다.
+  port: ${PORT:8080}
+  # 외부 요청의 Forwarded 헤더를 근거로 서버가 인식하는 주소를 자동으로 바꾸지 않는다.
+  forward-headers-strategy: none
+
+# 아래는 Spring 기본 항목이 아니라 우리가 정의한 설정이며 GatewayProperties가 읽는다.
+gateway:
+  # 요청을 전달할 Service 서버다. 예: Gateway의 /api/orders를 Service의 /api/orders로 전달한다.
+  service-url: ${SERVICE_BASE_URL:http://127.0.0.1:8081}
+  # 브라우저 호출을 허용할 프론트엔드 출처다. 프로토콜·호스트·포트가 모두 일치해야 한다.
+  # 쉼표로 여러 출처를 지정하며 localhost와 127.0.0.1도 서로 다른 출처로 취급한다.
+  allowed-origins: ${FRONTEND_ORIGINS:http://localhost:3000,http://127.0.0.1:3000}
+  # Service 연결과 연결 풀 대기를 제한한다. s는 초, ms는 밀리초다.
+  connect-timeout: ${SERVICE_CONNECT_TIMEOUT:2s}
+  # 응답 데이터를 기다리는 읽기 제한이다. 전체 작업의 총 제한 시간이나 Service 작업 취소가 아니다.
+  read-timeout: ${SERVICE_READ_TIMEOUT:5s}

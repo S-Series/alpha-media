@@ -1,10 +1,16 @@
 import Link from "next/link";
+import { getCurrentMember } from "@/lib/auth-server";
+import LogoutButton from "@/components/screens/logout-button";
 
-export default function MyPage() {
+export default async function MyPage() {
+  const result = await getCurrentMember();
+  if (!result.ok) return null;
   return (
     <>
       <h1>마이페이지</h1>
-      <p>본인 정보·최근 주문·보유 SIM 요약 영역</p>
+      <p>{result.data.displayName}님, 로그인되어 있습니다.</p>
+      <p>{result.data.email}</p>
+      <LogoutButton />
       <nav aria-label="마이페이지 메뉴">
         <ul>
           <li><Link href="/mypage/profile">내 정보</Link></li>

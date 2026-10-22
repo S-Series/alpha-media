@@ -1,14 +1,14 @@
 import Link from "next/link";
 import { Suspense } from "react";
-import PreviewNotice from "@/components/screens/preview-notice";
 import PlanList from "@/components/screens/plan-list";
-import { previewPlans, queryText } from "@/lib/preview-data";
+import { getPlans } from "@/lib/plans";
+import { queryText } from "@/lib/preview-data";
 
 export default function PlansPage(props: PageProps<"/plans">) {
   return (
     <>
       <h1>요금제 목록</h1>
-      <PreviewNotice />
+      <p>Service에서 조회한 예시 상품입니다. 주문·결제는 아직 연결되지 않았습니다.</p>
       <Suspense fallback={<p>요금제 확인 중…</p>}>
         <Plans {...props} />
       </Suspense>
@@ -22,13 +22,7 @@ async function Plans({ searchParams }: PageProps<"/plans">) {
     days = queryText(query.days),
     dataMb = queryText(query.dataMb),
     simType = queryText(query.simType);
-  const plans = previewPlans.filter(
-    (plan) =>
-      (!country || plan.country.includes(country.trim())) &&
-      (!days || plan.days === Number(days)) &&
-      (!dataMb || plan.dataMb === Number(dataMb)) &&
-      (!simType || plan.simType === simType),
-  );
+  const result = await getPlans({ country, days, dataMb, simType });
   return (
     <>
       <form
@@ -64,8 +58,18 @@ async function Plans({ searchParams }: PageProps<"/plans">) {
         <button type="submit">검색</button>
         <Link href="/plans">초기화</Link>
       </form>
-      <p>예시 상품 {plans.length}개</p>
-      <PlanList plans={plans} />
+      {result.ok ? (
+        <>
+          <p>상품 {result.data.length}개</p>
+          <PlanList plans={result.data} />
+        </>
+      ) : (
+        <p role="alert">
+          {result.status === 400
+            ? "검색 조건을 확인해 주세요. 사용 일수와 용량은 양수여야 합니다."
+            : "요금제를 불러오지 못했습니다. 잠시 후 다시 조회해 주세요."}
+        </p>
+      )}
     </>
   );
 }

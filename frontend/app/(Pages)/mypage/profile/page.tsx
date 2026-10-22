@@ -1,8 +1,19 @@
-export default function ProfilePage() {
+import { getCurrentMember } from "@/lib/auth-server";
+
+export default async function ProfilePage() {
+  const result = await getCurrentMember();
+  if (!result.ok) return null;
+  const member = result.data;
+
   return (
     <>
       <h1>내 정보</h1>
-      <p>본인 정보 확인·수정 영역</p>
+      <dl>
+        <dt>이름</dt>
+        <dd>{member.displayName}</dd>
+        <dt>이메일</dt>
+        <dd>{member.email}</dd>
+      </dl>
     </>
   );
 }

@@ -2,10 +2,10 @@ import Link from "next/link";
 import { Suspense } from "react";
 import { notFound } from "next/navigation";
 import PreviewNotice from "@/components/screens/preview-notice";
+import { getPlan } from "@/lib/plans";
 import {
   money,
   previewOrders,
-  previewPlans,
   queryText,
 } from "@/lib/preview-data";
 
@@ -27,14 +27,18 @@ async function Checkout({ searchParams }: PageProps<"/checkout">) {
   const order = previewOrders.find((item) => item.id === orderId);
   if (orderId && !order) notFound();
   const planId = order?.planId || queryText(query.planId);
-  const plan = previewPlans.find((item) => item.id === planId);
-  if (planId && !plan) notFound();
-  if (!plan)
+  if (!planId)
     return (
       <p>
         먼저 <Link href="/plans">요금제를 선택해 주세요.</Link>
       </p>
     );
+  const result = await getPlan(planId);
+  if (!result.ok) {
+    if (result.status === 404) notFound();
+    return <p role="alert">주문할 상품 정보를 불러오지 못했습니다. 잠시 후 다시 조회해 주세요.</p>;
+  }
+  const plan = result.data;
   return (
     <>
       <section className="home-panel">

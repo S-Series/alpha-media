@@ -1,0 +1,77 @@
+package service;
+
+import java.util.Map;
+
+import jakarta.servlet.DispatcherType;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.crypto.password.DelegatingPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.crypto.password.Pbkdf2PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import tools.jackson.databind.ObjectMapper;
+
+@Configuration(proxyBeanMethods = false)
+public class SecurityConfiguration {
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        // 알고리즘 식별자와 무작위 salt를 해시와 함께 저장해 향후 교체할 수 있게 한다.
+        var encoder = new Pbkdf2PasswordEncoder("", 16, 600000,
+                Pbkdf2PasswordEncoder.SecretKeyFactoryAlgorithm.PBKDF2WithHmacSHA256);
+        return new DelegatingPasswordEncoder("pbkdf2-sha256-600k", Map.of("pbkdf2-sha256-600k", encoder));
+    }
+
+    @Bean
+    UserDetailsService userDetailsService(MemberRepository members) {
+        return email -> {
+            var member = members.findByEmail(email)
+                    .orElseThrow(() -> new UsernameNotFoundException("Invalid credentials"));
+            return User.withUsername(member.email()).password(member.passwordHash()).roles(member.role()).build();
+        };
+    }
+
+    @Bean
+    SecurityFilterChain securityFilterChain(HttpSecurity http, MemberRepository members,
+            ObjectMapper mapper) throws Exception {
+        http
+                .httpBasic(AbstractHttpConfigurer::disable)
+                .requestCache(AbstractHttpConfigurer::disable)
+                .authorizeHttpRequests(auth -> auth
+                        .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/plans", "/api/plans/**", "/api/auth/csrf").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/auth/signup", "/api/auth/login").permitAll()
+                        .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                        .requestMatchers("/api/me", "/api/auth/logout", "/api/orders/**", "/api/sims/**").authenticated()
+                        .anyRequest().denyAll())
+                .exceptionHandling(errors -> errors
+                        .authenticationEntryPoint((request, response, exception) -> ApiError.write(
+                                response, mapper, 401, "UNAUTHENTICATED", "로그인이 필요합니다."))
+                        .accessDeniedHandler((request, response, exception) -> ApiError.write(
+                                response, mapper, 403, "FORBIDDEN", "권한 또는 CSRF 토큰을 확인해 주세요.")))
+                // 기본 CSRF 검사를 유지한다. 표준 로그인 필터가 세션 ID와 CSRF 토큰 교체를 처리한다.
+                .formLogin(form -> form
+                        .loginPage("/login")
+                        .loginProcessingUrl("/api/auth/login")
+                        .usernameParameter("email")
+                        .successHandler((request, response, authentication) -> {
+                            response.setContentType("application/json");
+                            response.setCharacterEncoding("UTF-8");
+                            var member = members.findByEmail(authentication.getName()).orElseThrow();
+                            mapper.writeValue(response.getOutputStream(), member.view());
+                        })
+                        .failureHandler((request, response, exception) -> ApiError.write(response, mapper,
+                                401, "INVALID_CREDENTIALS", "이메일 또는 비밀번호가 올바르지 않습니다.")))
+                .logout(logout -> logout
+                        .logoutUrl("/api/auth/logout")
+                        .deleteCookies("ALPHA_SESSION")
+                        .logoutSuccessHandler((request, response, authentication) -> response.setStatus(204)));
+        return http.build();
+    }
+}

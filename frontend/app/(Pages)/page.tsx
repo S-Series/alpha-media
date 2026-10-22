@@ -1,7 +1,8 @@
 import Link from "next/link";
+import { Suspense } from "react";
 import PreviewNotice from "@/components/screens/preview-notice";
 import PlanList from "@/components/screens/plan-list";
-import { previewPlans } from "@/lib/preview-data";
+import { getPlans } from "@/lib/plans";
 
 export default function Home() {
   return (
@@ -24,7 +25,9 @@ export default function Home() {
 
       <section className="home-panel" aria-labelledby="plans-title">
         <h2 id="plans-title">요금제 목록</h2>
-        <PlanList plans={previewPlans.slice(0, 2)} />
+        <Suspense fallback={<p>요금제 확인 중…</p>}>
+          <HomePlans />
+        </Suspense>
         <Link href="/plans">전체 요금제 보기</Link>
       </section>
 
@@ -42,4 +45,12 @@ export default function Home() {
       </div>
     </>
   );
+}
+
+async function HomePlans() {
+  const result = await getPlans();
+  if (!result.ok) {
+    return <p role="alert">요금제를 불러오지 못했습니다. 잠시 후 다시 조회해 주세요.</p>;
+  }
+  return <PlanList plans={result.data.slice(0, 2)} />;
 }

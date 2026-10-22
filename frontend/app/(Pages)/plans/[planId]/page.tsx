@@ -1,10 +1,11 @@
 import Link from "next/link";
 import { Suspense } from "react";
 import { notFound } from "next/navigation";
-import PreviewNotice from "@/components/screens/preview-notice";
+import { getPlan } from "@/lib/plans";
 import { money, previewPlans } from "@/lib/preview-data";
 
 export function generateStaticParams() {
+  // 빌드 시 검증할 예시 경로다. 상품 본문은 요청마다 Gateway를 통해 조회한다.
   return previewPlans.map(({ id }) => ({ planId: id }));
 }
 
@@ -12,7 +13,7 @@ export default function PlanDetailPage(props: PageProps<"/plans/[planId]">) {
   return (
     <>
       <h1>요금제 상세</h1>
-      <PreviewNotice />
+      <p>Service에서 조회한 예시 상품입니다. 주문·결제는 아직 연결되지 않았습니다.</p>
       <Suspense fallback={<p role="status">상품 정보 확인 중…</p>}>
         <PlanDetail {...props} />
       </Suspense>
@@ -22,8 +23,12 @@ export default function PlanDetailPage(props: PageProps<"/plans/[planId]">) {
 
 async function PlanDetail({ params }: PageProps<"/plans/[planId]">) {
   const { planId } = await params;
-  const plan = previewPlans.find((item) => item.id === planId);
-  if (!plan) notFound();
+  const result = await getPlan(planId);
+  if (!result.ok) {
+    if (result.status === 404) notFound();
+    return <p role="alert">상품 정보를 불러오지 못했습니다. 잠시 후 다시 조회해 주세요.</p>;
+  }
+  const plan = result.data;
   return (
     <>
       <section className="home-panel">

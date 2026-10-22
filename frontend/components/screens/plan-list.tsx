@@ -1,10 +1,11 @@
 import Link from "next/link";
-import { money, previewPlans } from "@/lib/preview-data";
+import { money } from "@/lib/preview-data";
+import type { Plan } from "@/lib/plans";
 
 export default function PlanList({
   plans,
 }: {
-  plans: readonly (typeof previewPlans)[number][];
+  plans: readonly Plan[];
 }) {
   return (
     <div className="home-links">
@@ -19,7 +20,7 @@ export default function PlanList({
           <Link href={`/plans/${plan.id}`}>요금제 상세 보기</Link>
         </article>
       ))}
-      {plans.length === 0 && <p>조건에 맞는 예시 요금제가 없습니다.</p>}
+      {plans.length === 0 && <p>조건에 맞는 요금제가 없습니다.</p>}
     </div>
   );
 }
