@@ -77,7 +77,7 @@ PG·공급사 호출은 별도 Client 코드로 모은다. DB 변경 트랜잭�
 
 DB 스키마 변경은 **Flyway**로 순서와 적용 이력을 관리한다. `backend/database`의 SQL·시드가 Service 배포에 포함되도록 빌드를 구성하고, 배포 환경의 DB에 연결할 수 있는 시작 준비 단계에서 적용한다. 이미 적용한 SQL을 덮어쓰기보다 새 변경 파일을 추가한다.
 
-DB 호스팅은 운영 부담을 줄일 수 있는 **관리형 PostgreSQL**을 사용하고, Neon을 우선 검토 후보로 둔다. 개발·검증에서는 무료 범위를 우선 활용한다. 운영 환경은 허용 지연, 연결 수, 백업·복구 요구, Railway와의 연결 및 월 예산을 확인한 뒤 서비스와 요금제를 확정한다. 외부 DB 연결에는 TLS를 사용하고 접속 정보는 Service 환경변수로 관리한다. [Neon 요금제](https://neon.com/docs/introduction/plans)
+개발 DB는 **Neon PostgreSQL의 무료 플랜**을 사용한다. 일반 쿼리는 pooled 연결, Flyway는 direct 연결을 사용하고 TLS로 서버 인증서를 검증한다. 운영 환경은 허용 지연, 연결 수, 백업·복구 요구, Render와의 연결 및 월 예산을 확인한 뒤 요금제를 확정한다. 접속 정보는 Service 환경변수로 관리한다. [Neon 요금제](https://neon.com/docs/introduction/plans)
 
 ### 백그라운드 처리
 
@@ -89,9 +89,9 @@ DB 호스팅은 운영 부담을 줄일 수 있는 **관리형 PostgreSQL**을 �
 
 ### 배포와 설정
 
-Gateway와 Service는 **Railway의 같은 프로젝트·같은 환경**에 별도 서비스로 배포하는 방향으로 잡는다. Gateway는 공개 주소를 제공하고, Service는 Railway 내부 네트워크로 연결한다. 외부 PG·공급사의 콜백도 공개 Gateway를 통해 Service에 전달한다. [Railway 내부 네트워크](https://docs.railway.com/networking/private-networking)
+개발·검증용 Gateway와 Service는 **Render의 무료 Web Service**로 각각 배포하도록 구성한다. 무료 인스턴스는 사설 요청을 받을 수 없어 두 서버도 공개 HTTPS로 통신한다. Service는 내부 공유 키로 Gateway를 확인하고, 회원 인증·권한은 별도로 검사한다. 외부 PG·공급사의 콜백도 Gateway를 통해 Service에 전달하는 방향으로 설계한다. [Render 무료 제한](https://render.com/docs/free)
 
-Railway에서 Root Directory를 좁히면 그 폴더 밖 파일은 배포에 포함되지 않는다. 따라서 `service`가 공용 `database` 폴더의 SQL을 사용하는 점을 고려해 빌드 컨텍스트와 시작 명령을 설정한다. 프론트엔드 호스팅은 별도 결정 항목으로 남긴다. [모노레포 배포](https://docs.railway.com/deployments/monorepo)
+Render Docker 빌드 컨텍스트는 `backend`로 지정해 Service와 공용 `database` 폴더의 SQL을 함께 포함한다. GitHub `main` 커밋을 Render가 자동 배포하며 프론트엔드 호스팅은 별도 결정 항목으로 남긴다. 서버 절전·공유 실행 시간 때문에 무료 구성은 상시 워커 운영에 사용할 수 없으며, 운영 단계에서 가동 조건을 다시 정한다. 현재 설정은 [배포 안내](deployment.md)에 정리한다.
 
 개발·검증 환경과 운영 환경은 DB·외부 연동 키·설정을 분리한다. 운영 비용은 Gateway·Service의 메모리와 가동 시간, DB 사용량, 외부 통신량을 기준으로 산정한다. 무료 제공량은 개발 비용을 줄이는 수단으로 활용하고, 운영 환경은 필요한 가용성과 예산에 맞춰 결정한다.
 

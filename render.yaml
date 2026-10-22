@@ -1,0 +1,65 @@
+envVarGroups:
+  - name: alpha-media-internal
+    envVars:
+      - key: INTERNAL_GATEWAY_TOKEN
+        generateValue: true
+
+services:
+  - type: web
+    name: alpha-media-service
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerContext: ./backend
+    dockerfilePath: ./backend/service/Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: alpha-media-internal
+      - key: SPRING_PROFILES_ACTIVE
+        value: render
+      - key: JAVA_TOOL_OPTIONS
+        value: -XX:MaxRAMPercentage=50 -XX:ActiveProcessorCount=1 -Xss512k
+      - key: DB_URL
+        sync: false
+      - key: DB_USERNAME
+        value: alpha_media_app
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_MIGRATION_URL
+        sync: false
+      - key: DB_MIGRATION_USERNAME
+        sync: false
+      - key: DB_MIGRATION_PASSWORD
+        sync: false
+      - key: DB_CONNECTION_TIMEOUT
+        value: "10000"
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: SESSION_CLEANUP_CRON
+        value: "0 0 * * * *"
+
+  - type: web
+    name: alpha-media-gateway
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerContext: ./backend
+    dockerfilePath: ./backend/gateway/Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: alpha-media-internal
+      - key: SPRING_PROFILES_ACTIVE
+        value: render
+      - key: JAVA_TOOL_OPTIONS
+        value: -XX:MaxRAMPercentage=50 -XX:ActiveProcessorCount=1 -Xss512k
+      - key: SERVICE_BASE_URL
+        fromService:
+          type: web
+          name: alpha-media-service
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: FRONTEND_ORIGINS
+        value: http://localhost:3000,http://127.0.0.1:3000
+      - key: SERVICE_CONNECT_TIMEOUT
+        value: 10s
+      - key: SERVICE_READ_TIMEOUT
+        value: 90s

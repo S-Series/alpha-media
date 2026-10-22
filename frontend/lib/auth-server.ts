@@ -12,7 +12,7 @@ export async function getCurrentMember(): Promise<MemberResult> {
     const response = await fetch(new URL("/api/me", gateway), {
       cache: "no-store",
       headers: { Cookie: `ALPHA_SESSION=${session.value}` },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(Number(process.env.GATEWAY_REQUEST_TIMEOUT_MS || 8000)),
     });
     if (!response.ok) return { ok: false, status: response.status };
     return { ok: true, data: (await response.json()) as Member };

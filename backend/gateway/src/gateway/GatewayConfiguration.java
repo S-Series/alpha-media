@@ -8,8 +8,11 @@ import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.core5.util.Timeout;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
+import org.springframework.util.Assert;
 import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.web.cors.CorsConfiguration;
@@ -32,14 +35,18 @@ public class GatewayConfiguration {
     // @Bean: 반환한 객체를 Spring이 관리한다. 메서드의 매개변수도 Spring이 찾아 넣어준다.
     // 이처럼 필요한 객체를 직접 new 하지 않고 전달받는 방식을 의존성 주입이라고 한다.
     @Bean
-    RouterFunction<ServerResponse> serviceRoutes(GatewayProperties properties) {
+    RouterFunction<ServerResponse> serviceRoutes(GatewayProperties properties,
+            @Value("${INTERNAL_GATEWAY_TOKEN:}") String internalToken, Environment environment) {
+        if (environment.matchesProfiles("render") || !internalToken.isEmpty()) {
+            Assert.isTrue(internalToken.length() >= 32, "INTERNAL_GATEWAY_TOKEN must contain at least 32 characters");
+        }
         return route("service")
                 // **는 하위 경로 전체다. 예: /api/orders/123. http()가 실제 HTTP 중계를 맡는다.
                 .route(path("/api/**").or(path("/webhooks/**")), http())
                 // Service 주소만 지정하며, /api 등의 요청 경로를 지우지 않고 전달한다.
                 .before(uri(properties.serviceUrl().toString()))
                 // 중계 요청과 응답에 추적 ID를 붙이고, 연결 오류를 처리할 필터다.
-                .filter(new ProxyExchangeFilter())
+                .filter(new ProxyExchangeFilter(internalToken))
                 .build();
     }
 

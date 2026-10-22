@@ -204,7 +204,9 @@ Gateway를 거친 실제 API 응답에는 `X-Request-Id`를 포함한다. 데이
 | `spring_session` | 로그인·CSRF 세션 | 세션 ID UNIQUE, 만료·실행자 인덱스 |
 | `spring_session_attributes` | 세션 속성 | 세션 FK, 세션 삭제 시 함께 삭제 |
 
-`alpha_media_app`은 요금제·회원 조회, 회원 일반 컬럼 입력, 세션 읽기·쓰기에만 권한이 있다. 가격이나 회원 역할 변경은 허용하지 않는다. `alpha_media_owner`는 Flyway 마이그레이션에 사용한다. 두 계정 모두 슈퍼유저가 아니며 비밀번호는 Git에서 제외한 `backend/service/.env` 또는 환경변수로 제공한다.
+`alpha_media_app`은 요금제·회원 조회, 회원 일반 컬럼 입력, 세션 읽기·쓰기에만 권한이 있다. 가격이나 회원 역할 변경은 허용하지 않는다. 로컬 DB의 Flyway 계정은 `alpha_media_owner`, Neon에서는 지정된 DB 소유자다. 접속 비밀번호는 Git에서 제외한 `backend/service/.env` 또는 환경변수로 제공한다.
+
+현재 DB는 Neon의 `production` 브랜치를 사용한다. 실행 쿼리는 pooled JDBC, Flyway는 direct JDBC로 연결한다. Render 배포에서는 내부 공유 키가 없는 Service 직접 요청을 403으로 거부하며, 인증 없이 허용하는 상태 확인 경로는 GET `/health`다. 환경변수와 무료 플랜의 범위는 [배포 안내](deployment.md)에 정리했다.
 
 SQL은 `backend/database/migration`에서 버전 관리한다. Service 시작 시 Flyway가 미적용 버전만 실행하며 초기 요금제 3건도 첫 마이그레이션에 포함된다. 실행 방법은 [DB 안내](../backend/database/README.md)에 정리한다.
 

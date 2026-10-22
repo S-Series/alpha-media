@@ -1,5 +1,7 @@
 # 로컬 PostgreSQL
 
+현재 Service의 접속 정보는 Neon으로 전환했다. [Render·Neon 배포 안내](../../docs/deployment.md)에 설정과 검증 결과를 정리했다. 아래는 기존 로컬 DB를 사용할 때의 안내이며, 기존 설정 백업은 `.local/service-before-neon.env`다.
+
 현재 PC에 설치된 PostgreSQL 18.6을 사용한다. 프로젝트의 `.local/postgres`에 별도 클러스터를 생성했으며 `127.0.0.1:5432/alpha_media`로 접속한다. 데이터와 비밀번호는 Git에 포함하지 않는다.
 
 ## 실행 순서

@@ -22,7 +22,7 @@ async function request<T>(path: string): Promise<ApiResult<T>> {
   try {
     const response = await fetch(new URL(path, gatewayUrl), {
       cache: "no-store",
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(Number(process.env.GATEWAY_REQUEST_TIMEOUT_MS || 8000)),
     });
     if (!response.ok) return { ok: false, status: response.status };
     return { ok: true, data: (await response.json()) as T };

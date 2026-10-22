@@ -19,6 +19,11 @@ final class ProxyExchangeFilter implements HandlerFilterFunction<ServerResponse,
 
     private static final Logger log = LoggerFactory.getLogger(ProxyExchangeFilter.class);
     private static final String REQUEST_ID = "X-Request-Id";
+    private final String internalToken;
+
+    ProxyExchangeFilter(String internalToken) {
+        this.internalToken = internalToken;
+    }
 
     @Override
     public ServerResponse filter(ServerRequest request, HandlerFunction<ServerResponse> next) throws Exception {
@@ -27,9 +32,14 @@ final class ProxyExchangeFilter implements HandlerFilterFunction<ServerResponse,
         // 원래 요청을 바탕으로 헤더를 수정한 요청을 만든다. headers -> {...}는 람다식(함수 전달)이다.
         var forwarded = ServerRequest.from(request).headers(headers -> {
             headers.set(REQUEST_ID, requestId);
-            // 클라이언트가 사용자·관리자 ID를 임의로 보낼 수 있으므로 제거한다. 실제 인증 기능은 아직 없다.
+            // 사용자가 지정한 신원을 신뢰하지 않는다. 회원 인증은 Service가 검사한다.
             headers.remove("X-User-Id");
             headers.remove("X-Admin-Id");
+            // 외부에서 보낸 내부 키를 제거한 뒤 서버의 키로 교체한다.
+            headers.remove("X-Gateway-Token");
+            if (!internalToken.isEmpty()) {
+                headers.set("X-Gateway-Token", internalToken);
+            }
         }).build();
 
         try {
