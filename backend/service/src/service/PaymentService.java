@@ -21,6 +21,16 @@ public class PaymentService {
     @Transactional
     public Acceptance accept(UUID memberId, UUID orderId, UUID key, PaymentController.Request request) {
         orders.historyContext(memberId,"PAYMENT_REQUEST",null);
+        return acceptOwned(memberId,orderId,key,request);
+    }
+
+    @Transactional
+    public Acceptance acceptScenario(UUID actor, UUID memberId, UUID orderId, UUID key, PaymentController.Request request) {
+        orders.historyContext(actor,"SCENARIO_GENERATOR","운영자가 시연용 모의 결제 접수");
+        return acceptOwned(memberId,orderId,key,request);
+    }
+
+    private Acceptance acceptOwned(UUID memberId, UUID orderId, UUID key, PaymentController.Request request) {
         Order order = orders.lock(memberId, orderId).orElseThrow(() -> new OrderException(404, "ORDER_NOT_FOUND", "주문을 찾을 수 없습니다."));
         var existing = payments.findByKey(orderId, key);
         if (existing.isPresent()) {

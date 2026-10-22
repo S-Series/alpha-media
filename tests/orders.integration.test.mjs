@@ -1363,3 +1363,199 @@ test("admin concurrency restart loses only coordination metadata; accepted actio
   assert.equal(refundRow(order.id).status, "SUCCEEDED");
   assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE idempotency_key='${refundRow(order.id).id}'`), "1");
 });
+
+async function generateScenario(scenario = "ISSUANCE_FAILED", key = randomUUID(),
+  overrides = {}, client = admin) {
+  return client.request("/api/admin/scenarios", { method: "POST", headers: { ...await client.csrf(), "Idempotency-Key": key },
+    body: { scenario, customer: "customer1", planId: "jp-esim-7d", ...overrides } });
+}
+async function scenarioResult(id, client = admin) {
+  const response = await client.request(`/api/admin/scenarios/${id}`);
+  assert.equal(response.status, 200); return response.json();
+}
+async function readyScenario(id) {
+  let result;
+  await until(async () => { result = await scenarioResult(id); return result.status !== "GENERATING"; }, 45000);
+  assert.equal(result.status, "READY", JSON.stringify(result));
+  return result;
+}
+
+test("scenario generator restricts options, writes and reads to authenticated operators with CSRF", async () => {
+  for (const client of [new Client(), alice, bob]) {
+    const expected = client === alice || client === bob ? 403 : 401;
+    assert.equal((await client.request("/api/admin/scenarios/options")).status, expected);
+    assert.equal((await generateScenario("PENDING_PAYMENT", randomUUID(), {}, client)).status, expected);
+    assert.equal((await client.request(`/api/admin/scenarios/${randomUUID()}`)).status, expected);
+  }
+  assert.equal((await admin.request("/api/admin/scenarios", { method: "POST", body: {} })).status, 403);
+  const response = await admin.request("/api/admin/scenarios/options");
+  assert.equal(response.status, 200); assert.equal(response.headers.get("cache-control"), "no-store");
+  const options = await response.json();
+  assert.deepEqual(options.customers.map(c => c.username), ["customer1", "customer2"]);
+  assert.ok(options.plans.length === 2 && options.plans.every(p => p.simType === "ESIM" && p.price > 0));
+  assert.ok(!JSON.stringify(options).includes("password"));
+  for (const body of [{ scenario: "FAKE" }, { scenario: null }, { customer: "admin" }, { customer: "admin2" },
+    { customer: "missing" }, { customer: "" }, { customer: "x".repeat(33) }, { planId: "jp-usim-7d" }]) {
+    assert.equal((await generateScenario("PENDING_PAYMENT", randomUUID(), body)).status, 400);
+  }
+  assert.equal((await generateScenario("PENDING_PAYMENT", randomUUID(), { planId: "missing" })).status, 404);
+  assert.equal((await generateScenario("PENDING_PAYMENT", "bad-key")).status, 400);
+  assert.equal((await admin.request("/api/admin/scenarios", { method: "POST", headers: await admin.csrf(),
+    body: { scenario: "PENDING_PAYMENT", customer: "customer1", planId: "jp-esim-7d" } })).status, 400);
+  assert.equal((await admin.request(`/api/admin/scenarios/${randomUUID()}`)).status, 404);
+});
+
+for (const scenario of ["PENDING_PAYMENT", "ISSUANCE_FAILED", "ISSUED", "REFUNDED", "REFUND_REVIEW_REQUIRED"]) {
+  test(`scenario generator ${scenario} uses real order payment supplier and refund records`, async () => {
+    const second = await member("admin2"), key = randomUUID();
+    const response = await generateScenario(scenario, key, { customer: "customer2", planId: "th-esim-5d",
+      actor: "admin", memberId: alice.memberId, amount: 1, currency: "USD", status: "REFUNDED" }, second);
+    assert.equal(response.status, 201); assert.equal(response.headers.get("location"), `/api/admin/scenarios/${key}`);
+    assert.equal(response.headers.get("idempotency-replayed"), "false");
+    const initial = await response.json();
+    assert.equal(initial.id, key); assert.equal(initial.createdBy, "admin2");
+    assert.equal(initial.customer, "customer2"); assert.equal(initial.planId, "th-esim-5d");
+    assert.equal(initial.status, scenario === "PENDING_PAYMENT" ? "READY" : "GENERATING");
+    const result = await readyScenario(key);
+    const detail = await (await second.request(`/api/admin/orders/${result.orderId}`)).json();
+    assert.equal(detail.order.order.amount, 9900); assert.equal(detail.order.order.currency, "KRW");
+    assert.equal(sql(`SELECT member_id FROM orders WHERE id='${result.orderId}'`), bob.memberId);
+    assert.equal((await alice.request(`/api/orders/${result.orderId}`)).status, 404);
+    assert.equal((await bob.request(`/api/orders/${result.orderId}`)).status, 200);
+    assert.ok(detail.timeline.items.some(e => e.target === "ORDER" && e.toStatus === "PENDING_PAYMENT"
+      && e.actor === "ADMIN:admin2" && e.source === "SCENARIO_GENERATOR"));
+    assert.equal(sql(`SELECT count(*) FROM scenario_generations WHERE id='${key}'`), "1");
+    if (scenario === "PENDING_PAYMENT") {
+      assert.equal(result.orderStatus, "PENDING_PAYMENT"); assert.equal(detail.payments.length, 0);
+      assert.equal(result.issuanceStatus, null); assert.equal(result.refundStatus, null);
+      assert.equal(Date.parse(detail.order.order.expiresAt) - Date.parse(detail.order.order.createdAt), 600000);
+    } else {
+      assert.equal(detail.payments.length, 1); assert.equal(detail.payments[0].status, "APPROVED");
+      assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${detail.payments[0].id}'`), "1");
+      assert.equal(sql(`SELECT count(*) FROM mock_supplier_orders WHERE request_id='${detail.issuance.issuance.id}'`), "1");
+      assert.equal(sql(`SELECT issue_executions FROM mock_supplier_orders WHERE request_id='${detail.issuance.issuance.id}'`), scenario === "ISSUED" ? "1" : "0");
+      assert.ok(detail.timeline.items.some(e => e.target === "PAYMENT" && e.actor === "ADMIN:admin2" && e.source === "SCENARIO_GENERATOR"));
+      if (scenario === "ISSUED") {
+        assert.equal(result.orderStatus, "PAID"); assert.equal(result.issuanceStatus, "ISSUED");
+        assert.equal(detail.issuance.profile.installStatus, "ISSUED"); assert.ok(result.simId);
+        assert.equal(detail.issuance.profile.installedAt, null); assert.equal(detail.refund, null);
+      } else {
+        assert.equal(result.issuanceStatus, "FAILED"); assert.equal(result.simId, null);
+        if (scenario === "ISSUANCE_FAILED") {
+          assert.equal(result.orderStatus, "PAID"); assert.equal(detail.refund, null); assert.equal(detail.actions.length, 0);
+          assert.equal((await adminAction(result.orderId, "concurrency-demos", demoRequest(issuanceRow(result.orderId)), randomUUID(), second)).status, 200);
+        } else {
+          assert.equal(detail.actions.length, 1); assert.equal(detail.actions[0].actor, "admin2");
+          assert.equal(detail.actions[0].reason, `시나리오 데이터 생성: ${scenario}`);
+          if (scenario === "REFUNDED") {
+            assert.equal(result.orderStatus, "REFUNDED"); assert.equal(result.refundStatus, "SUCCEEDED");
+            assert.equal(sql(`SELECT amount FROM mock_pg_cancellations WHERE idempotency_key='${detail.refund.id}'`), "9900");
+          } else {
+            assert.equal(result.orderStatus, "REFUND_PROCESSING"); assert.equal(result.refundStatus, "REVIEW_REQUIRED");
+            assert.equal(detail.refund.attemptCount, 3);
+            assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE idempotency_key='${detail.refund.id}'`), "0");
+            assert.equal((await adminAction(result.orderId, "issuance-retries", retryRequest(issuanceRow(result.orderId)))).status, 409);
+          }
+        }
+      }
+    }
+    console.log(`scenario proof ${scenario}: generation=READY order=${result.orderStatus} issuance=${result.issuanceStatus} refund=${result.refundStatus}`);
+  });
+}
+
+test("scenario generator twenty concurrent identical requests create one order and one external effect", async () => {
+  const key = randomUUID(), headers = { ...await admin.csrf(), "Idempotency-Key": key };
+  const requests = await Promise.all(Array.from({ length: 20 }, () => admin.request("/api/admin/scenarios", {
+    method: "POST", headers, body: { scenario: "REFUNDED", customer: "customer1", planId: "jp-esim-7d" },
+  })));
+  assert.equal(requests.filter(r => r.status === 201).length, 1);
+  assert.equal(requests.filter(r => r.status === 200).length, 19);
+  assert.equal(new Set(await Promise.all(requests.map(async r => (await r.json()).orderId))).size, 1);
+  const result = await readyScenario(key);
+  assert.equal(sql(`SELECT count(*) FROM orders WHERE idempotency_key='${key}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM payment_attempts WHERE order_id='${result.orderId}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${result.orderId}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${result.orderId}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE idempotency_key='${refundRow(result.orderId).id}'`), "1");
+  const replay = await generateScenario("REFUNDED", key);
+  assert.equal(replay.status, 200); assert.equal(replay.headers.get("idempotency-replayed"), "true");
+  assert.equal((await replay.json()).orderId, result.orderId);
+});
+
+test("scenario generator changed payload or operator conflicts and a discarded response safely replays", async () => {
+  const key = randomUUID(), response = await generateScenario("PENDING_PAYMENT", key);
+  assert.equal(response.status, 201); await response.body.cancel();
+  const replay = await generateScenario("PENDING_PAYMENT", key); assert.equal(replay.status, 200);
+  const original = await replay.json();
+  for (const changed of [{ scenario: "ISSUED" }, { customer: "customer2" }, { planId: "th-esim-5d" }]) {
+    const conflict = await generateScenario("PENDING_PAYMENT", key, changed);
+    assert.equal(conflict.status, 409); assert.equal((await conflict.json()).code, "SCENARIO_KEY_CONFLICT");
+  }
+  assert.equal((await generateScenario("PENDING_PAYMENT", key, {}, await member("admin2"))).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM orders WHERE idempotency_key='${key}'`), "1");
+  expire(original.orderId);
+  const expired = await (await generateScenario("PENDING_PAYMENT", key)).json();
+  assert.equal(expired.orderId, original.orderId); assert.equal(expired.orderStatus, "EXPIRED");
+});
+
+test("scenario generator durable acceptance survives restart and never reports ready before workers finish", async () => {
+  await restart({ PAYMENT_WORKER_DELAY_MS: "60000" });
+  const key = randomUUID(), response = await generateScenario("ISSUANCE_FAILED", key);
+  assert.equal(response.status, 201); const queued = await response.json();
+  assert.equal(queued.status, "GENERATING"); assert.equal(queued.orderStatus, "PAYMENT_PROCESSING");
+  await restart();
+  const result = await readyScenario(key);
+  assert.equal(result.orderId, queued.orderId); assert.equal(result.issuanceStatus, "FAILED");
+  assert.equal((await generateScenario("ISSUANCE_FAILED", key)).status, 200);
+  assert.equal(sql(`SELECT count(*) FROM orders WHERE idempotency_key='${key}'`), "1");
+});
+
+test("scenario generator replay preserves order snapshots when current product price changes", async () => {
+  const key = randomUUID(), response = await generateScenario("PENDING_PAYMENT", key);
+  assert.equal(response.status, 201); const original = await response.json();
+  const price = sql("SELECT price FROM plans WHERE id='jp-esim-7d'");
+  sql("UPDATE plans SET price=0 WHERE id='jp-esim-7d'");
+  try {
+    const replay = await generateScenario("PENDING_PAYMENT", key);
+    assert.equal(replay.status, 200); assert.equal((await replay.json()).orderId, original.orderId);
+    assert.equal((await generateScenario("PENDING_PAYMENT")).status, 400);
+    assert.equal(sql(`SELECT amount FROM orders WHERE id='${original.orderId}'`), price);
+  } finally { sql(`UPDATE plans SET price=${price} WHERE id='jp-esim-7d'`); }
+});
+
+test("scenario generator intake failures roll back the generation order payment and history together", async () => {
+  const key = randomUUID(), count = sql("SELECT count(*) FROM orders");
+  sql("CREATE FUNCTION fail_scenario_for_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'payment insert unavailable'; END $$; CREATE TRIGGER fail_scenario_for_test BEFORE INSERT ON payment_attempts FOR EACH ROW EXECUTE FUNCTION fail_scenario_for_test();");
+  try { assert.equal((await generateScenario("ISSUED", key)).status, 500); }
+  finally { sql("DROP TRIGGER fail_scenario_for_test ON payment_attempts; DROP FUNCTION fail_scenario_for_test();"); }
+  assert.equal(sql("SELECT count(*) FROM orders"), count);
+  assert.equal(sql(`SELECT count(*) FROM scenario_generations WHERE id='${key}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM orders WHERE idempotency_key='${key}'`), "0");
+  assert.equal((await generateScenario("ISSUED", key)).status, 201);
+  assert.equal((await readyScenario(key)).issuanceStatus, "ISSUED");
+});
+
+test("scenario generator timeout preserves the actual order without fabricating the target state", async () => {
+  await restart({ PAYMENT_WORKER_DELAY_MS: "60000" });
+  const response = await generateScenario("ISSUED"); assert.equal(response.status, 201); const queued = await response.json();
+  sql(`UPDATE scenario_generations SET created_at=clock_timestamp()-INTERVAL '11 minutes' WHERE id='${queued.id}'`);
+  let stopped;
+  await until(async () => { stopped = await scenarioResult(queued.id); return stopped.status === "FAILED"; });
+  assert.equal(stopped.lastError, "GENERATION_TIMEOUT"); assert.equal(stopped.orderStatus, "PAYMENT_PROCESSING");
+  assert.equal(stopped.simId, null);
+  assert.equal((await generateScenario("ISSUED", queued.id)).status, 200);
+  await restart();
+  await until(() => issuanceRow(queued.orderId)?.status === "ISSUED");
+  assert.equal((await scenarioResult(queued.id)).status, "FAILED");
+});
+
+test("scenario generator cannot create data when either mock provider is disabled", async () => {
+  const count = sql("SELECT count(*) FROM orders");
+  for (const extra of [{ MOCK_PG_ENABLED: "false" }, { MOCK_SUPPLIER_ENABLED: "false" }]) {
+    await restart(extra);
+    assert.equal((await generateScenario()).status, 503);
+    assert.equal((await admin.request("/api/admin/scenarios/options")).status, 503);
+    assert.equal(sql("SELECT count(*) FROM orders"), count);
+  }
+  await restart();
+});

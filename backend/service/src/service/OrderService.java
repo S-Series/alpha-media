@@ -21,6 +21,16 @@ public class OrderService {
     @Transactional
     public Creation create(UUID memberId, UUID key, String planId, LocalDate travelStartDate) {
         orders.historyContext(memberId,"ORDER_REQUEST",null);
+        return createOwned(memberId,key,planId,travelStartDate);
+    }
+
+    @Transactional
+    public Creation createScenario(UUID actor, UUID memberId, UUID key, String planId, LocalDate travelStartDate) {
+        orders.historyContext(actor,"SCENARIO_GENERATOR","운영자가 시연용 주문 생성");
+        return createOwned(memberId,key,planId,travelStartDate);
+    }
+
+    private Creation createOwned(UUID memberId, UUID key, String planId, LocalDate travelStartDate) {
         var existing = orders.findByKey(memberId, key);
         if (existing.isPresent()) return replay(existing.get(), planId, travelStartDate);
         if (orders.isPast(travelStartDate)) {
