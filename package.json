@@ -4,6 +4,10 @@
     "build": "npm --prefix frontend run build",
     "dev": "npm --prefix frontend run dev",
     "start": "npm --prefix frontend run start",
+<<<<<<< HEAD
+=======
+    "test:orders": "node --test --test-concurrency=1 tests/orders.integration.test.mjs",
+>>>>>>> develop
     "neon:configure": "node backend/database/configure-neon.mjs"
   },
   "dependencies": {

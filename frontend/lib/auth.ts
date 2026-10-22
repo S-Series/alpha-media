@@ -6,12 +6,13 @@ export type Member = {
   createdAt: string;
 };
 
-async function post(path: string, body?: string, contentType?: string) {
+export async function post(path: string, body?: string, contentType?: string,
+  extraHeaders: Record<string, string> = {}) {
   // 로그인·로그아웃으로 토큰이 교체될 수 있으므로 변경 요청 전에 새로 조회한다.
   const csrfResponse = await fetch("/api/auth/csrf", { cache: "no-store", credentials: "same-origin" });
   if (!csrfResponse.ok) throw new Error("로그인 서버에 연결하지 못했습니다.");
   const csrf: { headerName: string; token: string } = await csrfResponse.json();
-  const headers: Record<string, string> = { [csrf.headerName]: csrf.token };
+  const headers: Record<string, string> = { ...extraHeaders, [csrf.headerName]: csrf.token };
   if (contentType) headers["Content-Type"] = contentType;
   const response = await fetch(path, {
     method: "POST",
@@ -21,9 +22,15 @@ async function post(path: string, body?: string, contentType?: string) {
   });
   if (!response.ok) {
     const error = await response.json().catch(() => null);
-    throw new Error(error?.message || "요청을 처리하지 못했습니다. 다시 시도해 주세요.");
+    throw new ApiRequestError(response.status, error?.message || "요청을 처리하지 못했습니다. 다시 시도해 주세요.");
   }
   return response;
+}
+
+export class ApiRequestError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
 }
 
 export async function signup(email: string, displayName: string, password: string) {

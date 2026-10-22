@@ -1,74 +1,41 @@
 import Link from "next/link";
 import { Suspense } from "react";
-import { notFound } from "next/navigation";
-import PreviewNotice from "@/components/screens/preview-notice";
-import OrderSummary from "@/components/screens/order-summary";
-import { previewOrders } from "@/lib/preview-data";
+import { notFound, redirect } from "next/navigation";
+import { getOrder } from "@/lib/orders-server";
+import { orderStatus } from "@/lib/orders";
+import { kst, money } from "@/lib/preview-data";
 
-export function generateStaticParams() {
-  return previewOrders.map(({ id }) => ({ orderId: id }));
-}
-
-export default function OrderDetailPage(
-  props: PageProps<"/mypage/orders/[orderId]">,
-) {
-  return (
-    <>
-      <h1>주문 상세</h1>
-      <PreviewNotice />
-      <Suspense fallback={<p role="status">주문 정보 확인 중…</p>}>
-        <OrderDetail {...props} />
-      </Suspense>
-    </>
-  );
+export default function OrderDetailPage(props: PageProps<"/mypage/orders/[orderId]">) {
+  return <><h1>주문 상세</h1><Suspense fallback={<p>주문 조회 중…</p>}><OrderDetail {...props} /></Suspense></>;
 }
 
 async function OrderDetail({ params }: PageProps<"/mypage/orders/[orderId]">) {
   const { orderId } = await params;
-  const order = previewOrders.find((item) => item.id === orderId);
-  if (!order) notFound();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(orderId)) notFound();
+  const result = await getOrder(orderId);
+  if (!result.ok) {
+    if (result.status === 401) redirect("/login");
+    if (result.status === 404) notFound();
+    return <p role="alert">주문을 불러오지 못했습니다. 잠시 후 다시 조회해 주세요.</p>;
+  }
+  const order = result.data;
   return (
     <>
-      <OrderSummary order={order} />
       <section className="home-panel">
-        <h2>다음 행동</h2>
-        {order.payment === "결제 대기" && (
-          <p>
-            미결제 주문의 유효 시간은 생성 후 10분입니다. 잔여 시간과 만료
-            여부는 서버 확인 후 표시합니다.
-          </p>
-        )}
-        {order.fulfillment === "발급 중" && (
-          <p>
-            발급이 지연되는 경우 상태를 다시 확인하거나 고객지원에 문의할 수
-            있습니다.
-          </p>
-        )}
-        <div className="page-actions">
-          <button type="button" disabled>
-            상태 다시 확인
-          </button>
-          {order.payment === "결제 대기" && (
-            <Link href={`/checkout?orderId=${order.id}`}>결제 화면 확인</Link>
-          )}
-          {order.simId && (
-            <Link href={`/mypage/sims/${order.simId}`}>SIM 상세 보기</Link>
-          )}
-          <Link href="/support">고객지원</Link>
-        </div>
+        <h2>{order.planName}</h2>
+        <dl className="detail-list">
+          <dt>주문번호</dt><dd>{order.id}</dd>
+          <dt>상품 조건</dt><dd>{order.country} · {order.days}일 · {order.dataMb.toLocaleString("ko-KR")}MB · {order.simType}</dd>
+          <dt>여행 시작일</dt><dd>{order.travelStartDate}</dd>
+          <dt>주문 금액</dt><dd>{money(order.amount)} {order.currency}</dd>
+          <dt>상태</dt><dd>{orderStatus(order.status)}</dd>
+          <dt>생성 시각</dt><dd>{kst(order.createdAt)}</dd>
+          <dt>유효 기한</dt><dd>{kst(order.expiresAt)}</dd>
+        </dl>
+        <p>{order.status === "EXPIRED" ? "주문이 만료됐습니다. 구매하려면 상품을 다시 선택해 새 주문을 생성해 주세요." : "결제 대기 중입니다. 결제·발급 기능은 아직 연결되지 않았습니다."}</p>
+        <form action={`/mypage/orders/${order.id}`} method="get"><button type="submit">상태 다시 확인</button></form>
       </section>
-      <section className="home-panel">
-        <h2>환불</h2>
-        <p>
-          {order.installation === "개통"
-            ? "설치·개통된 SIM은 환불할 수 없습니다."
-            : "공급사의 최신 설치·개통 상태와 결제 내역을 확인한 뒤 환불 가능 여부를 안내합니다."}
-        </p>
-        <button type="button" disabled>
-          환불 요청
-        </button>
-      </section>
-      <Link href="/mypage/orders">주문 내역으로 돌아가기</Link>
+      <nav className="page-actions"><Link href="/mypage/orders">주문 내역</Link><Link href="/plans">요금제 선택</Link></nav>
     </>
   );
 }

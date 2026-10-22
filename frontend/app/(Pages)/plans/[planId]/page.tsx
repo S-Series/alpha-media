@@ -13,7 +13,7 @@ export default function PlanDetailPage(props: PageProps<"/plans/[planId]">) {
   return (
     <>
       <h1>요금제 상세</h1>
-      <p>Service에서 조회한 예시 상품입니다. 주문·결제는 아직 연결되지 않았습니다.</p>
+      <p>상품을 확인하고 eSIM 주문을 생성할 수 있습니다. 결제·발급은 아직 연결되지 않았습니다.</p>
       <Suspense fallback={<p role="status">상품 정보 확인 중…</p>}>
         <PlanDetail {...props} />
       </Suspense>
@@ -46,14 +46,14 @@ async function PlanDetail({ params }: PageProps<"/plans/[planId]">) {
           <dd>{money(plan.price)}</dd>
         </dl>
       </section>
-      <form action="/checkout" method="get" className="screen-form home-panel">
+      {plan.simType === "ESIM" ? <form action="/checkout" method="get" className="screen-form home-panel">
         <input type="hidden" name="planId" value={plan.id} />
         <label>
           여행 시작일
           <input type="date" name="travelStartDate" required />
         </label>
         <button type="submit">주문 조건 확인</button>
-      </form>
+      </form> : <p>USIM 주문은 수령·등록 절차를 연결한 뒤 제공할 예정입니다.</p>}
       <nav className="page-actions" aria-label="상품 관련 화면">
         <Link href="/plans">요금제 목록</Link>
         <Link href="/guide">설치·수령 안내</Link>
