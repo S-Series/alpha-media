@@ -1,6 +1,6 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { createHmac, pbkdf2Sync, randomBytes, randomUUID } from "node:crypto";
+import { createHmac, pbkdf2Sync, randomBytes, randomInt, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
@@ -14,6 +14,7 @@ import { setTimeout as delay } from "node:timers/promises";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const secret = randomBytes(32).toString("hex");
 const children = [];
+const reservedPorts = new Set();
 let directory, dbPort, servicePort, gatewayPort, serviceProcess, base, alice, bob, admin, first, firstKey;
 const future = "2099-01-01";
 const password = "LocalOrderTest!2026Aa";
@@ -41,12 +42,22 @@ function sql(statement, app = false, expectFailure = false) {
 }
 
 async function port() {
-  const server = createServer();
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const value = server.address().port;
-  await new Promise(resolve => server.close(resolve));
-  return value;
+  // Windows clients use the dynamic range from 49152; server restarts must not race those sockets.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const value = randomInt(20000, 30000);
+    if (reservedPorts.has(value)) continue;
+    reservedPorts.add(value);
+    const server = createServer();
+    try {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(value, "127.0.0.1", resolve);
+      });
+      await new Promise(resolve => server.close(resolve));
+      return value;
+    } catch { reservedPorts.delete(value); }
+  }
+  throw new Error("No available isolated test server port in 20000–29999");
 }
 
 async function until(check, timeout = 30000) {
@@ -62,17 +73,33 @@ async function startJava(name, env) {
   const jar = join(root, "backend", name, "target", `${name}-0.0.1-SNAPSHOT.jar`);
   const built = await stat(jar).catch(() => null);
   assert.ok(built, `Build backend/${name} with Maven package first`);
-  const log = createWriteStream(join(directory, `${name}.log`), { flags: "a" });
+  const logPath = join(directory, `${name}.log`);
+  const log = createWriteStream(logPath, { flags: "a" });
   const processChild = spawn("java", ["-jar", jar], {
     cwd: join(root, "backend", name), windowsHide: true,
     env: { ...process.env, SPRING_PROFILES_ACTIVE: "render", INTERNAL_GATEWAY_TOKEN: secret, ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let startupOutput = "", startupError;
+  processChild.stdout.on("data", chunk => { startupOutput = (startupOutput + chunk.toString()).slice(-8192); });
+  processChild.once("error", error => { startupError = error; });
   processChild.stdout.pipe(log); processChild.stderr.pipe(log);
   children.push(processChild);
   const url = `http://127.0.0.1:${env.PORT}/health`;
-  await until(async () => (await fetch(url, { signal: AbortSignal.timeout(2000) })).ok);
-  return processChild;
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    if (startupError || processChild.exitCode !== null || processChild.signalCode !== null) {
+      throw new Error(`${name} exited before startup (exit=${processChild.exitCode}, signal=${processChild.signalCode}); see ${logPath}`);
+    }
+    // A stale process on the same port must not satisfy the new process's health check.
+    if (/Started (?:Service|Gateway)Application in /.test(startupOutput)) {
+      try {
+        if ((await fetch(url, { signal: AbortSignal.timeout(2000) })).ok) return processChild;
+      } catch { /* Wait for this application's HTTP listener. */ }
+    }
+    await delay(250);
+  }
+  throw new Error(`${name} did not become healthy; see ${logPath}`);
 }
 
 function startService(extra = {}) {
@@ -89,7 +116,9 @@ function startService(extra = {}) {
     SUPPLIER_WEBHOOK_URL: `http://127.0.0.1:${gatewayPort}/webhooks/supplier`,
     SUPPLIER_HTTP_TIMEOUT_MS: "500", ISSUANCE_LEASE_MS: "3000", ISSUANCE_POLL_MS: "1000",
     ISSUANCE_WORKER_DELAY_MS: "100", SUPPLIER_COMPLETION_DELAY_MS: "200",
-    PAYMENT_WORKER_DELAY_MS: "100", ...accountHashes, ...extra });
+    PAYMENT_WORKER_DELAY_MS: "100", WEBHOOK_WORKER_DELAY_MS: "50", WEBHOOK_LEASE_MS: "3000",
+    WEBHOOK_RETRY_BASE_MS: "100", WEBHOOK_INBOX_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
+    ...accountHashes, ...extra });
 }
 
 class Client {
@@ -352,8 +381,39 @@ async function notify(result, signature = true) {
       ? createHmac("sha256", secret).update(body).digest("hex") : "0".repeat(64) } });
 }
 
+function inboundRow(id) {
+  const value = sql(`SELECT row_to_json(e) FROM inbound_events e WHERE id='${id}'`);
+  return value ? JSON.parse(value) : null;
+}
+
+async function webhookOutcome(pendingResponse, errorStatus = null) {
+  const response = await pendingResponse;
+  if (response.status === 409) {
+    assert.equal(errorStatus, 409);
+    assert.equal((await response.json()).code, "INBOUND_EVENT_CONFLICT");
+    return;
+  }
+  assert.ok([200, 202].includes(response.status), `unexpected webhook HTTP ${response.status}`);
+  const receipt = await response.json();
+  assert.ok(receipt.id); assert.ok(receipt.eventId);
+  await until(() => inboundRow(receipt.id)?.status === (errorStatus ? "REVIEW_REQUIRED" : "PROCESSED"));
+  const row = inboundRow(receipt.id);
+  if (errorStatus) assert.equal(row.error_status, errorStatus);
+  else assert.ok(row.processed_at);
+  return { receipt, row };
+}
+
+async function webhookCopies(responses, errorStatus = null) {
+  assert.ok(responses.every(response => [200, 202].includes(response.status)));
+  const completed = await Promise.all(responses.map(response => webhookOutcome(response, errorStatus)));
+  assert.equal(new Set(completed.map(result => result.receipt.id)).size, 1);
+  return completed[0];
+}
+
 async function restart(extra = {}) {
-  const stopped = once(serviceProcess, "exit"); serviceProcess.kill(); await stopped;
+  if (serviceProcess && serviceProcess.exitCode === null && serviceProcess.signalCode === null) {
+    const stopped = once(serviceProcess, "exit"); serviceProcess.kill(); await stopped;
+  }
   serviceProcess = await startService(extra);
 }
 
@@ -396,6 +456,228 @@ function rejectTransitions(table, orderId, statuses) {
       FOR EACH ROW EXECUTE FUNCTION reject_transition_for_test();`);
   return () => sql(`DROP TRIGGER reject_transition_for_test ON ${table}; DROP FUNCTION reject_transition_for_test();`);
 }
+
+const inboxOnly = { PAYMENT_WORKER_DELAY_MS: "60000", ISSUANCE_WORKER_DELAY_MS: "60000" };
+
+async function pendingWebhookPayment() {
+  const order = await newOrder(), attempt = await (await alice.pay(order.id)).json();
+  assert.equal(attempt.status, "QUEUED");
+  const approved = await pg("/payments/approve", { paymentId: attempt.id, orderId: order.id,
+    amount: order.amount, currency: "KRW", scenario: "APPROVE", webhookCopies: 0, webhookDelayMs: 0 });
+  assert.equal(approved.status, 200);
+  return { order, attempt, result: await approved.json() };
+}
+
+function rejectInbox(eventId, operation, statuses = []) {
+  const condition = statuses.length ? `AND NEW.status IN (${statuses.map(value => `'${value}'`).join(",")})` : "";
+  sql(`CREATE FUNCTION reject_inbox_for_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.event_id='${eventId}' ${condition} THEN RAISE EXCEPTION 'simulated inbox database failure'; END IF;
+    RETURN NEW; END $$; CREATE TRIGGER reject_inbox_for_test BEFORE ${operation} ON inbound_events
+      FOR EACH ROW EXECUTE FUNCTION reject_inbox_for_test();`);
+  return () => sql("DROP TRIGGER reject_inbox_for_test ON inbound_events; DROP FUNCTION reject_inbox_for_test();");
+}
+
+async function holdOrder(orderId) {
+  const processChild = spawn("psql", ["-X", "-At", "-v", "ON_ERROR_STOP=1"], { windowsHide: true,
+    env: { ...process.env, PGHOST: "127.0.0.1", PGPORT: String(dbPort), PGDATABASE: "orders_test",
+      PGUSER: "postgres", PGPASSWORD: secret, PGSSLMODE: "disable" } });
+  let output = "";
+  processChild.stdout.on("data", chunk => { output += chunk.toString(); });
+  processChild.stdin.write(`BEGIN; SELECT id FROM orders WHERE id='${orderId}' FOR NO KEY UPDATE;\n\\echo lock-ready\n`);
+  await until(() => output.includes("lock-ready"));
+  return async () => {
+    const exited = once(processChild, "exit");
+    processChild.stdin.end("ROLLBACK;\n\\q\n");
+    await exited;
+  };
+}
+
+test("webhook inbox persists one encrypted receipt for twenty concurrent deliveries before processing after restart", { timeout: 45000 }, async () => {
+  await restart({ ...inboxOnly, WEBHOOK_WORKER_DELAY_MS: "60000" });
+  try {
+    const { order, attempt, result } = await pendingWebhookPayment();
+    const responses = await Promise.all(Array.from({ length: 20 }, () => notify(result)));
+    assert.equal(responses.filter(response => response.status === 202).length, 1);
+    assert.equal(responses.filter(response => response.status === 200).length, 19);
+    const receipts = await Promise.all(responses.map(response => response.json()));
+    assert.equal(new Set(receipts.map(receipt => receipt.id)).size, 1);
+    const receipt = receipts[0], before = inboundRow(receipt.id);
+    assert.equal(before.status, "PENDING"); assert.equal(before.receive_count, 20); assert.equal(before.attempt_count, 0);
+    assert.equal(before.order_id, order.id); assert.equal(before.target_id, attempt.id);
+    assert.ok(!Buffer.from(before.body.slice(2), "hex").includes(Buffer.from(JSON.stringify(result))));
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    const body = JSON.stringify(Object.fromEntries(Object.entries(result).reverse()), null, 2);
+    const formatted = await fetch(base + "/webhooks/pg", { method: "POST", body,
+      headers: { "Content-Type": "application/json", "X-Signature": createHmac("sha256", secret).update(body).digest("hex") } });
+    assert.equal(formatted.status, 200); assert.equal((await formatted.json()).id, receipt.id);
+    assert.equal(inboundRow(receipt.id).body, before.body); assert.equal(inboundRow(receipt.id).receive_count, 21);
+    sql(`UPDATE inbound_events SET body='tampered'::bytea WHERE id='${receipt.id}'`, true, true);
+    sql(`DELETE FROM inbound_events WHERE id='${receipt.id}'`, true, true);
+    await restart(inboxOnly);
+    await until(() => inboundRow(receipt.id).status === "PROCESSED");
+    assert.equal(inboundRow(receipt.id).attempt_count, 1);
+    assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    assert.equal((await (await pg(`/payments/${attempt.id}/stats`)).json()).approvalExecutions, 1);
+    const detail = await (await admin.request(`/api/admin/orders/${order.id}`)).json();
+    const visible = detail.inboundEvents.find(event => event.id === receipt.id);
+    assert.equal(visible.status, "PROCESSED"); assert.equal(visible.receiveCount, 21);
+    for (const privateField of ["body", "payloadHash", "signature", "leaseToken"]) assert.equal(visible[privateField], undefined);
+  } finally { await restart(); }
+});
+
+test("webhook inbox rejects invalid signatures and returns non-success when its durable insert fails", { timeout: 45000 }, async () => {
+  await restart(inboxOnly);
+  let restore;
+  try {
+    const { order, result } = await pendingWebhookPayment();
+    assert.equal((await notify(result, false)).status, 401);
+    assert.equal((await notify({ ...result, amount: "15900" })).status, 400);
+    assert.equal(sql(`SELECT count(*) FROM inbound_events WHERE event_id='${result.eventId}'`), "0");
+    restore = rejectInbox(result.eventId, "INSERT");
+    const rejected = await notify(result);
+    assert.ok(rejected.status >= 500 && rejected.status <= 599);
+    assert.equal(sql(`SELECT count(*) FROM inbound_events WHERE event_id='${result.eventId}'`), "0");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    restore(); restore = null;
+    const accepted = await notify(result); assert.equal(accepted.status, 202);
+    await webhookOutcome(accepted); assert.equal(orderState(order.id), "PAID");
+  } finally { if (restore) restore(); await restart(); }
+});
+
+test("webhook inbox keeps a receipt across business DB rollback and restarts then automatically retries the same event", { timeout: 60000 }, async () => {
+  const settings = { ...inboxOnly, WEBHOOK_RETRY_BASE_MS: "1000" };
+  await restart(settings);
+  let restore;
+  try {
+    const { order, attempt, result } = await pendingWebhookPayment();
+    restore = rejectTransitions("payment_attempts", order.id, ["APPROVED"]);
+    const response = await notify(result); assert.equal(response.status, 202);
+    const receipt = await response.json();
+    await until(() => inboundRow(receipt.id).status === "RETRY");
+    const failed = inboundRow(receipt.id);
+    assert.equal(failed.last_error, "INBOUND_PROCESSING_FAILED"); assert.equal(failed.error_status, 503);
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+    await restart({ ...settings, WEBHOOK_WORKER_DELAY_MS: "60000" });
+    assert.ok(inboundRow(receipt.id).attempt_count >= failed.attempt_count);
+    assert.equal(inboundRow(receipt.id).body, failed.body);
+    restore(); restore = null;
+    await restart(settings);
+    await until(() => inboundRow(receipt.id).status === "PROCESSED");
+    assert.ok(inboundRow(receipt.id).attempt_count >= 2);
+    assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    assert.equal((await (await pg(`/payments/${attempt.id}/stats`)).json()).approvalRequests, 1);
+  } finally { if (restore) restore(); await restart(); }
+});
+
+test("webhook inbox completion failure atomically rolls back payment approval and issuance enqueue", { timeout: 45000 }, async () => {
+  await restart({ ...inboxOnly, WEBHOOK_RETRY_BASE_MS: "1000" });
+  let restore;
+  try {
+    const { order, attempt, result } = await pendingWebhookPayment();
+    restore = rejectInbox(result.eventId, "UPDATE", ["PROCESSED"]);
+    const response = await notify(result); assert.equal(response.status, 202); const receipt = await response.json();
+    await until(() => inboundRow(receipt.id).status === "RETRY");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT status FROM payment_attempts WHERE id='${attempt.id}'`), "QUEUED");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+    restore(); restore = null;
+    await until(() => inboundRow(receipt.id).status === "PROCESSED");
+    assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+  } finally { if (restore) restore(); await restart(); }
+});
+
+test("webhook inbox reclaims an interrupted processing lease after server restart without a second approval", { timeout: 45000 }, async () => {
+  await restart(inboxOnly);
+  let release;
+  try {
+    const { order, attempt, result } = await pendingWebhookPayment();
+    release = await holdOrder(order.id);
+    const response = await notify(result); assert.equal(response.status, 202); const receipt = await response.json();
+    await until(() => inboundRow(receipt.id).status === "PROCESSING");
+    const claimed = inboundRow(receipt.id); assert.equal(claimed.attempt_count, 1); assert.ok(claimed.lease_token);
+    const stopped = once(serviceProcess, "exit"); serviceProcess.kill(); await stopped;
+    await release(); release = null;
+    serviceProcess = await startService(inboxOnly);
+    await until(() => inboundRow(receipt.id).status === "PROCESSED");
+    assert.equal(inboundRow(receipt.id).attempt_count, 2); assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    assert.equal((await (await pg(`/payments/${attempt.id}/stats`)).json()).approvalRequests, 1);
+  } finally { if (release) await release(); await restart(); }
+});
+
+test("webhook inbox preserves the original payload and quarantines concurrent reuse of an event ID with changed content", { timeout: 45000 }, async () => {
+  await restart({ ...inboxOnly, WEBHOOK_WORKER_DELAY_MS: "60000" });
+  try {
+    const { order, attempt, result } = await pendingWebhookPayment();
+    const response = await notify(result); assert.equal(response.status, 202); const receipt = await response.json();
+    const original = inboundRow(receipt.id);
+    const changed = { ...result, amount: result.amount + 1 };
+    const collisions = await Promise.all(Array.from({ length: 20 }, () => notify(changed)));
+    assert.ok(collisions.every(response => response.status === 409));
+    assert.ok((await Promise.all(collisions.map(response => response.json()))).every(body => body.code === "INBOUND_EVENT_CONFLICT"));
+    const quarantined = inboundRow(receipt.id);
+    assert.equal(quarantined.status, "REVIEW_REQUIRED"); assert.equal(quarantined.body, original.body);
+    assert.equal(quarantined.payload_hash, original.payload_hash); assert.ok(quarantined.conflicting_payload_hash);
+    assert.equal(sql(`SELECT count(*) FROM inbound_events WHERE source='PG' AND event_id='${result.eventId}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
+    const same = await notify(result); assert.equal(same.status, 200); assert.equal((await same.json()).id, receipt.id);
+    await restart(inboxOnly); await delay(500);
+    assert.equal(inboundRow(receipt.id).status, "REVIEW_REQUIRED"); assert.equal(inboundRow(receipt.id).attempt_count, 0);
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+  } finally { await restart(); }
+});
+
+test("webhook inbox retains its six-attempt budget when completion and error recording both fail across restart", { timeout: 60000 }, async () => {
+  const settings = { ...inboxOnly, WEBHOOK_LEASE_MS: "1000" };
+  await restart(settings);
+  let restore;
+  try {
+    const { order, attempt, result } = await pendingWebhookPayment();
+    restore = rejectInbox(result.eventId, "UPDATE", ["PROCESSED", "RETRY", "REVIEW_REQUIRED"]);
+    const response = await notify(result); assert.equal(response.status, 202); const receipt = await response.json();
+    await until(() => inboundRow(receipt.id).attempt_count >= 2);
+    await restart(settings);
+    await until(() => inboundRow(receipt.id).attempt_count === 6);
+    await delay(1500);
+    assert.equal(inboundRow(receipt.id).status, "PROCESSING");
+    assert.equal(inboundRow(receipt.id).attempt_count, 6);
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    restore(); restore = null;
+    await restart(settings);
+    await until(() => inboundRow(receipt.id).status === "REVIEW_REQUIRED");
+    assert.equal(inboundRow(receipt.id).attempt_count, 6);
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+    assert.equal((await (await pg(`/payments/${attempt.id}/stats`)).json()).approvalRequests, 1);
+    const duplicate = await notify(result); assert.equal(duplicate.status, 200);
+    assert.equal((await duplicate.json()).id, receipt.id);
+    await delay(500); assert.equal(inboundRow(receipt.id).attempt_count, 6);
+  } finally { if (restore) restore(); await restart(); }
+});
+
+test("webhook inbox retains an unknown valid target and stops after six deferred lookups without fabricating an order", { timeout: 30000 }, async () => {
+  const result = { eventId: randomUUID(), paymentId: randomUUID(), orderId: randomUUID(), amount: 15900,
+    currency: "KRW", status: "APPROVED", transactionId: `unknown_${randomUUID()}`, declineCode: null };
+  const response = await notify(result); assert.equal(response.status, 202);
+  const { row } = await webhookOutcome(response, 404);
+  assert.equal(row.attempt_count, 6); assert.equal(row.order_id, null);
+  assert.equal(row.last_error, "PAYMENT_NOT_FOUND");
+  assert.equal(sql(`SELECT count(*) FROM orders WHERE id='${result.orderId}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${result.orderId}'`), "0");
+});
 
 test("payment intake authenticates owner, enforces CSRF, validates inputs and ignores forged amount", async () => {
   const order = await newOrder(), path = `/api/orders/${order.id}/payment-attempts`;
@@ -521,19 +803,19 @@ test("payment signed duplicate webhook and response races apply one event and on
   await settled(order, attempt);
   const result = await (await pg(`/payments/${attempt.id}`)).json();
   const responses = await Promise.all(Array.from({ length: 20 }, () => notify(result)));
-  assert.ok(responses.every(r => r.status === 200));
+  await webhookCopies(responses);
   assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
   assert.equal(sql(`SELECT status FROM payment_attempts WHERE id='${attempt.id}'`), "APPROVED");
   assert.equal(orderState(order.id), "PAID");
   await until(async () => (await (await pg(`/payments/${attempt.id}/stats`)).json()).webhookSent === 2);
   assert.equal((await (await pg(`/payments/${attempt.id}/stats`)).json()).approvalExecutions, 1);
   assert.equal((await notify(result, false)).status, 401);
-  assert.equal((await notify({ ...result, amount: result.amount + 1 })).status, 409);
-  assert.equal((await notify({ ...result, currency: "USD" })).status, 409);
+  await webhookOutcome(notify({ ...result, amount: result.amount + 1 }), 409);
+  await webhookOutcome(notify({ ...result, currency: "USD" }), 409);
   assert.equal((await notify({ ...result, amount: result.amount + 0.5 })).status, 400);
   assert.equal((await notify({ ...result, amount: String(result.amount) })).status, 400);
-  assert.equal((await notify({ ...result, transactionId: "changed" })).status, 409);
-  assert.equal((await notify({ ...result, orderId: randomUUID() })).status, 409);
+  await webhookOutcome(notify({ ...result, transactionId: "changed" }), 409);
+  await webhookOutcome(notify({ ...result, orderId: randomUUID() }), 409);
   assert.equal(orderState(order.id), "PAID");
 });
 
@@ -542,13 +824,14 @@ test("payment forged amount webhook cannot mark an unresolved order paid", async
   const attempt = await (await alice.pay(order.id, randomUUID(), "RESPONSE_LOST")).json();
   await until(() => sql(`SELECT count(*) FROM mock_pg_payments WHERE payment_id='${attempt.id}'`) === "1");
   const result = await (await pg(`/payments/${attempt.id}`)).json();
-  assert.equal((await notify({ ...result, amount: 1 })).status, 409);
+  await webhookOutcome(notify({ ...result, amount: 1 }), 409);
   assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
   assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
-  assert.equal((await notify(result)).status, 409);
+  await webhookOutcome(notify(result), 409);
   await settled(order, attempt, "REVIEW_REQUIRED");
   assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
-  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
+  assert.equal(sql(`SELECT string_agg(code,',' ORDER BY code) FROM order_conflicts WHERE order_id='${order.id}'`),
+    "INBOUND_EVENT_CONFLICT,PG_RESULT_MISMATCH");
   assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
 });
 
@@ -592,7 +875,7 @@ test("payment mismatched PG lookup requires review and cannot mark the order pai
   assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
   sql(`UPDATE mock_pg_payments SET amount=amount-1 WHERE payment_id='${attempt.id}'`);
   const corrected = await (await pg(`/payments/${attempt.id}`)).json();
-  assert.equal((await notify(corrected)).status, 409);
+  await webhookOutcome(notify(corrected), 409);
   assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
   assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
 });
@@ -793,7 +1076,7 @@ test("issuance delayed duplicate callbacks issue one profile and late acceptance
   await until(() => issuanceRow(order.id).status === "ISSUED");
   const result = await (await supplier(`/orders/${job.id}`)).json();
   const copies = await Promise.all(Array.from({ length: 20 }, () => supplierNotify(result)));
-  assert.ok(copies.every(r => r.status === 200));
+  await webhookCopies(copies);
   await until(async () => (await (await supplier(`/orders/${job.id}/stats`)).json()).callbackSent === 20);
   assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
   assert.equal(sql(`SELECT count(*) FROM issuance_events WHERE event_id='${result.eventId}'`), "1");
@@ -801,14 +1084,14 @@ test("issuance delayed duplicate callbacks issue one profile and late acceptance
   assert.equal(stats.issueExecutions, 1); assert.equal(stats.requestCount, 1);
   assert.equal(stats.callbackFailures, 0);
   const stale = { ...result, eventId: randomUUID(), status: "ACCEPTED", revision: 1, iccid: null, activationCode: null };
-  assert.equal((await supplierNotify(stale)).status, 200); assert.equal(issuanceRow(order.id).status, "ISSUED");
+  await webhookOutcome(supplierNotify(stale)); assert.equal(issuanceRow(order.id).status, "ISSUED");
   assert.equal((await supplierNotify(result, false)).status, 401);
-  assert.equal((await supplierNotify({ ...result, orderId: randomUUID() })).status, 409);
-  assert.equal((await supplierNotify({ ...result, requestId: randomUUID() })).status, 404);
-  assert.equal((await supplierNotify({ ...result, activationCode: "LPA:1$smdp.example$changed" })).status, 409);
+  await webhookOutcome(supplierNotify({ ...result, orderId: randomUUID() }), 409);
+  await webhookOutcome(supplierNotify({ ...result, eventId: randomUUID(), requestId: randomUUID() }), 404);
+  await webhookOutcome(supplierNotify({ ...result, activationCode: "LPA:1$smdp.example$changed" }), 409);
   assert.equal((await supplierNotify({ ...result, revision: 2.5 })).status, 400);
-  assert.equal((await supplierNotify({ ...result, eventId: randomUUID(), status: "FAILED", reason: "MOCK_ISSUANCE_FAILED",
-    iccid: null, activationCode: null })).status, 409);
+  await webhookOutcome(supplierNotify({ ...result, eventId: randomUUID(), status: "FAILED", reason: "MOCK_ISSUANCE_FAILED",
+    iccid: null, activationCode: null }), 409);
   assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
 });
 
@@ -835,7 +1118,7 @@ test("issuance final failure without callback stays visible to customer and admi
   assert.equal(detail.issuance.issuance.status, "FAILED");
   const result = await (await supplier(`/orders/${job.id}`)).json();
   const repeats = await Promise.all(Array.from({ length: 20 }, () => supplierNotify(result)));
-  assert.ok(repeats.every(r => r.status === 200));
+  await webhookCopies(repeats);
   assert.equal((await (await supplier(`/orders/${job.id}/stats`)).json()).issueExecutions, 0);
 });
 
@@ -865,7 +1148,7 @@ test("issuance job insertion failure rolls back paid state and the same PG resul
     assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
   } finally { sql("GRANT INSERT ON issuance_jobs TO alpha_media_app"); }
   const result = await (await pg(`/payments/${attempt.id}`)).json();
-  assert.equal((await notify(result)).status, 200);
+  await webhookOutcome(notify(result));
   assert.equal(orderState(order.id), "PAID");
   await until(() => issuanceRow(order.id)?.status === "ISSUED");
   assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
@@ -1017,7 +1300,7 @@ test("conflict policy terminal supplier contradiction is durable deduplicated an
   assert.equal((await supplierNotify(contradiction, false)).status, 401);
   assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "0");
   const responses = await Promise.all(Array.from({ length: 20 }, () => supplierNotify(contradiction)));
-  assert.ok(responses.every(r => r.status === 409));
+  await webhookCopies(responses, 409);
   assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
   assert.equal(issuanceRow(order.id).status, "FAILED");
   assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
@@ -1031,7 +1314,7 @@ test("conflict policy terminal supplier contradiction is durable deduplicated an
   assert.equal(detail.conflicts[0].expectedStatus, "FAILED"); assert.equal(detail.conflicts[0].observedStatus, "ISSUED");
   assert.ok(detail.timeline.items.some(e => e.target === "CONFLICT"));
   await restart();
-  assert.equal((await supplierNotify(contradiction)).status, 409);
+  await webhookOutcome(supplierNotify(contradiction), 409);
   assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
   assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 409);
   assert.equal((await adminAction(order.id, "issuance-retries", retryRequest(job))).status, 409);
@@ -1049,8 +1332,8 @@ test("conflict policy signed contradictory payment result blocks new charges aft
     transactionId: `contradictory_${randomUUID()}` };
   assert.equal((await notify(contradiction, false)).status, 401);
   assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "0");
-  assert.equal((await notify(contradiction)).status, 409);
-  assert.equal((await notify(contradiction)).status, 409);
+  await webhookOutcome(notify(contradiction), 409);
+  await webhookOutcome(notify(contradiction), 409);
   assert.equal(orderState(order.id), "PENDING_PAYMENT");
   assert.equal((await alice.pay(order.id)).status, 409);
   await restart();
@@ -1068,7 +1351,7 @@ test("conflict policy mismatched callback order ID quarantines the referenced pa
     const result = target === "PAYMENT" ? await (await pg(`/payments/${attempt.id}`)).json()
       : await (await supplier(`/orders/${job.id}`)).json();
     const notifyResult = target === "PAYMENT" ? notify : supplierNotify;
-    assert.equal((await notifyResult({ ...result, orderId: unrelated.id })).status, 409);
+    await webhookOutcome(notifyResult({ ...result, orderId: unrelated.id }), 409);
     assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}' AND target='${target}'`), "1");
     assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${unrelated.id}'`), "0");
     assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 409);
@@ -1087,8 +1370,8 @@ test("conflict policy reused PG transaction reference quarantines an unresolved 
     const order = await newOrder(), queued = await (await alice.pay(order.id)).json();
     assert.equal(queued.status, "QUEUED");
     const collision = { ...approved, eventId: randomUUID(), orderId: order.id, paymentId: queued.id };
-    assert.equal((await notify(collision)).status, 409);
-    assert.equal((await notify(collision)).status, 409);
+    await webhookOutcome(notify(collision), 409);
+    await webhookOutcome(notify(collision), 409);
     assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}' AND code='PG_TRANSACTION_CONFLICT'`), "1");
     assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${original.id}'`), "0");
     assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
@@ -1107,8 +1390,8 @@ test("conflict policy reused supplier ICCID quarantines a queued issuance withou
     assert.equal(issuanceRow(order.id).status, "QUEUED");
     const collision = { ...issued, eventId: randomUUID(), orderId: order.id, requestId: job.id,
       supplierOrderNo: `supplier_${job.id}` };
-    assert.equal((await supplierNotify(collision)).status, 409);
-    assert.equal((await supplierNotify(collision)).status, 409);
+    await webhookOutcome(supplierNotify(collision), 409);
+    await webhookOutcome(supplierNotify(collision), 409);
     assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}' AND code='SUPPLIER_REFERENCE_CONFLICT'`), "1");
     assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${original.order.id}'`), "0");
     assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
@@ -1124,7 +1407,7 @@ test("conflict policy quarantines a queued refund before the external cancellati
   try {
     assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 202);
     assert.equal(refundRow(order.id).status, "REQUESTED");
-    assert.equal((await supplierNotify(contradiction)).status, 409);
+    await webhookOutcome(supplierNotify(contradiction), 409);
     await restart();
     await until(() => refundRow(order.id).status === "REVIEW_REQUIRED");
     assert.equal(orderState(order.id), "REFUND_PROCESSING");
@@ -1157,8 +1440,8 @@ for (const domain of ["payment", "refund"]) {
       await until(() => lookupEntered, 10000);
       const writesBeforeConflict = proxy.forId(paymentId).filter(c => c.method === "POST").length;
       assert.equal(writesBeforeConflict, domain === "payment" ? 1 : 0);
-      assert.equal((await notify({ eventId: randomUUID(), paymentId, orderId: order.id, amount: 1,
-        currency: "KRW", status: "APPROVED", transactionId: `conflicting_${randomUUID()}`, declineCode: null })).status, 409);
+      await webhookOutcome(notify({ eventId: randomUUID(), paymentId, orderId: order.id, amount: 1,
+        currency: "KRW", status: "APPROVED", transactionId: `conflicting_${randomUUID()}`, declineCode: null }), 409);
       assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
       releaseLookup();
       const row = () => domain === "payment"
@@ -1246,11 +1529,11 @@ test("refund issuance retry preserves failed attempts and ignores old callbacks 
   await until(()=>issuanceRow(order.id).id!==job.id && issuanceRow(order.id).status==="FAILED");
   assert.equal((await adminAction(order.id,"issuance-retries",body,key)).status,200);
   assert.equal((await adminAction(order.id,"issuance-retries",body)).status,409);
-  assert.equal((await supplierNotify(oldResult)).status,200);
+  await webhookOutcome(supplierNotify(oldResult));
   const second=issuanceRow(order.id), last=await adminAction(order.id,"issuance-retries",retryRequest(second));
   assert.equal(last.status,202);
   await until(()=>issuanceRow(order.id).status==="ISSUED");
-  assert.equal((await supplierNotify(oldResult)).status,200);
+  await webhookOutcome(supplierNotify(oldResult));
   assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`),"3");
   assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`),"1");
   assert.equal(sql(`SELECT sum(issue_executions) FROM mock_supplier_orders WHERE order_id='${order.id}'`),"1");
@@ -1270,8 +1553,8 @@ test("refund cancellation response loss reconciles the same refund reference wit
   const detail=await (await admin.request(`/api/admin/orders/${order.id}`)).json();
   assert.deepEqual(detail.actionEvents.map(e=>e.status),["REQUESTED","UNKNOWN","SUCCEEDED"]);
   const old=await (await supplier(`/orders/${job.id}`)).json();
-  assert.equal((await supplierNotify(old)).status,200);
-  assert.equal((await notify(await (await pg(`/payments/${attempt.id}`)).json())).status,200);
+  await webhookOutcome(supplierNotify(old));
+  await webhookOutcome(notify(await (await pg(`/payments/${attempt.id}`)).json()));
   assert.equal(orderState(order.id),"REFUNDED");
 });
 
@@ -1378,6 +1661,78 @@ async function profileNotify(signal, valid = true) {
 }
 const installedChange = { state: "INSTALLED", activatedAt: null, callbackCopies: 1, callbackDelayMs: 0 };
 
+for (const source of ["SUPPLIER", "PROFILE"]) {
+  test(`webhook inbox ${source.toLowerCase()} callback survives queued receipt restart and applies one event`, { timeout: 60000 }, async () => {
+    let order, job, profile, result;
+    try {
+      if (source === "SUPPLIER") {
+        await restart({ ISSUANCE_WORKER_DELAY_MS: "60000", WEBHOOK_WORKER_DELAY_MS: "60000" });
+        ({ order, job } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 }));
+        sql(`UPDATE issuance_jobs SET next_check_at=clock_timestamp()+INTERVAL '5 minutes' WHERE id='${job.id}'`);
+        await restart({ WEBHOOK_WORKER_DELAY_MS: "60000" });
+        assert.equal((await supplier("/orders", { requestId: job.id, orderId: order.id,
+          simulation: { scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 } })).status, 202);
+        await until(async () => (await (await supplier(`/orders/${job.id}`)).json()).status === "ISSUED");
+        result = await (await supplier(`/orders/${job.id}`)).json();
+      } else {
+        ({ order, profile } = await trackingProfile());
+        sql(`UPDATE sim_profiles SET next_sync_at=clock_timestamp()+INTERVAL '5 minutes' WHERE id='${profile.id}'`);
+        await restart({ WEBHOOK_WORKER_DELAY_MS: "60000" });
+        const changed = await trackingChange(profile, { ...installedChange, callbackCopies: 0 });
+        assert.equal(changed.status, 200); result = await changed.json();
+      }
+      const receive = source === "SUPPLIER" ? supplierNotify : profileNotify;
+      const response = await receive(result); assert.equal(response.status, 202); const receipt = await response.json();
+      assert.equal(receipt.source, source); assert.equal(inboundRow(receipt.id).status, "PENDING");
+      const duplicate = await receive(result); assert.equal(duplicate.status, 200); assert.equal((await duplicate.json()).id, receipt.id);
+      await restart({ ISSUANCE_WORKER_DELAY_MS: "60000" });
+      await until(() => inboundRow(receipt.id).status === "PROCESSED");
+      assert.equal(inboundRow(receipt.id).attempt_count, 1);
+      if (source === "SUPPLIER") {
+        assert.equal(issuanceRow(order.id).status, "ISSUED");
+        assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
+        assert.equal(sql(`SELECT source FROM issuance_events WHERE event_id='${result.eventId}'`), "CALLBACK");
+        assert.equal((await (await supplier(`/orders/${job.id}/stats`)).json()).issueExecutions, 1);
+      } else {
+        assert.equal((await trackingView(profile)).profile.installStatus, "INSTALLED");
+        assert.equal(sql(`SELECT count(*) FROM sim_profile_events WHERE event_id='${result.eventId}' AND source='CALLBACK'`), "1");
+      }
+    } finally { await restart(); }
+  });
+}
+
+test("webhook inbox retries a profile callback received before issuance and resolves after the supplier callback creates the SIM", { timeout: 60000 }, async () => {
+  await restart({ ISSUANCE_WORKER_DELAY_MS: "60000", WEBHOOK_RETRY_BASE_MS: "1000" });
+  try {
+    const simulation = { scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 };
+    const { order, job } = await issueOrder(simulation);
+    sql(`UPDATE issuance_jobs SET next_check_at=clock_timestamp()+INTERVAL '5 minutes' WHERE id='${job.id}'`);
+    await restart({ WEBHOOK_RETRY_BASE_MS: "1000" });
+    assert.equal((await supplier("/orders", { requestId: job.id, orderId: order.id, simulation })).status, 202);
+    await until(async () => (await (await supplier(`/orders/${job.id}`)).json()).status === "ISSUED");
+    const issued = await (await supplier(`/orders/${job.id}`)).json();
+    await until(async () => (await supplier(`/profiles/${issued.iccid}`)).status === 200);
+    const changed = await fetch(`http://127.0.0.1:${servicePort}/internal/mock-supplier/profiles/${issued.iccid}/simulate`, {
+      method: "POST", headers: { "X-Gateway-Token": secret, Authorization: `Bearer ${secret}`,
+        "Content-Type": "application/json", "Idempotency-Key": randomUUID() },
+      body: JSON.stringify({ ...installedChange, callbackCopies: 0 }), signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(changed.status, 200); const signal = await changed.json();
+    await restart({ ISSUANCE_WORKER_DELAY_MS: "60000", WEBHOOK_RETRY_BASE_MS: "1000" });
+    const response = await profileNotify(signal); assert.equal(response.status, 202); const receipt = await response.json();
+    await until(() => inboundRow(receipt.id).status === "RETRY");
+    assert.equal(inboundRow(receipt.id).last_error, "SIM_NOT_FOUND");
+    assert.equal(inboundRow(receipt.id).error_status, 404);
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+    await webhookOutcome(supplierNotify(issued));
+    await until(() => inboundRow(receipt.id).status === "PROCESSED");
+    assert.ok(inboundRow(receipt.id).attempt_count >= 2);
+    assert.equal(sql(`SELECT install_status FROM sim_profiles WHERE order_id='${order.id}'`), "INSTALLED");
+    assert.equal(sql(`SELECT count(*) FROM sim_profile_events WHERE event_id='${signal.eventId}' AND source='CALLBACK'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
+  } finally { await restart(); }
+});
+
 test("tracking owner authorization, CSRF, validation and activation-information viewing are enforced", async () => {
   const { profile } = await trackingProfile();
   assert.equal((await new Client().request(`/api/sims/${profile.id}/tracking`)).status, 401);
@@ -1411,13 +1766,13 @@ test("tracking delayed duplicate callbacks and concurrent replay apply one suppl
   assert.ok((await Promise.all(duplicates.map(response => response.json()))).every(copy => copy.eventId === signal.eventId));
   await until(async () => (await trackingView(profile)).profile.installStatus === "INSTALLED");
   const callbacks = await Promise.all(Array.from({ length: 20 }, () => profileNotify(signal)));
-  assert.ok(callbacks.every(response => response.status === 200));
+  await webhookCopies(callbacks);
   await until(() => sql(`SELECT callback_sent FROM mock_profile_notifications WHERE event_id='${signal.eventId}'`) === "3");
   assert.equal(sql(`SELECT count(*) FROM sim_profile_events WHERE event_id='${signal.eventId}'`), "1");
   assert.equal((await trackingChange(profile, { ...body, callbackCopies: 4 }, key)).status, 409);
   assert.equal((await profileNotify(signal, false)).status, 401);
   assert.equal((await profileNotify({ ...signal, revision: 2.5 })).status, 400);
-  assert.equal((await profileNotify({ ...signal, orderId: randomUUID() })).status, 404);
+  await webhookOutcome(profileNotify({ ...signal, eventId: randomUUID(), orderId: randomUUID() }), 404);
 });
 
 test("tracking callback omission is reconciled by polling and survives Service restart", async () => {
@@ -1432,7 +1787,7 @@ test("tracking callback omission is reconciled by polling and survives Service r
 });
 
 test("tracking reordered events cannot regress activation or alter an already known timestamp", async () => {
-  const { profile } = await trackingProfile();
+  const { profile, order } = await trackingProfile();
   const oldResponse = await trackingChange(profile, { ...installedChange, callbackCopies: 0 });
   assert.equal(oldResponse.status, 200); const old = await oldResponse.json();
   assert.equal((await trackingChange(profile, { state: "ENABLED", activatedAt: "2020-01-01T00:00:00Z", callbackCopies: 0, callbackDelayMs: 0 })).status, 400);
@@ -1440,13 +1795,16 @@ test("tracking reordered events cannot regress activation or alter an already kn
   const activeResponse = await trackingChange(profile, { state: "ENABLED", activatedAt, callbackCopies: 1, callbackDelayMs: 0 });
   assert.equal(activeResponse.status, 200); const active = await activeResponse.json();
   await until(async () => (await trackingView(profile)).profile.installStatus === "ACTIVE");
-  assert.equal((await profileNotify(old)).status, 200);
+  await webhookOutcome(profileNotify(old));
   assert.equal((await trackingView(profile)).profile.installStatus, "ACTIVE");
-  assert.equal((await profileNotify({ ...old, state: "DELETED" })).status, 409);
-  assert.equal((await profileNotify({ ...active, eventId: randomUUID() })).status, 409);
+  await webhookOutcome(profileNotify({ ...active, eventId: randomUUID() }), 409);
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "0");
+  assert.ok((await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json()).items.some(item => item.order.id === order.id));
+  await webhookOutcome(profileNotify({ ...old, state: "DELETED" }), 409);
   assert.equal((await trackingChange(profile, installedChange)).status, 409);
   assert.equal((await trackingChange(profile, { state: "ENABLED", activatedAt: "2020-01-01T00:00:00Z", callbackCopies: 0, callbackDelayMs: 0 })).status, 409);
-  assert.equal((await trackingView(profile)).profile.activatedAt, activatedAt);
+  assert.equal((await alice.request(`/api/sims/${profile.id}/tracking`)).status, 409);
+  assert.equal(Date.parse(sql(`SELECT activated_at FROM sim_profiles WHERE id='${profile.id}'`)), Date.parse(activatedAt));
 });
 
 test("tracking UTC expiry uses exactly seven 24-hour periods and displays the next KST date", async () => {
@@ -1537,8 +1895,8 @@ test("admin console timeline captures signal sources and does not repeat an unch
   assert.ok(events.some(e => e.target === "ISSUANCE" && e.toStatus === "ISSUED" && e.source.startsWith("SUPPLIER_")));
   assert.ok(events.some(e => e.target === "PROFILE" && e.toStatus === "QR_VIEWED" && e.actor === "USER:customer1"));
   assert.ok(events.some(e => e.target === "PROFILE" && e.toStatus === "ACTIVE" && e.source === "PROFILE_LOOKUP" && e.actor === "SYSTEM"));
-  assert.equal((await profileNotify(signal)).status, 200);
-  assert.equal((await profileNotify(signal)).status, 200);
+  await webhookOutcome(profileNotify(signal));
+  await webhookOutcome(profileNotify(signal));
   const replayed = (await (await admin.request(path)).json()).items;
   assert.equal(replayed.filter(e => e.target === "PROFILE" && e.toStatus === "ACTIVE").length, 1);
   assert.equal(replayed.filter(e => e.target === "ORDER" && e.toStatus === "PAID").length, 1);

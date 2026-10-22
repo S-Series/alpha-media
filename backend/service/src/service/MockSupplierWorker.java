@@ -52,7 +52,8 @@ public class MockSupplierWorker {
             var request = HttpRequest.newBuilder(URI.create(settings.webhookUrl())).timeout(Duration.ofMillis(settings.httpTimeoutMs()))
                 .header("Content-Type", "application/json").header("X-Signature", PgSignature.sign(body, settings.webhookSecret()))
                 .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
-            delivered = http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode() == 200;
+            int status = http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode();
+            delivered = status >= 200 && status < 300;
         } catch (InterruptedException exception) { Thread.currentThread().interrupt(); }
         catch (Exception exception) { /* 전송 실패는 원장에 남겨 제한된 횟수만 재시도한다. */ }
         if (delivered) {

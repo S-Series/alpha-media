@@ -51,7 +51,8 @@ public class MockPgWebhookWorker {
                     .header("Content-Type", "application/json")
                     .header("X-Signature", PgSignature.sign(body, settings.webhookSecret()))
                     .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
-            delivered = http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode() == 200;
+            int status = http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode();
+            delivered = status >= 200 && status < 300;
         } catch (InterruptedException exception) { Thread.currentThread().interrupt(); }
         catch (Exception exception) { /* 영속 작업에 실패를 남겨 제한된 횟수만 다시 보낸다. */ }
         if (delivered) {

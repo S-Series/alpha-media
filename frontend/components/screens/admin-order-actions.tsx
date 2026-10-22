@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getCsrfToken, post } from "@/lib/auth";
-import type { AdminOrderDetail } from "@/lib/admin-orders-server";
+import type { AdminOrderDetail, InboundEvent } from "@/lib/admin-orders-server";
 import { issuanceStatus, simStatus } from "@/lib/issuance";
 import { paymentStatus } from "@/lib/payments";
 import { orderStatus } from "@/lib/orders";
@@ -14,6 +14,9 @@ import AdminConcurrencyDemo from "./admin-concurrency-demo";
 type Draft = { key: string; path: string; body: string };
 const states: Record<string, string> = { REQUESTED: "환불 접수", QUEUED: "발급 재시도 접수", UNKNOWN: "PG 취소 결과 확인 중",
   PROCESSING: "PG 취소 확인 중", SUCCEEDED: "환불 완료", REVIEW_REQUIRED: "운영자 확인 필요", ISSUED: "발급 완료", FAILED: "발급 실패" };
+const inboundStates: Record<InboundEvent["status"], string> = { PENDING: "저장 완료·처리 대기", PROCESSING: "처리 중",
+  RETRY: "재처리 대기", PROCESSED: "처리 완료", REVIEW_REQUIRED: "운영자 확인 필요" };
+const inboundSources: Record<InboundEvent["source"], string> = { PG: "결제 PG", SUPPLIER: "공급사 발급", PROFILE: "공급사 설치·사용" };
 
 export default function AdminOrderActions({ initial }: { initial: AdminOrderDetail }) {
   const [view, setView] = useState(initial);
@@ -49,7 +52,8 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
             && [`/api/admin/orders/${id}/refunds`, `/api/admin/orders/${id}/issuance-retries`].includes(saved.path)) setDraft(saved);
         } catch { /* 저장할 수 없어도 같은 화면에서는 요청 키를 유지한다. */ }
         const active = ["REQUESTED", "PROCESSING", "UNKNOWN"].includes(data.refund?.status || "")
-          || ["QUEUED", "PROCESSING", "WAITING_CALLBACK"].includes(data.issuance?.issuance?.status || "");
+          || ["QUEUED", "PROCESSING", "WAITING_CALLBACK"].includes(data.issuance?.issuance?.status || "")
+          || (data.inboundEvents || []).some(event => ["PENDING", "PROCESSING", "RETRY"].includes(event.status));
         timer = setTimeout(poll, active ? 1500 : 5000);
       } catch {
         if (!controller.signal.aborted) {
@@ -127,6 +131,18 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
           공급사 마지막 확인: {profile.lastSyncedAt ? kst(profile.lastSyncedAt) : "확인 대기"}</p>
         {profile.syncError && <p role="alert">공급사 확인 지연: {profile.syncError}. 마지막 확인 상태입니다.</p>}
       </>}
+    </section>
+    <section className="home-panel"><h2>웹훅 수신·처리 내역</h2>
+      <p>최근 최대 100건입니다. 수신을 먼저 저장한 뒤 처리합니다. 같은 내용의 중복 수신은 수신 횟수에 합산됩니다.</p>
+      {(view.inboundEvents || []).length === 0 ? <p>아직 수신한 웹훅이 없습니다.</p> : view.inboundEvents?.map(event => <article key={event.id}>
+        <h3>{inboundSources[event.source]} · {inboundStates[event.status]}</h3>
+        <p>이벤트 번호: {event.eventId}<br />수신 기록번호: {event.id}<br />수신 {event.receiveCount}회 · 처리 시도 {event.attemptCount}회</p>
+        <p>최초 수신: {kst(event.receivedAt)}<br />마지막 수신: {kst(event.lastReceivedAt)}<br />
+          처리 완료: {event.processedAt ? kst(event.processedAt) : "미완료"}
+          {event.nextAttemptAt && <><br />다음 처리 시각: {kst(event.nextAttemptAt)}</>}</p>
+        {event.lastError && <p>처리 오류: {event.lastError}{event.errorStatus !== null && ` · 오류 상태 ${event.errorStatus}`}</p>}
+        {event.status === "REVIEW_REQUIRED" && <p role="alert">자동 처리를 중단했습니다. 오류와 상충 결과를 확인해 주세요.</p>}
+      </article>)}
     </section>
     <AdminOrderTimeline orderId={id} latest={view.timeline} />
     <section className="home-panel"><h2>운영자 조치</h2>

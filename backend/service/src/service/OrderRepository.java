@@ -97,6 +97,7 @@ public class OrderRepository {
                         AND p.status IN ('UNKNOWN','REVIEW_REQUIRED'))
                         OR sp.sync_error IS NOT NULL
                         OR EXISTS (SELECT 1 FROM order_conflicts c WHERE c.order_id=o.id)
+                        OR EXISTS (SELECT 1 FROM inbound_events e WHERE e.order_id=o.id AND e.status='REVIEW_REQUIRED')
                         OR EXISTS (SELECT 1 FROM refunds r WHERE r.order_id=o.id AND r.status='REVIEW_REQUIRED')
                         OR (o.effective_status='PAID' AND EXISTS (SELECT 1 FROM issuance_jobs j WHERE j.order_id=o.id AND j.is_current
                             AND (j.status IN ('FAILED','REVIEW_REQUIRED') OR

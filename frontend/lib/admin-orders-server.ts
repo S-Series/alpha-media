@@ -12,11 +12,16 @@ export type HistoryEvent = { id: string; target: string; targetId: string; fromS
 export type HistoryPage = { items: HistoryEvent[]; nextBefore: string | null; checkedAt: string };
 export type OrderConflict = { id: string; orderId: string; target: string; targetId: string; code: string; source: string;
   expectedStatus: string; observedStatus: string; recordedAt: string };
+export type InboundEvent = { id: string; source: "PG" | "SUPPLIER" | "PROFILE"; eventId: string;
+  status: "PENDING" | "PROCESSING" | "RETRY" | "PROCESSED" | "REVIEW_REQUIRED";
+  attemptCount: number; receiveCount: number; receivedAt: string; lastReceivedAt: string;
+  processedAt: string | null; nextAttemptAt: string | null; lastError: string | null; errorStatus: number | null };
 type Page = { items: AdminOrder[]; page: number; size: number; hasNext: boolean; checkedAt: string };
 export type AdminOrderDetail = { order: AdminOrder; payments: PaymentAttempt[]; issuance?: IssuanceView;
   refund?: { id: string; status: string; amount: number; attemptCount: number; executionRound?: number; roundAttemptCount?: number;
     lastError: string | null; pgCancellationId: string | null } | null;
   conflicts?: OrderConflict[];
+  inboundEvents?: InboundEvent[];
   actions?: { id: string; actor: string; type: string; reason: string; issuanceId: string | null; refundId: string | null; createdAt: string }[];
   actionEvents?: { id: string; actionId: string; status: string; detail: string | null; createdAt: string }[];
   timeline: HistoryPage; checkedAt: string;

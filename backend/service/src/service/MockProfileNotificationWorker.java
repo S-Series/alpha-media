@@ -37,7 +37,8 @@ public class MockProfileNotificationWorker {
             var request=HttpRequest.newBuilder(URI.create(settings.webhookUrl()+"/profiles")).timeout(Duration.ofMillis(settings.httpTimeoutMs()))
                 .header("Content-Type","application/json").header("X-Signature",PgSignature.sign(body,settings.webhookSecret()))
                 .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
-            delivered=http.send(request,HttpResponse.BodyHandlers.discarding()).statusCode()==200;
+            int status=http.send(request,HttpResponse.BodyHandlers.discarding()).statusCode();
+            delivered=status>=200 && status<300;
         } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         catch (Exception e) { /* Durable notification retries are bounded below. */ }
         if (delivered) jdbc.update("""

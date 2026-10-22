@@ -25,10 +25,12 @@ public class AdminOrderController {
     private final RefundRepository refunds;
     private final AdminActionRepository actions;
     private final OrderConflicts conflicts;
+    private final InboundEventRepository inboundEvents;
 
     public AdminOrderController(OrderRepository orders, PaymentRepository payments, IssuanceService issuances,
-            RefundRepository refunds,AdminActionRepository actions,OrderConflicts conflicts) {
+            RefundRepository refunds,AdminActionRepository actions,OrderConflicts conflicts,InboundEventRepository inboundEvents) {
         this.orders = orders; this.payments = payments; this.issuances = issuances; this.refunds=refunds; this.actions=actions; this.conflicts=conflicts;
+        this.inboundEvents=inboundEvents;
     }
 
     @GetMapping
@@ -60,7 +62,7 @@ public class AdminOrderController {
         var order = orders.findForAdmin(orderId).orElseThrow(
                 () -> new OrderService.OrderException(404, "ORDER_NOT_FOUND", "주문을 찾을 수 없습니다."));
         return ResponseEntity.ok().header("Cache-Control", "no-store").body(new Detail(order, payments.list(orderId), issuances.forOrder(orderId),
-            refunds.find(orderId).orElse(null),actions.list(orderId),actions.events(orderId),timeline(orderId,null,50),Instant.now(),conflicts.list(orderId)));
+            refunds.find(orderId).orElse(null),actions.list(orderId),actions.events(orderId),timeline(orderId,null,50),Instant.now(),conflicts.list(orderId),inboundEvents.forOrder(orderId)));
     }
 
     @GetMapping("/{orderId}/history")
@@ -78,5 +80,5 @@ public class AdminOrderController {
     public record Page(List<OrderRepository.AdminOrder> items,int page,int size,boolean hasNext,Instant checkedAt) {}
     public record Detail(OrderRepository.AdminOrder order, List<PaymentAttempt> payments, IssuanceService.View issuance,
         Refund refund,List<AdminActionRepository.Action> actions,List<AdminActionRepository.Event> actionEvents,HistoryPage timeline,Instant checkedAt,
-        List<OrderConflicts.Conflict> conflicts) {}
+        List<OrderConflicts.Conflict> conflicts,List<InboundEventRepository.View> inboundEvents) {}
 }

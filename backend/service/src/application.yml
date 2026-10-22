@@ -64,6 +64,12 @@ payment:
   retry-base-ms: ${PAYMENT_RETRY_BASE_MS:1000}
   worker-delay-ms: ${PAYMENT_WORKER_DELAY_MS:500}
 
+webhook:
+  inbox-encryption-key: ${WEBHOOK_INBOX_ENCRYPTION_KEY:}
+  worker-delay-ms: ${WEBHOOK_WORKER_DELAY_MS:500}
+  lease-ms: ${WEBHOOK_LEASE_MS:30000}
+  retry-base-ms: ${WEBHOOK_RETRY_BASE_MS:1000}
+
 issuance:
   mock-enabled: ${MOCK_SUPPLIER_ENABLED:false}
   base-url: ${SUPPLIER_BASE_URL:http://127.0.0.1:${server.port}/internal/mock-supplier}
