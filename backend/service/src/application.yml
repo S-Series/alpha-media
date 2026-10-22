@@ -75,6 +75,14 @@ recovery:
   lease-ms: ${RECOVERY_LEASE_MS:30000}
   retry-base-ms: ${RECOVERY_RETRY_BASE_MS:1000}
 
+reconciliation:
+  enabled: ${RECONCILIATION_ENABLED:true}
+  schedule-enabled: ${RECONCILIATION_SCHEDULE_ENABLED:true}
+  worker-delay-ms: ${RECONCILIATION_WORKER_DELAY_MS:1000}
+  lease-ms: ${RECONCILIATION_LEASE_MS:30000}
+  retry-base-ms: ${RECONCILIATION_RETRY_BASE_MS:1000}
+  page-size: ${RECONCILIATION_PAGE_SIZE:50}
+
 issuance:
   mock-enabled: ${MOCK_SUPPLIER_ENABLED:false}
   base-url: ${SUPPLIER_BASE_URL:http://127.0.0.1:${server.port}/internal/mock-supplier}

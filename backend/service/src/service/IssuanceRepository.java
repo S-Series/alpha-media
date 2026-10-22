@@ -34,19 +34,6 @@ public class IssuanceRepository {
             """, UUID.randomUUID(), payment.orderId(), config.scenario().name(), config.callbackCopies(), config.callbackDelayMs());
     }
 
-    void recoverPaidOrders() {
-        // 이전 버전 서버와 배포가 겹쳐 생긴 미등록 작업도 중복 없이 복구한다.
-        jdbc.update("""
-            INSERT INTO issuance_jobs(id,order_id,scenario,callback_copies,callback_delay_ms)
-            SELECT gen_random_uuid(),p.order_id,p.supplier_scenario,p.supplier_callback_copies,p.supplier_callback_delay_ms
-            FROM payment_attempts p JOIN orders o ON o.id=p.order_id
-            WHERE p.status='APPROVED' AND o.status='PAID'
-                AND NOT EXISTS (SELECT 1 FROM order_conflicts c WHERE c.order_id=o.id)
-                AND NOT EXISTS (SELECT 1 FROM issuance_jobs j WHERE j.order_id=o.id)
-            ORDER BY p.created_at LIMIT 100 ON CONFLICT(order_id) WHERE is_current DO NOTHING
-            """);
-    }
-
     Optional<Issuance> find(UUID orderId) {
         return jdbc.query("SELECT * FROM issuance_jobs WHERE order_id=? AND is_current", MAPPER, orderId).stream().findFirst();
     }

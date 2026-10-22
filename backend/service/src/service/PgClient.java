@@ -6,7 +6,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Optional;
+import java.util.UUID;
 
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Value;
@@ -39,6 +41,49 @@ public class PgClient {
 
     Optional<PgResult> lookup(PaymentAttempt p) throws IOException, InterruptedException {
         return send(HttpRequest.newBuilder(URI.create(settings.pgBaseUrl() + "/payments/" + p.id())).GET(), true);
+    }
+
+    ExternalLedger.Page paymentLedger(Instant from,Instant to,Instant afterTime,UUID afterId,int limit) throws IOException,InterruptedException {
+        return ledger("payments","PAYMENT",from,to,afterTime,afterId,limit);
+    }
+    ExternalLedger.Page cancellationLedger(Instant from,Instant to,Instant afterTime,UUID afterId,int limit) throws IOException,InterruptedException {
+        return ledger("cancellations","CANCELLATION",from,to,afterTime,afterId,limit);
+    }
+    private ExternalLedger.Page ledger(String path,String source,Instant from,Instant to,Instant afterTime,UUID afterId,int limit)
+            throws IOException,InterruptedException {
+        var response=readLedger("/ledger/"+path+ExternalLedger.query(from,to,afterTime,afterId,limit));
+        if (response.statusCode()!=200) throw new InvalidResult();
+        try {
+            return ExternalLedger.validate(mapper.readValue(response.body(),ExternalLedger.Page.class),from,to,afterTime,afterId,limit,source);
+        } catch (RuntimeException e) { throw new InvalidResult(); }
+    }
+    Optional<ExternalLedger.PaymentSnapshot> financial(UUID paymentId) throws IOException,InterruptedException {
+        if (paymentId==null) throw new IllegalArgumentException("Payment ID is required");
+        var response=readLedger("/ledger/payments/"+paymentId);
+        if (response.statusCode()==404) return Optional.empty();
+        if (response.statusCode()!=200) throw new InvalidResult();
+        try {
+            var tree=mapper.readTree(response.body());
+            var total=tree==null?null:tree.get("cancelledTotal");
+            if (total==null || !total.isIntegralNumber() || !total.canConvertToLong()) throw new InvalidResult();
+            var payment=tree.get("payment");
+            if (payment==null) throw new InvalidResult();
+            PgResult.parse(mapper,mapper.writeValueAsBytes(payment));
+            var cancellations=tree.get("cancellations");
+            if (cancellations==null || !cancellations.isArray() || cancellations.size()>1000) throw new InvalidResult();
+            for (var item:cancellations) for (String field:new String[]{"amount","cancelledTotal"}) {
+                var value=item.get(field);
+                if (value==null || !value.isIntegralNumber() || !value.canConvertToLong()) throw new InvalidResult();
+            }
+            return Optional.of(ExternalLedger.validate(mapper.treeToValue(tree,ExternalLedger.PaymentSnapshot.class),paymentId));
+        } catch (RuntimeException e) { throw new InvalidResult(); }
+    }
+    private HttpResponse<String> readLedger(String path) throws IOException,InterruptedException {
+        var response=http.send(HttpRequest.newBuilder(URI.create(settings.pgBaseUrl()+path))
+            .timeout(Duration.ofMillis(settings.httpTimeoutMs())).header("Authorization","Bearer "+settings.apiKey())
+            .header("X-Gateway-Token",gatewayToken).GET().build(),HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode()>=500) throw new IOException("PG_LEDGER_UNAVAILABLE");
+        return response;
     }
 
     MockPgService.Cancellation cancel(Refund refund) throws IOException, InterruptedException {

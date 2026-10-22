@@ -21,7 +21,6 @@ public class IssuanceWorker {
     }
     @Scheduled(fixedDelayString = "${issuance.worker-delay-ms}", initialDelayString = "${issuance.worker-delay-ms}")
     public void tick() {
-        jobs.recoverPaidOrders();
         var claimed = jobs.claim(settings.leaseMs());
         if (claimed.isEmpty()) return;
         var claim = claimed.get();

@@ -119,6 +119,8 @@ function startService(extra = {}) {
     PAYMENT_WORKER_DELAY_MS: "100", WEBHOOK_WORKER_DELAY_MS: "50", WEBHOOK_LEASE_MS: "3000",
     WEBHOOK_RETRY_BASE_MS: "100", WEBHOOK_INBOX_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
     RECOVERY_WORKER_DELAY_MS: "100", RECOVERY_LEASE_MS: "1200", RECOVERY_RETRY_BASE_MS: "100",
+    RECONCILIATION_SCHEDULE_ENABLED: "false", RECONCILIATION_WORKER_DELAY_MS: "100",
+    RECONCILIATION_LEASE_MS: "3000", RECONCILIATION_RETRY_BASE_MS: "100",
     ...accountHashes, ...extra });
 }
 
@@ -2715,4 +2717,608 @@ test("operator recovery completion and error-recording DB failures cannot reset 
     await delay(1500); assert.equal(proxy.forId(attempt.id).length, calls);
     assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
   } finally { if (restore) restore(); await restart(); await proxy.close(); }
+});
+
+async function externalPayment(amount = 15900) {
+  const paymentId = randomUUID(), orderId = randomUUID();
+  const response = await pg("/payments/approve", { paymentId, orderId, amount, currency: "KRW",
+    scenario: "APPROVE", webhookCopies: 0, webhookDelayMs: 0 });
+  assert.equal(response.status, 200);
+  return { paymentId, orderId, amount, result: await response.json() };
+}
+
+function ledgerQuery(from, to, overrides = {}) {
+  return new URLSearchParams({ from, to, ...overrides }).toString();
+}
+
+test("reconciliation ledger payment pages honor KST day boundaries and a stable timestamp plus UUID cursor", async () => {
+  const from = "2001-02-01T15:00:00Z", to = "2001-02-02T15:00:00Z";
+  const times = ["2001-02-01T14:59:59.999999Z", from, "2001-02-01T16:00:00Z",
+    "2001-02-01T16:00:00Z", "2001-02-01T16:00:00Z", "2001-02-02T14:59:59.999999Z", to];
+  const created = [];
+  for (const time of times) {
+    const value = await externalPayment(); created.push({ ...value, time });
+    sql(`UPDATE mock_pg_payments SET created_at='${time}' WHERE payment_id='${value.paymentId}'`);
+  }
+  const expected = created.slice(1, -1).sort((a, b) => Date.parse(a.time) - Date.parse(b.time)
+    || a.paymentId.localeCompare(b.paymentId)).map(value => value.paymentId);
+  const received = []; let cursor = {}, pages = 0;
+  do {
+    const response = await pg(`/ledger/payments?${ledgerQuery(from, to, { limit: 2, ...cursor })}`);
+    assert.equal(response.status, 200); const page = await response.json(); pages++;
+    assert.ok(page.items.length <= 2); received.push(...page.items.map(item => item.id));
+    assert.ok(page.items.every(item => item.paymentId === item.id && item.orderId && item.occurredAt));
+    assert.ok(!JSON.stringify(page).includes("transactionId"));
+    if (!page.nextTime) { assert.equal(page.nextId, null); break; }
+    assert.ok(page.nextId); cursor = { afterTime: page.nextTime, afterId: page.nextId };
+    assert.ok(pages < 5, "ledger cursor must advance");
+  } while (true);
+  assert.deepEqual(received, expected); assert.equal(pages, 3);
+  assert.equal(new Set(received).size, 5);
+});
+
+test("reconciliation ledger endpoints require provider credentials and validate range cursor and page bounds", async () => {
+  const from = "2001-02-01T15:00:00Z", to = "2001-02-02T15:00:00Z", query = ledgerQuery(from, to);
+  for (const endpoint of ["/ledger/payments", "/ledger/cancellations"]) {
+    const response = await fetch(`http://127.0.0.1:${servicePort}/internal/mock-pg${endpoint}?${query}`,
+      { headers: { "X-Gateway-Token": secret } });
+    assert.equal(response.status, 401);
+    assert.equal((await admin.request(`/internal/mock-pg${endpoint}?${query}`)).status, 404);
+    for (const overrides of [{ limit: 0 }, { limit: 101 }, { afterTime: from }, { afterId: randomUUID() }, { from: to }, { from: "not-a-date" }]) {
+      assert.equal((await pg(`${endpoint}?${ledgerQuery(from, to, overrides)}`)).status, 400);
+    }
+  }
+  const supplierPath = `/ledger/orders?${query}`;
+  const unauthenticated = await fetch(`http://127.0.0.1:${servicePort}/internal/mock-supplier${supplierPath}`,
+    { headers: { "X-Gateway-Token": secret } });
+  assert.equal(unauthenticated.status, 401);
+  for (const overrides of [{ limit: 0 }, { limit: 101 }, { afterTime: from }, { afterId: randomUUID() }, { from: to }]) {
+    assert.equal((await supplier(`/ledger/orders?${ledgerQuery(from, to, overrides)}`)).status, 400);
+  }
+});
+
+test("reconciliation PG financial snapshot includes manual cancellation evidence without another provider write", async () => {
+  const value = await externalPayment(20000);
+  const first = await pg(`/payments/${value.paymentId}/cancel`, { amount: 3000, scenario: "SUCCESS" });
+  const second = await pg(`/payments/${value.paymentId}/cancel`, { amount: 4000, scenario: "SUCCESS" });
+  assert.equal(first.status, 200); assert.equal(second.status, 200);
+  const cancellations = [await first.json(), await second.json()];
+  const before = await (await pg(`/payments/${value.paymentId}/stats`)).json();
+  const response = await pg(`/ledger/payments/${value.paymentId}`);
+  assert.equal(response.status, 200); const snapshot = await response.json();
+  assert.equal(snapshot.payment.paymentId, value.paymentId); assert.equal(snapshot.payment.status, "APPROVED");
+  assert.equal(snapshot.cancelledTotal, 7000);
+  assert.deepEqual(snapshot.cancellations.map(item => item.id).sort(), cancellations.map(item => item.id).sort());
+  assert.deepEqual(Object.keys(snapshot.cancellationTimes).sort(), cancellations.map(item => item.id).sort());
+  assert.ok(Object.values(snapshot.cancellationTimes).every(value => Number.isFinite(Date.parse(value))));
+  const after = await (await pg(`/payments/${value.paymentId}/stats`)).json();
+  assert.deepEqual(after, before);
+  const from = "2002-03-01T15:00:00Z", to = "2002-03-02T15:00:00Z";
+  sql(`UPDATE mock_pg_cancellations SET created_at='${from}' WHERE payment_id='${value.paymentId}'`);
+  const page = await (await pg(`/ledger/cancellations?${ledgerQuery(from, to, { limit: 100 })}`)).json();
+  assert.deepEqual(page.items.map(item => item.id).sort(), cancellations.map(item => item.id).sort());
+  assert.ok(page.items.every(item => item.paymentId === value.paymentId && item.orderId === value.orderId));
+});
+
+test("reconciliation supplier ledger follows business status changes rather than delivery counters", { timeout: 45000 }, async () => {
+  await restart({ ISSUANCE_WORKER_DELAY_MS: "60000" });
+  try {
+    const requestId = randomUUID(), orderId = randomUUID();
+    const response = await supplier("/orders", { requestId, orderId,
+      simulation: { scenario: "FAIL", callbackCopies: 0, callbackDelayMs: 0 } });
+    assert.equal(response.status, 202);
+    sql(`UPDATE mock_supplier_orders SET created_at='2003-04-01T15:00:00Z',ledger_updated_at='2003-04-01T15:00:00Z' WHERE request_id='${requestId}'`);
+    const before = sql(`SELECT ledger_updated_at FROM mock_supplier_orders WHERE request_id='${requestId}'`);
+    sql(`UPDATE mock_supplier_orders SET callback_failures=callback_failures+1,request_count=request_count+1 WHERE request_id='${requestId}'`);
+    assert.equal(sql(`SELECT ledger_updated_at FROM mock_supplier_orders WHERE request_id='${requestId}'`), before);
+    sql(`UPDATE mock_supplier_orders SET status='FAILED' WHERE request_id='${requestId}'`);
+    const changed = sql(`SELECT ledger_updated_at FROM mock_supplier_orders WHERE request_id='${requestId}'`);
+    assert.notEqual(changed, before);
+    const from = new Date(Date.now() - 60000).toISOString(), to = new Date(Date.now() + 60000).toISOString();
+    const page = await (await supplier(`/ledger/orders?${ledgerQuery(from, to)}`)).json();
+    const found = page.items.find(item => item.id === requestId);
+    assert.ok(found); assert.equal(found.orderId, orderId); assert.equal(found.paymentId, null);
+    assert.ok(!JSON.stringify(page).includes("activationCode"));
+  } finally { await restart(); }
+});
+
+function reconciliationRow(id) {
+  const value = sql(`SELECT row_to_json(r) FROM reconciliation_runs r WHERE id='${id}'`);
+  return value ? JSON.parse(value) : null;
+}
+
+function reconciliationItem(runId, targetId) {
+  const value = sql(`SELECT row_to_json(i) FROM reconciliation_items i WHERE run_id='${runId}' AND target_id='${targetId}'`);
+  return value ? JSON.parse(value) : null;
+}
+
+async function requestReconciliation(body, key = randomUUID(), client = admin) {
+  return client.request("/api/admin/reconciliation-runs", { method: "POST",
+    headers: { ...await client.csrf(), "Idempotency-Key": key }, body });
+}
+
+async function completedReconciliation(id) {
+  await until(() => ["SUCCEEDED", "REVIEW_REQUIRED"].includes(reconciliationRow(id)?.status), 60000);
+  return reconciliationRow(id);
+}
+
+async function runReconciliation(body) {
+  const response = await requestReconciliation({ reason: "외부 원장과 업무 기록 정합성 확인", ...body });
+  assert.equal(response.status, 202); const { run } = await response.json();
+  assert.ok(run.id); return completedReconciliation(run.id);
+}
+
+function incidentFor(kind, targetId, code) {
+  const value = sql(`SELECT row_to_json(i) FROM incidents i WHERE kind='${kind}' AND target_id='${targetId}'${code ? ` AND code='${code}'` : ""} ORDER BY first_seen_at LIMIT 1`);
+  return value ? JSON.parse(value) : null;
+}
+
+function ledgerDay(date) {
+  const [year, month, day] = date.split("-").map(Number);
+  const next = new Date(Date.UTC(year, month - 1, day + 1)).toISOString().slice(0, 10);
+  return { mode: "LEDGER", from: date, to: next };
+}
+
+function stampPayment(paymentId, date) {
+  sql(`UPDATE mock_pg_payments SET created_at='${date}T00:00:00+09:00' WHERE payment_id='${paymentId}'`);
+}
+
+function stampSupplier(requestId, date) {
+  // Only this isolated fixture rewinds provider history; the production trigger forbids that update.
+  sql(`BEGIN; ALTER TABLE mock_supplier_orders DISABLE TRIGGER mock_supplier_ledger_update;
+    UPDATE mock_supplier_orders SET ledger_updated_at='${date}T00:00:00+09:00' WHERE request_id='${requestId}';
+    ALTER TABLE mock_supplier_orders ENABLE TRIGGER mock_supplier_ledger_update; COMMIT;`);
+}
+
+test("reconciliation runs require admin CSRF and bounded KST dates and expose only audit metadata", { timeout: 60000 }, async () => {
+  const path = "/api/admin/reconciliation-runs", body = { ...ledgerDay("2004-01-02"), reason: "입력 검증" };
+  assert.equal((await requestReconciliation(body, randomUUID(), new Client())).status, 401);
+  assert.equal((await requestReconciliation(body, randomUUID(), alice)).status, 403);
+  assert.equal((await admin.request(path, { method: "POST", body, headers: { "Idempotency-Key": randomUUID() } })).status, 403);
+  for (const invalid of [{ ...body, mode: "FAKE" }, { ...body, reason: " " }, { ...body, reason: "x".repeat(301) },
+    { ...body, from: body.to }, { ...body, from: "2004-01-01", to: "2004-02-02" },
+    { ...body, from: "2004-13-01" }, { ...body, to: null }]) {
+    assert.equal((await requestReconciliation(invalid)).status, 400);
+  }
+  assert.equal((await alice.request(path)).status, 403);
+  assert.equal((await new Client().request("/api/admin/incidents")).status, 401);
+  assert.equal((await alice.request("/api/admin/incidents")).status, 403);
+  const result = await runReconciliation(body);
+  assert.equal(new Date(result.from_at).toISOString(), "2004-01-01T15:00:00.000Z");
+  assert.equal(new Date(result.to_at).toISOString(), "2004-01-02T15:00:00.000Z");
+  const response = await admin.request(`${path}/${result.id}?page=0&size=2`);
+  assert.equal(response.status, 200); const detail = await response.json();
+  assert.equal(detail.page, 0); assert.equal(detail.size, 2); assert.ok(Array.isArray(detail.items));
+  const serialized = JSON.stringify(detail);
+  for (const privateField of ["leaseToken", "payloadHash", "activationCode", "password", "LPA:"]) assert.ok(!serialized.includes(privateField));
+  const list = await (await admin.request(path)).json();
+  assert.ok(list.items.some(item => item.id === result.id)); assert.ok(list.lastSuccessfulAt); assert.ok(list.checkedAt);
+});
+
+test("reconciliation twenty identical run requests create one durable run and changed parameters conflict", { timeout: 60000 }, async () => {
+  await restart({ RECONCILIATION_WORKER_DELAY_MS: "60000" });
+  const body = { ...ledgerDay("2004-02-02"), reason: "중복 대사 요청" }, key = randomUUID();
+  const headers = { ...await admin.csrf(), "Idempotency-Key": key };
+  const responses = await Promise.all(Array.from({ length: 20 }, () => admin.request("/api/admin/reconciliation-runs",
+    { method: "POST", headers, body })));
+  assert.equal(responses.filter(response => response.status === 202).length, 1);
+  assert.equal(responses.filter(response => response.status === 200).length, 19);
+  const receipts = await Promise.all(responses.map(response => response.json()));
+  assert.equal(new Set(receipts.map(receipt => receipt.run.id)).size, 1);
+  const runId = receipts[0].run.id;
+  assert.equal(reconciliationRow(runId).status, "QUEUED");
+  assert.equal(sql(`SELECT count(*) FROM reconciliation_runs WHERE idempotency_key='${key}'`), "1");
+  assert.equal((await requestReconciliation({ ...body, reason: "다른 내용" }, key)).status, 409);
+  await restart(); assert.equal((await completedReconciliation(runId)).status, "SUCCEEDED");
+  const replay = await requestReconciliation(body, key); assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).run.id, runId);
+});
+
+test("reconciliation pending scan includes arbitrarily old unresolved payments and recovers approval by read only lookup", { timeout: 75000 }, async () => {
+  const proxy = await providerProxy("mock-pg");
+  try {
+    const { order, attempt } = await reviewPayment(true, { MOCK_PG_BASE_URL: proxy.url });
+    sql(`UPDATE orders SET created_at='1999-01-01T00:00:00Z',expires_at='1999-01-01T00:10:00Z' WHERE id='${order.id}';
+      UPDATE payment_attempts SET created_at='1999-01-01T00:00:00Z',updated_at='1999-01-01T00:00:00Z' WHERE id='${attempt.id}'`);
+    const run = await runReconciliation({ mode: "PENDING" });
+    const item = reconciliationItem(run.id, attempt.id); assert.ok(item);
+    assert.equal(item.status, "SUCCEEDED"); assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    assert.ok(proxy.forId(attempt.id).length > 0);
+    assert.ok(proxy.forId(attempt.id).every(call => call.method === "GET"));
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT execution_round||':'||attempt_count FROM payment_attempts WHERE id='${attempt.id}'`), "1:6");
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("reconciliation discovers a manually cancelled approval without marking it paid or starting issuance", { timeout: 60000 }, async () => {
+  const { order, attempt } = await reviewPayment(true);
+  const cancellation = await pg(`/payments/${attempt.id}/cancel`, { amount: order.amount, scenario: "SUCCESS" });
+  assert.equal(cancellation.status, 200); const cancelled = await cancellation.json();
+  stampPayment(attempt.id, "2005-01-02");
+  sql(`UPDATE mock_pg_cancellations SET created_at='2005-01-02T00:00:00+09:00' WHERE id='${cancelled.id}'`);
+  const run = await runReconciliation(ledgerDay("2005-01-02"));
+  assert.ok(reconciliationItem(run.id, attempt.id));
+  assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+  assert.ok(incidentFor("PAYMENT", attempt.id, "EXTERNAL_CANCELLATION_UNMATCHED"));
+  assert.equal(sql(`SELECT count(*) FROM external_cancellations WHERE id='${cancelled.id}'`), "1");
+  assert.equal(new Date(sql(`SELECT external_occurred_at FROM external_cancellations WHERE id='${cancelled.id}'`)).toISOString(), "2005-01-01T15:00:00.000Z");
+  sql(`UPDATE external_cancellations SET amount=1 WHERE id='${cancelled.id}'`, true, true);
+  assert.equal(sql(`SELECT count(*) FROM refunds WHERE order_id='${order.id}'`), "0");
+  await restart();
+});
+
+test("reconciliation external orphan payments and supplier orders create incidents without inventing business records", { timeout: 60000 }, async () => {
+  const paymentValue = await externalPayment(), requestId = randomUUID(), supplierOrderId = randomUUID();
+  stampPayment(paymentValue.paymentId, "2005-02-02");
+  const supplierResponse = await supplier("/orders", { requestId, orderId: supplierOrderId,
+    simulation: { scenario: "FAIL", callbackCopies: 0, callbackDelayMs: 0 } });
+  assert.equal(supplierResponse.status, 202);
+  await until(() => sql(`SELECT status FROM mock_supplier_orders WHERE request_id='${requestId}'`) === "FAILED");
+  stampSupplier(requestId, "2005-02-02");
+  const beforeOrders = sql("SELECT count(*) FROM orders"), beforePayments = sql("SELECT count(*) FROM payment_attempts");
+  const beforeJobs = sql("SELECT count(*) FROM issuance_jobs");
+  await runReconciliation(ledgerDay("2005-02-02"));
+  const paymentIncident = incidentFor("PAYMENT", paymentValue.paymentId, "ORPHAN_PAYMENT");
+  const supplierIncident = incidentFor("ISSUANCE", requestId, "ORPHAN_ISSUANCE");
+  assert.ok(paymentIncident, "external payment incident is required");
+  assert.ok(supplierIncident, "external supplier incident is required");
+  assert.equal(paymentIncident.order_id, null); assert.equal(supplierIncident.order_id, null);
+  assert.equal(sql("SELECT count(*) FROM orders"), beforeOrders);
+  assert.equal(sql("SELECT count(*) FROM payment_attempts"), beforePayments);
+  assert.equal(sql("SELECT count(*) FROM issuance_jobs"), beforeJobs);
+  assert.equal(sql(`SELECT count(*) FROM orders WHERE id IN ('${paymentValue.orderId}','${supplierOrderId}')`), "0");
+});
+
+test("reconciliation repeated discrepancies deduplicate incidents and only verified repair automatically resolves them", { timeout: 75000 }, async () => {
+  const { order, attempt } = await failedOrder(), proxy = await providerProxy("mock-pg");
+  try {
+    stampPayment(attempt.id, "2006-01-02");
+    proxy.intercept = call => call.path === `/internal/mock-pg/ledger/payments/${attempt.id}` ? { status: 404 } : null;
+    await restart({ MOCK_PG_BASE_URL: proxy.url });
+    await runReconciliation(ledgerDay("2006-01-02"));
+    const original = incidentFor("PAYMENT", attempt.id, "PROVIDER_RECORD_MISSING"); assert.ok(original);
+    await runReconciliation(ledgerDay("2006-01-02"));
+    const repeated = incidentFor("PAYMENT", attempt.id, "PROVIDER_RECORD_MISSING");
+    assert.equal(repeated.id, original.id); assert.equal(repeated.version, original.version);
+    assert.equal(sql(`SELECT count(*) FROM incidents WHERE kind='PAYMENT' AND target_id='${attempt.id}' AND code='PROVIDER_RECORD_MISSING'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM incident_events WHERE incident_id='${original.id}'`), "1");
+    const path = `/api/admin/incidents/${original.id}/investigations`, key = randomUUID();
+    const body = { expectedVersion: repeated.version, reason: "PG 운영 기록 확인 중" };
+    assert.equal((await alice.request(path, { method: "POST", headers: { ...await alice.csrf(), "Idempotency-Key": key }, body })).status, 403);
+    assert.equal((await admin.request(path, { method: "POST", headers: { "Idempotency-Key": key }, body })).status, 403);
+    const headers = { ...await admin.csrf(), "Idempotency-Key": key };
+    const responses = await Promise.all(Array.from({ length: 20 }, () => admin.request(path, { method: "POST", headers, body })));
+    assert.ok(responses.every(response => [200, 202].includes(response.status)));
+    const receipts = await Promise.all(responses.map(response => response.json()));
+    assert.equal(receipts.filter(receipt => !receipt.replayed).length, 1);
+    assert.equal(sql(`SELECT count(*) FROM incident_actions WHERE incident_id='${original.id}'`), "1");
+    const investigating = incidentFor("PAYMENT", attempt.id, "PROVIDER_RECORD_MISSING");
+    assert.equal(investigating.status, "INVESTIGATING"); assert.equal(investigating.version, original.version + 1);
+    assert.equal((await admin.request(path, { method: "POST", headers, body: { ...body, reason: "다른 이유" } })).status, 409);
+    assert.equal((await admin.request(path, { method: "POST", headers: { ...headers, "Idempotency-Key": randomUUID() }, body })).status, 409);
+    assert.equal((await admin.request(`/api/admin/incidents/${original.id}/resolve`, { method: "POST", headers, body })).status, 404);
+    proxy.intercept = null;
+    await runReconciliation(ledgerDay("2006-01-02"));
+    const resolved = incidentFor("PAYMENT", attempt.id, "PROVIDER_RECORD_MISSING");
+    assert.equal(resolved.status, "RESOLVED"); assert.ok(resolved.resolved_at);
+    assert.equal(orderState(order.id), "PAID");
+    const detail = await (await admin.request(`/api/admin/incidents/${original.id}`)).json();
+    assert.equal(detail.incident.status, "RESOLVED"); assert.ok(detail.events.some(event => event.status === "INVESTIGATING"));
+    const publicJson = JSON.stringify(detail);
+    for (const value of ["activationCode", "leaseToken", "payloadHash", "LPA:"]) assert.ok(!publicJson.includes(value));
+    sql(`UPDATE incident_events SET reason='rewrite' WHERE incident_id='${original.id}'`, true, true);
+    sql(`DELETE FROM incidents WHERE id='${original.id}'`, true, true);
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("reconciliation matches an existing refund to the provider cancellation without cancelling twice", { timeout: 60000 }, async () => {
+  await restart(); const { order, attempt, job } = await failedOrder();
+  await restart(inboxOnly);
+  assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 202);
+  const refund = refundRow(order.id);
+  sql(`UPDATE refunds SET status='REVIEW_REQUIRED',attempt_count=3,round_attempt_count=3,last_error='REFUND_RETRY_LIMIT_REACHED' WHERE id='${refund.id}'`);
+  const response = await pg(`/payments/${attempt.id}/cancel`, { amount: order.amount, scenario: "SUCCESS" }, refund.id);
+  assert.equal(response.status, 200); const cancellation = await response.json();
+  sql(`UPDATE mock_pg_cancellations SET created_at='2007-01-02T00:00:00+09:00' WHERE id='${cancellation.id}'`);
+  await runReconciliation(ledgerDay("2007-01-02"));
+  assert.equal(refundRow(order.id).status, "SUCCEEDED"); assert.equal(orderState(order.id), "REFUNDED");
+  assert.equal(refundRow(order.id).attempt_count, 3); assert.equal(refundRow(order.id).execution_round, 1);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM external_cancellations WHERE id='${cancellation.id}'`), "1");
+  assert.equal(new Date(sql(`SELECT external_occurred_at FROM external_cancellations WHERE id='${cancellation.id}'`)).toISOString(), "2007-01-01T15:00:00.000Z");
+  assert.equal(sql(`SELECT count(*) FROM incidents WHERE order_id='${order.id}' AND status<>'RESOLVED'`), "0");
+  await restart();
+});
+
+test("reconciliation page checkpoint and discovered items commit atomically and resume from the same cursor after restart", { timeout: 75000 }, async () => {
+  const targets = [];
+  for (let index = 0; index < 3; index++) {
+    const value = await externalPayment(); targets.push(value.paymentId); stampPayment(value.paymentId, "2008-01-02");
+  }
+  const ids = targets.map(id => `'${id}'`).join(","); let restore;
+  try {
+    await restart({ ...inboxOnly, RECONCILIATION_WORKER_DELAY_MS: "60000", RECONCILIATION_PAGE_SIZE: "2" });
+    const response = await requestReconciliation({ ...ledgerDay("2008-01-02"), reason: "페이지 체크포인트 장애 검증" });
+    assert.equal(response.status, 202); const { run } = await response.json();
+    sql(`CREATE FUNCTION reject_reconciliation_page() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.id='${run.id}' AND NEW.phase='PG_PAYMENTS' AND NEW.cursor_id IS NOT NULL
+        THEN RAISE EXCEPTION 'simulated page checkpoint failure'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER reject_reconciliation_page BEFORE UPDATE ON reconciliation_runs
+        FOR EACH ROW EXECUTE FUNCTION reject_reconciliation_page();`);
+    restore = () => sql("DROP TRIGGER reject_reconciliation_page ON reconciliation_runs; DROP FUNCTION reject_reconciliation_page();");
+    await restart({ ...inboxOnly, RECONCILIATION_PAGE_SIZE: "2", RECONCILIATION_RETRY_BASE_MS: "10000" });
+    await until(() => reconciliationRow(run.id).last_error === "RECONCILIATION_STORAGE_UNKNOWN", 60000);
+    const failed = reconciliationRow(run.id);
+    assert.equal(failed.phase, "PG_PAYMENTS"); assert.equal(failed.cursor_id, null);
+    assert.equal(failed.page_attempt_count, 1);
+    assert.equal(sql(`SELECT count(*) FROM reconciliation_items WHERE run_id='${run.id}' AND target_id IN (${ids})`), "0");
+    restore(); restore = null;
+    await restart({ ...inboxOnly, RECONCILIATION_PAGE_SIZE: "2" });
+    const completed = await completedReconciliation(run.id);
+    assert.equal(completed.status, "SUCCEEDED");
+    assert.ok(completed.page_count > failed.page_count);
+    assert.equal(sql(`SELECT count(*) FROM reconciliation_items WHERE run_id='${run.id}' AND target_id IN (${ids})`), "3");
+    assert.equal(sql(`SELECT count(DISTINCT target_id) FROM reconciliation_items WHERE run_id='${run.id}' AND target_id IN (${ids})`), "3");
+    for (const id of targets) assert.ok(incidentFor("PAYMENT", id, "ORPHAN_PAYMENT"));
+  } finally { if (restore) restore(); await restart(); }
+});
+
+test("reconciliation item business DB failure rolls back approval and preserves a three-lookup budget across restart", { timeout: 90000 }, async () => {
+  const proxy = await providerProxy("mock-pg"); let restore;
+  try {
+    const { order, attempt } = await reviewPayment(true, { MOCK_PG_BASE_URL: proxy.url, RECONCILIATION_RETRY_BASE_MS: "2000" });
+    stampPayment(attempt.id, "2009-01-02");
+    restore = rejectTransitions("payment_attempts", order.id, ["APPROVED"]);
+    const response = await requestReconciliation({ ...ledgerDay("2009-01-02"), reason: "대사 결과 DB 롤백 검증" });
+    assert.equal(response.status, 202); const { run } = await response.json();
+    await until(() => reconciliationItem(run.id, attempt.id)?.status === "RETRY", 60000);
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+    const before = reconciliationItem(run.id, attempt.id).attempt_count;
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url });
+    await completedReconciliation(run.id);
+    const failed = reconciliationItem(run.id, attempt.id);
+    assert.equal(failed.status, "REVIEW_REQUIRED"); assert.equal(failed.attempt_count, 3); assert.ok(before >= 1);
+    const calls = proxy.forId(attempt.id).length;
+    assert.equal(calls, 3); assert.ok(proxy.forId(attempt.id).every(call => call.method === "GET"));
+    restore(); restore = null;
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url }); await delay(500);
+    assert.equal(reconciliationItem(run.id, attempt.id).attempt_count, 3); assert.equal(proxy.forId(attempt.id).length, calls);
+    await runReconciliation(ledgerDay("2009-01-02"));
+    assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(incidentFor("PAYMENT", attempt.id, "RECONCILIATION_QUERY_FAILED").status, "RESOLVED");
+  } finally { if (restore) restore(); await restart(); await proxy.close(); }
+});
+
+test("reconciliation item completion and error recording failures cannot exceed three durable claims after restart", { timeout: 90000 }, async () => {
+  const proxy = await providerProxy("mock-pg"), value = await externalPayment(); let restore;
+  stampPayment(value.paymentId, "2010-01-02");
+  try {
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url, RECONCILIATION_LEASE_MS: "1200" });
+    sql(`CREATE FUNCTION reject_reconciliation_item() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.target_id='${value.paymentId}' AND NEW.status IN ('SUCCEEDED','RETRY','REVIEW_REQUIRED','STALE')
+        THEN RAISE EXCEPTION 'simulated item recording failure'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER reject_reconciliation_item BEFORE UPDATE ON reconciliation_items
+        FOR EACH ROW EXECUTE FUNCTION reject_reconciliation_item();`);
+    restore = () => sql("DROP TRIGGER reject_reconciliation_item ON reconciliation_items; DROP FUNCTION reject_reconciliation_item();");
+    const response = await requestReconciliation({ ...ledgerDay("2010-01-02"), reason: "아이템 상태 기록 장애 검증" });
+    assert.equal(response.status, 202); const { run } = await response.json();
+    await until(() => proxy.forId(value.paymentId).length > 0, 60000); await delay(200);
+    assert.equal(reconciliationItem(run.id, value.paymentId).status, "PROCESSING");
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url, RECONCILIATION_LEASE_MS: "1200" });
+    await until(() => reconciliationItem(run.id, value.paymentId).attempt_count === 3, 60000); await delay(1500);
+    const calls = proxy.forId(value.paymentId).length;
+    assert.ok(calls > 0 && calls <= 3);
+    assert.equal(reconciliationItem(run.id, value.paymentId).status, "PROCESSING");
+    assert.equal(incidentFor("PAYMENT", value.paymentId, "ORPHAN_PAYMENT"), null);
+    restore(); restore = null;
+    await completedReconciliation(run.id);
+    assert.equal(reconciliationItem(run.id, value.paymentId).attempt_count, 3);
+    assert.equal(reconciliationItem(run.id, value.paymentId).status, "REVIEW_REQUIRED");
+    assert.equal(proxy.forId(value.paymentId).length, calls);
+    assert.ok(incidentFor("PAYMENT", value.paymentId, "RECONCILIATION_QUERY_FAILED"));
+    assert.equal(sql(`SELECT count(*) FROM orders WHERE id='${value.orderId}'`), "0");
+  } finally { if (restore) restore(); await restart(); await proxy.close(); }
+});
+
+test("reconciliation expired page lease cannot publish an old cursor or exceed three failed provider reads", { timeout: 90000 }, async () => {
+  const proxy = await providerProxy("mock-pg"); let release;
+  try {
+    let entered = false;
+    const barrier = new Promise(resolve => { release = resolve; });
+    proxy.intercept = async call => {
+      if (call.path.startsWith("/internal/mock-pg/ledger/payments?") && call.path.includes("2011-01-01")) {
+        entered = true; await barrier; return { status: 503 };
+      }
+      return null;
+    };
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url, PG_HTTP_TIMEOUT_MS: "5000", PAYMENT_LEASE_MS: "12000", RECONCILIATION_LEASE_MS: "12000" });
+    const response = await requestReconciliation({ ...ledgerDay("2011-01-02"), reason: "페이지 lease와 재시도 상한 검증" });
+    assert.equal(response.status, 202); const { run } = await response.json();
+    await until(() => entered, 60000);
+    const newerToken = randomUUID();
+    sql(`UPDATE reconciliation_runs SET lease_token='${newerToken}',lease_until=clock_timestamp()+INTERVAL '1 hour' WHERE id='${run.id}'`);
+    release(); await delay(500);
+    assert.equal(reconciliationRow(run.id).lease_token, newerToken);
+    assert.equal(reconciliationRow(run.id).last_error, null);
+    assert.equal(reconciliationRow(run.id).cursor_id, null);
+    sql(`UPDATE reconciliation_runs SET lease_until=clock_timestamp()-INTERVAL '1 second' WHERE id='${run.id}'`);
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url, RECONCILIATION_LEASE_MS: "1200" });
+    const done = await completedReconciliation(run.id);
+    assert.equal(done.status, "REVIEW_REQUIRED"); assert.equal(done.page_attempt_count, 3);
+    const count = proxy.calls.filter(call => call.path.startsWith("/internal/mock-pg/ledger/payments?") && call.path.includes("2011-01-01")).length;
+    assert.ok(count > 0 && count <= 3);
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url }); await delay(500);
+    assert.equal(reconciliationRow(run.id).page_attempt_count, 3);
+    assert.equal(proxy.calls.filter(call => call.path.startsWith("/internal/mock-pg/ledger/payments?") && call.path.includes("2011-01-01")).length, count);
+  } finally { release?.(); await restart(); await proxy.close(); }
+});
+
+test("reconciliation scheduler persists fifteen-minute pending and daily seven-completed-KST-day runs across restart", { timeout: 90000 }, async () => {
+  const existing = sql("SELECT count(*) FROM reconciliation_runs WHERE actor_id IS NULL");
+  sql("UPDATE reconciliation_schedule SET next_at=clock_timestamp()-INTERVAL '1 second'");
+  await restart({ ...inboxOnly, RECONCILIATION_SCHEDULE_ENABLED: "true" });
+  await until(() => Number(sql("SELECT count(*) FROM reconciliation_runs WHERE actor_id IS NULL")) === Number(existing) + 2, 60000);
+  const rows = JSON.parse(sql("SELECT json_agg(r) FROM (SELECT * FROM reconciliation_runs WHERE actor_id IS NULL ORDER BY created_at DESC LIMIT 2) r"));
+  assert.deepEqual(rows.map(row => row.mode).sort(), ["LEDGER", "PENDING"]);
+  const ledger = rows.find(row => row.mode === "LEDGER"), pending = rows.find(row => row.mode === "PENDING");
+  const kstToday = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  assert.equal(new Date(ledger.to_at).toISOString(), new Date(`${kstToday}T00:00:00+09:00`).toISOString());
+  assert.equal(Date.parse(ledger.to_at) - Date.parse(ledger.from_at), 7 * 24 * 60 * 60 * 1000);
+  assert.equal(new Date(pending.from_at).toISOString(), "1970-01-01T00:00:00.000Z");
+  const pendingDelay = Number(sql("SELECT EXTRACT(EPOCH FROM next_at-clock_timestamp()) FROM reconciliation_schedule WHERE mode='PENDING'"));
+  assert.ok(pendingDelay > 850 && pendingDelay <= 900);
+  const tomorrow = new Date(`${kstToday}T00:00:00+09:00`).getTime() + 24 * 60 * 60 * 1000;
+  assert.equal(new Date(sql("SELECT next_at FROM reconciliation_schedule WHERE mode='LEDGER'")).getTime(), tomorrow);
+  await restart({ ...inboxOnly, RECONCILIATION_SCHEDULE_ENABLED: "true" });
+  await delay(500);
+  assert.equal(Number(sql("SELECT count(*) FROM reconciliation_runs WHERE actor_id IS NULL")), Number(existing) + 2);
+  await completedReconciliation(pending.id); await completedReconciliation(ledger.id);
+  await restart();
+});
+
+test("reconciliation missing local issuance links on an approved order are quarantined without issuing a new request ID", { timeout: 75000 }, async () => {
+  await restart(); const { order, attempt, job } = await failedOrder();
+  await restart(inboxOnly);
+  // Simulate missing restored business rows while retaining the independent provider ledger.
+  sql(`DELETE FROM issuance_events WHERE issuance_id='${job.id}'; DELETE FROM issuance_jobs WHERE id='${job.id}'`);
+  const providerBefore = await (await supplier(`/orders/${job.id}/stats`)).json();
+  stampPayment(attempt.id, "2012-01-02");
+  await runReconciliation(ledgerDay("2012-01-02"));
+  assert.ok(incidentFor("PAYMENT", attempt.id, "MISSING_FULFILLMENT_LINK"));
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM mock_supplier_orders WHERE order_id='${order.id}'`), "1");
+  assert.deepEqual(await (await supplier(`/orders/${job.id}/stats`)).json(), providerBefore);
+  assert.equal(orderState(order.id), "PAID");
+  await restart(); await delay(300);
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+});
+
+test("reconciliation unknown local payment with an already issued provider order cannot create another issuance", { timeout: 75000 }, async () => {
+  const { order, attempt } = await reviewPayment(true);
+  const requestId = randomUUID();
+  await restart({ PAYMENT_WORKER_DELAY_MS: "60000" });
+  const response = await supplier("/orders", { requestId, orderId: order.id,
+    simulation: { scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 } });
+  assert.equal(response.status, 202);
+  await until(() => sql(`SELECT status FROM mock_supplier_orders WHERE request_id='${requestId}'`) === "ISSUED");
+  stampPayment(attempt.id, "2013-01-02");
+  await runReconciliation(ledgerDay("2013-01-02"));
+  assert.ok(incidentFor("PAYMENT", attempt.id, "MISSING_FULFILLMENT_LINK"));
+  assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+  assert.equal(sql(`SELECT status FROM payment_attempts WHERE id='${attempt.id}'`), "REVIEW_REQUIRED");
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM mock_supplier_orders WHERE order_id='${order.id}'`), "1");
+  const stats = await (await supplier(`/orders/${requestId}/stats`)).json();
+  assert.equal(stats.issueExecutions, 1); assert.equal(stats.requestCount, 1);
+  await restart();
+});
+
+test("reconciliation finds an issued local job with its profile missing and preserves provider evidence", { timeout: 75000 }, async () => {
+  await restart(); const { order, job } = await trackingProfile();
+  await restart(inboxOnly);
+  const profileId = sql(`SELECT id FROM sim_profiles WHERE order_id='${order.id}'`);
+  const providerBefore = await (await supplier(`/orders/${job.id}/stats`)).json();
+  sql(`DELETE FROM sim_profile_events WHERE profile_id='${profileId}'; DELETE FROM sim_profiles WHERE id='${profileId}'`);
+  await runReconciliation({ mode: "PENDING" });
+  assert.ok(incidentFor("ISSUANCE", job.id, "MISSING_PROFILE_LINK"));
+  assert.equal(issuanceRow(order.id).id, job.id); assert.equal(issuanceRow(order.id).status, "ISSUED");
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM mock_supplier_profiles WHERE request_id='${job.id}'`), "1");
+  assert.deepEqual(await (await supplier(`/orders/${job.id}/stats`)).json(), providerBefore);
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
+  await restart();
+});
+
+test("reconciliation financial lookup racing duplicate PG webhooks discards its stale result without approving twice", { timeout: 75000 }, async () => {
+  const proxy = await providerProxy("mock-pg"); let release;
+  try {
+    const { order, attempt } = await reviewPayment(true, { MOCK_PG_BASE_URL: proxy.url,
+      PG_HTTP_TIMEOUT_MS: "20000", PAYMENT_LEASE_MS: "45000", RECONCILIATION_LEASE_MS: "60000" });
+    const before = sql("SELECT max(last_successful_at) FROM reconciliation_schedule");
+    const result = await (await pg(`/payments/${attempt.id}`)).json();
+    let entered = false;
+    const barrier = new Promise(resolve => { release = resolve; });
+    proxy.intercept = async call => {
+      if (call.path === `/internal/mock-pg/ledger/payments/${attempt.id}`) { entered = true; await barrier; }
+      return null;
+    };
+    const response = await requestReconciliation({ mode: "PENDING", reason: "대사 조회 중 중복 승인 웹훅" });
+    assert.equal(response.status, 202); const { run } = await response.json();
+    await until(() => entered, 60000);
+    const responses = await Promise.all(Array.from({ length: 20 }, () => notify(result)));
+    assert.ok(responses.every(response => [200, 202].includes(response.status)));
+    const receipts = await Promise.all(responses.map(response => response.json()));
+    assert.equal(new Set(receipts.map(receipt => receipt.id)).size, 1);
+    await until(() => inboundRow(receipts[0].id)?.status === "PROCESSED");
+    assert.equal(orderState(order.id), "PAID");
+    release();
+    const done = await completedReconciliation(run.id);
+    assert.equal(done.status, "REVIEW_REQUIRED");
+    assert.equal(reconciliationItem(run.id, attempt.id).status, "STALE");
+    assert.equal(reconciliationItem(run.id, attempt.id).attempt_count, 1);
+    assert.equal(sql("SELECT max(last_successful_at) FROM reconciliation_schedule"), before);
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+    assert.ok(proxy.forId(attempt.id).every(call => call.method === "GET"));
+  } finally { release?.(); await restart(); await proxy.close(); }
+});
+
+test("reconciliation issuance-only pending lookup checks cancelled funding before creating a SIM profile", { timeout: 75000 }, async () => {
+  try {
+    await restart({ ISSUANCE_WORKER_DELAY_MS: "60000" });
+    const { order, attempt, job, simulation } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+    // Keep the normal issuance worker away while the independent supplier finishes the request.
+    sql(`UPDATE issuance_jobs SET next_check_at=clock_timestamp()+INTERVAL '1 day',
+      created_at=clock_timestamp()-INTERVAL '3 minutes' WHERE id='${job.id}'`);
+    await restart({ PAYMENT_WORKER_DELAY_MS: "60000" });
+    const response = await supplier("/orders", { requestId: job.id, orderId: order.id, simulation });
+    assert.equal(response.status, 202);
+    await until(() => sql(`SELECT status FROM mock_supplier_orders WHERE request_id='${job.id}'`) === "ISSUED");
+    const cancellationResponse = await pg(`/payments/${attempt.id}/cancel`, { amount: order.amount, scenario: "SUCCESS" });
+    assert.equal(cancellationResponse.status, 200); const cancellation = await cancellationResponse.json();
+    await restart(inboxOnly);
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+    const run = await runReconciliation({ mode: "PENDING" });
+    assert.equal(reconciliationItem(run.id, job.id).kind, "ISSUANCE");
+    assert.equal(reconciliationItem(run.id, attempt.id), null);
+    assert.ok(incidentFor("ISSUANCE", job.id, "EXTERNAL_CANCELLATION_UNMATCHED"));
+    assert.equal(issuanceRow(order.id).status, "QUEUED"); assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM refunds WHERE order_id='${order.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM external_cancellations WHERE id='${cancellation.id}'`), "1");
+    const stats = await (await supplier(`/orders/${job.id}/stats`)).json();
+    assert.equal(stats.issueExecutions, 1); assert.equal(stats.requestCount, 1);
+  } finally { await restart(); }
+});
+
+test("reconciliation rejects a provider ledger cursor moving backwards without checkpointing or retrying forever", { timeout: 75000 }, async () => {
+  const proxy = await providerProxy("mock-pg"), paymentId = randomUUID(), orderId = randomUUID();
+  const matches = call => call.path.startsWith("/internal/mock-pg/ledger/payments?") && call.path.includes("2014-01-01");
+  try {
+    proxy.intercept = call => matches(call) ? { status: 200, body: {
+      items: [{ id: paymentId, orderId, paymentId, occurredAt: "2014-01-01T15:00:00Z" }],
+      nextTime: "2014-01-01T14:59:59Z", nextId: paymentId,
+    } } : null;
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url, RECONCILIATION_PAGE_SIZE: "1" });
+    const before = sql("SELECT max(last_successful_at) FROM reconciliation_schedule");
+    const run = await runReconciliation(ledgerDay("2014-01-02"));
+    assert.equal(run.status, "REVIEW_REQUIRED"); assert.equal(run.last_error, "RECONCILIATION_INVALID_PROVIDER_RESULT");
+    assert.equal(run.page_attempt_count, 1); assert.equal(run.cursor_id, null); assert.equal(run.cursor_time, null);
+    assert.equal(proxy.calls.filter(matches).length, 1);
+    assert.equal(reconciliationItem(run.id, paymentId), null);
+    assert.equal(sql(`SELECT count(*) FROM orders WHERE id='${orderId}'`), "0");
+    assert.equal(sql("SELECT max(last_successful_at) FROM reconciliation_schedule"), before);
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url }); await delay(500);
+    assert.equal(proxy.calls.filter(matches).length, 1);
+    assert.equal(reconciliationRow(run.id).page_attempt_count, 1);
+  } finally { await restart(); await proxy.close(); }
 });

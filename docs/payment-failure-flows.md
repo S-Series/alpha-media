@@ -519,14 +519,29 @@ flowchart TD
 - `recovery_actions`는 최초 실행자·사유·이전 상태 스냅샷·조회 근거 참조를 보존한다. `recovery_action_events`와 통합 주문 이력에는 각 시도·오류·결과가 추가되며 앱 계정으로 과거 이력을 수정·삭제할 수 없다. 화면에는 외부 상태·처리번호·근거 해시·시각만 노출하고 공급사 활성화 코드는 저장하거나 표시하지 않는다.
 - 이 단계는 기존 충돌의 강제 해제, 미연결 수신의 주문 연결 복원, 주기적 대사·알림을 포함하지 않는다. 계속 불명확한 거래는 확인 필요 상태와 기존 예약을 유지한다. 배포 설정·원격 DB는 변경하지 않는다.
 
+### 4단계 구현: 주기적 대사와 운영 사건
+
+- `PENDING` 대사는 15분마다 미확정 결제·발급·환불, 발급 연결 누락, 발급 완료 후 프로필 누락, 미해결 사건·결과 충돌을 조회한다. `UNKNOWN`·`REVIEW_REQUIRED`·미해결 사건에는 생성일 하한을 두지 않는다. 접수·처리·콜백 대기 중인 정상 작업은 생성 후 2분이 지난 뒤 대상이 되어 아직 외부 전송 전인 새 주문을 불필요하게 사건으로 만들지 않는다.
+- `LEDGER` 대사는 KST 자정 기준 `[오늘-7일 00:00, 오늘 00:00)`의 PG 승인·취소와 공급사 결과 변경을 조회한다. 전일과 이전 6일을 매일 겹쳐 확인한다. 공급사는 최초 접수일 대신 마지막 결과 변경 시각을 사용한다. 서버가 중단됐다 켜지면 DB의 미실행 예약을 확인하고 한 번 접수한다. 7일보다 긴 장애 구간은 운영자가 별도 기간 대사를 실행해야 한다.
+- `/admin/reconciliation`에서 진행·실패·마지막 성공 시각, 개별 조회 결과와 운영 사건을 확인한다. `POST /api/admin/reconciliation-runs`는 `PENDING` 또는 `LEDGER`, 사유와 요청 키를 받는다. 기간은 KST 시작일 포함·종료일 제외이며 한 번에 최대 31일이다. 같은 키·본문은 기존 작업, 같은 키·다른 본문은 409, 같은 종류의 대사가 실행 중이면 다른 키도 409다. 두 종류가 겹쳐도 업무 행 잠금·기존 이벤트 유일성으로 중복 반영을 막는다.
+- `reconciliation_runs`에 구간·단계·시간+ID 커서·페이지 수·예산을, `reconciliation_items`에 대상별 상태·조회 근거·예산을 저장한다. 페이지의 대상 저장과 커서 이동은 한 트랜잭션이다. 중복 페이지·겹치는 구간은 실행별 `(종류, 업무 ID)`로 합친다. HTTP는 DB 트랜잭션 밖에서 수행한다. 업무 반영과 항목 완료도 함께 커밋하므로 DB 실패 시 같이 롤백된다.
+- 기본 워커 주기는 1초, lease는 30초다. 한 페이지 및 한 항목은 각각 최초 포함 최대 3회이며 호출 전에 횟수를 저장한다. 지연은 1초 지수 증가·최대 30초다. 오류 기록 실패·서버 재시작·늦은 워커도 한도를 초기화하거나 다른 lease 결과를 덮어쓰지 못한다. 처리 중 업무 버전이 바뀌면 `STALE`로 남기고 다음 대사에서 다시 확인한다. 조회 실패·STALE가 남은 실행은 마지막 성공 시각을 갱신하지 않는다.
+- 대사는 외부 GET만 호출한다. PG 승인과 전체 취소 내역을 동일 외부 스냅샷으로 조회하고 정수 금액·식별자·취소 합계·누계를 검사한다. 이미 취소된 승인을 먼저 결제 완료로 반영하여 발급하지 않는다. 기존 환불번호에 정확히 대응하는 전액 취소만 기존 환불 완료 경로로 반영하며 외부 취소 ID별 근거는 `external_cancellations`에 불변 기록으로 보존한다.
+- 처음 누락된 승인·발급 결과는 기존 공통 검증 경로로 반영한다. 승인 최초 반영에 따른 후속 발급 작업은 기존처럼 같은 트랜잭션으로 저장한다. 내부 발급 작업이 없을 때는 공급사의 해당 주문 발급 목록도 조회한다. 외부 발급이 이미 있거나 내부에서 승인 완료인데 작업 연결이 없으면 새 발급번호를 만들지 않고 `MISSING_FULFILLMENT_LINK`로 격리한다. 발급 완료 행의 프로필만 누락된 경우도 `MISSING_PROFILE_LINK`로 보류한다. 기존 워커의 결제 완료 건에 대한 무조건적인 새 발급 작업 생성은 제거했다.
+- `incidents`는 업무 종류·ID·원인별로 사건을 합친다. 미연결 외부 거래도 주문을 추정하지 않고 주문 ID 없이 보관한다. `OPEN → INVESTIGATING → RESOLVED`로 관리하며 같은 원인이 재발하면 다시 연다. `POST /api/admin/incidents/{id}/investigations`는 운영자·사유·화면 버전·요청 키를 검사한다. 같은 근거의 반복 조회는 조사 상태·담당자를 바꾸거나 동일 변경 이력을 늘리지 않는다. `incident_events`와 조사 요청 이력은 앱 DB 계정으로 수정·삭제할 수 없다.
+- 사건은 최신 외부 근거, 주문·금전 상태, 환불 예약, 후속 작업·프로필과 충돌 여부가 정합할 때만 자동 해결된다. 화면에서 강제 해결하는 기능은 없다. 대사 실행의 `SUCCEEDED`는 모든 대상 조회를 완료했다는 뜻이며 모든 사건이 해결됐다는 뜻은 아니다. 사건 목록에서 주문 상세의 3단계 재조회·재개 기능으로 이동할 수 있다.
+- 외부 수동·부분 취소, 고아 결제·발급, 영구 충돌, 연결이 사라진 업무는 탐지·기록·차단까지 제공한다. 임의 주문 생성, 고아 거래 자동 연결, 부분 환불 원장·잔액 자동 복구, 충돌 강제 해제, 워커 heartbeat 감시와 외부 알림은 후속 범위다. 원장 페이지는 최대 100개, 한 결제의 취소 및 한 주문의 공급사 요청은 최대 1,000개를 검증하며 초과 시 누락해서 성공시키지 않고 확인 필요로 남긴다.
+- 모의 외부 원장도 같은 PostgreSQL 안에 있으므로 검증에서 외부 기록을 남긴 채 내부 상태 누락을 주입한 것은 실제 외부 사업자·전체 DB 시점 복원 검증과 구분한다. 전체 DB 복원 전후의 모든 쓰기를 자동 차단하는 기능은 이번 단계에 없으며 복원 조사 중에는 운영 절차로 외부 쓰기 워커·요청을 중단한 뒤 원장·연결을 확인해야 한다. 원격 DB·배포 환경변수는 변경하지 않는다.
+
 구현 참고:
 
 - [주문·기한 검사](../backend/service/src/service/OrderRepository.java), [결제 접수](../backend/service/src/service/PaymentService.java), [결제 워커](../backend/service/src/service/PaymentWorker.java), [결제 결과 반영](../backend/service/src/service/PaymentTransitions.java).
 - [PG 클라이언트](../backend/service/src/service/PgClient.java), [PG 웹훅](../backend/service/src/service/PgWebhookController.java), [결제 제약](../backend/database/migration/V4__payments_and_mock_pg.sql).
 - [웹훅 수신함](../backend/service/src/service/InboundEventService.java), [원자적 반영](../backend/service/src/service/InboundEventProcessor.java), [재처리 워커](../backend/service/src/service/InboundEventWorker.java), [수신함 스키마](../backend/database/migration/V12__durable_webhook_inbox.sql).
 - [운영자 복구 API](../backend/service/src/service/RecoveryController.java), [조회·재개 검증](../backend/service/src/service/RecoveryService.java), [복구 조회 워커](../backend/service/src/service/RecoveryWorker.java), [복구 이력 스키마](../backend/database/migration/V13__operator_recovery.sql).
+- [대사·사건 API](../backend/service/src/service/ReconciliationController.java), [주기·페이지 처리](../backend/service/src/service/ReconciliationService.java), [조회 결과 반영](../backend/service/src/service/ReconciliationProcessor.java), [대사 워커](../backend/service/src/service/ReconciliationWorker.java), [대사·사건 스키마](../backend/database/migration/V15__reconciliation_and_incidents.sql).
 - [발급 워커](../backend/service/src/service/IssuanceWorker.java), [발급 반영](../backend/service/src/service/IssuanceService.java), [공급사 콜백](../backend/service/src/service/SupplierWebhookController.java).
 - [운영자 조치](../backend/service/src/service/AdminActionService.java), [환불 워커](../backend/service/src/service/RefundWorker.java), [환불 반영](../backend/service/src/service/RefundService.java).
 - [설치 반영](../backend/service/src/service/ProfileTrackingService.java), [SIM 생명주기](sim-lifecycle.md), [데이터 계약](data-contract.md), [기존 통합 테스트](../tests/orders.integration.test.mjs).
 
-위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계는 통합 테스트의 `retry policy`, `conflict policy`, 2단계는 `webhook inbox`, 3단계는 `operator recovery` 시나리오로 검증한다.
+위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계는 통합 테스트의 `retry policy`, `conflict policy`, 2단계는 `webhook inbox`, 3단계는 `operator recovery`, 4단계는 `reconciliation` 시나리오로 검증한다.

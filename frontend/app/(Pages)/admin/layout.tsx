@@ -18,7 +18,8 @@ async function AdminAccess({ children }: { children: ReactNode }) {
   return <>
     <p>운영자: {result.data.username}</p><LogoutButton />
     <nav className="page-actions" aria-label="운영자 메뉴"><Link href="/admin/orders">주문 목록</Link>
-      <Link href="/admin/issues">결과 확인 필요</Link><Link href="/">고객 화면</Link></nav>
+      <Link href="/admin/issues">결과 확인 필요</Link><Link href="/admin/reconciliation">대사·운영 사건</Link>
+      <Link href="/">고객 화면</Link></nav>
     {children}
   </>;
 }
