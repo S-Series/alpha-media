@@ -5,8 +5,10 @@ import type { Order, OrderPage } from "./orders";
 export async function request<T>(path: string): Promise<{ ok: true; data: T } | { ok: false; status: number }> {
   const session = (await cookies()).get("ALPHA_SESSION");
   if (!session) return { ok: false, status: 401 };
+  const gateway = process.env.GATEWAY_BASE_URL?.trim();
+  if (!gateway) return { ok: false, status: 503 };
   try {
-    const response = await fetch(new URL(path, process.env.GATEWAY_BASE_URL || "http://127.0.0.1:8080"), {
+    const response = await fetch(new URL(path, gateway), {
       cache: "no-store",
       headers: { Cookie: `ALPHA_SESSION=${session.value}` },
       signal: AbortSignal.timeout(Number(process.env.GATEWAY_REQUEST_TIMEOUT_MS || 8000)),

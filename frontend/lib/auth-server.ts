@@ -7,7 +7,8 @@ type MemberResult = { ok: true; data: Member } | { ok: false; status: number };
 export async function getCurrentMember(): Promise<MemberResult> {
   const session = (await cookies()).get("ALPHA_SESSION");
   if (!session) return { ok: false, status: 401 };
-  const gateway = process.env.GATEWAY_BASE_URL || "http://127.0.0.1:8080";
+  const gateway = process.env.GATEWAY_BASE_URL?.trim();
+  if (!gateway) return { ok: false, status: 503 };
   try {
     const response = await fetch(new URL("/api/me", gateway), {
       cache: "no-store",

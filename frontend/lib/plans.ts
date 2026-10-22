@@ -18,7 +18,8 @@ type ApiResult<T> =
 async function request<T>(path: string): Promise<ApiResult<T>> {
   // 요청 시 조회하므로 프론트엔드 빌드 때 백엔드가 실행 중일 필요는 없다.
   await io();
-  const gatewayUrl = process.env.GATEWAY_BASE_URL || "http://127.0.0.1:8080";
+  const gatewayUrl = process.env.GATEWAY_BASE_URL?.trim();
+  if (!gatewayUrl) return { ok: false, status: 503 };
   try {
     const response = await fetch(new URL(path, gatewayUrl), {
       cache: "no-store",
