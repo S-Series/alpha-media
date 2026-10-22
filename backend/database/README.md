@@ -44,7 +44,7 @@ pg_ctl -D D:\Projects\alpha-media\.local\postgres -m fast -w stop
 |---|---|---|
 | `postgres` | 클러스터 초기 관리 | 로컬 관리자 |
 | `alpha_media_owner` | Flyway 마이그레이션 | alpha_media DB 소유자, 슈퍼유저 아님 |
-| `alpha_media_app` | 업무 API | 상품·회원 조회, 회원 일반 컬럼 입력, 세션 관리 |
+| `alpha_media_app` | 업무 API | 상품·회원 조회, 회원 일반 컬럼 입력, 세션 관리, 주문 입력·조회·상태 갱신 |
 
 로컬 관리자 비밀번호는 `.local/postgres-admin.password`에 보관하며 현재 Windows 사용자만 파일을 읽도록 제한했다. 접속이 필요하면 비밀번호를 터미널 입력 프롬프트에 입력한다.
 
@@ -73,9 +73,9 @@ GRANT USAGE ON SCHEMA public TO alpha_media_app;
 
 ## 마이그레이션
 
-`migration/V1__members_and_plans.sql`은 회원·요금제와 초기 상품을 생성한다. `V2__http_sessions.sql`은 로그인 세션을 저장한다. SQL은 Service 빌드 때 JAR의 `db/migration`에 포함되고 Flyway가 시작 시 적용한다.
+`migration/V1__members_and_plans.sql`은 회원·요금제와 초기 상품을 생성한다. `V2__http_sessions.sql`은 로그인 세션을 저장한다. `V3__orders.sql`은 회원별 멱등키와 상품 조건·가격을 고정한 eSIM 주문을 저장한다. SQL은 Service 빌드 때 JAR의 `db/migration`에 포함되고 Flyway가 시작 시 적용한다.
 
-이미 적용한 SQL을 고치지 않고 다음 `V3__설명.sql`을 추가한다. 적용 여부는 `flyway_schema_history`에 기록된다. 마이그레이션 계정은 스키마 변경용이며 애플리케이션 쿼리는 제한된 실행 계정의 별도 커넥션 풀을 사용한다.
+이미 적용한 SQL을 고치지 않고 다음 버전인 `V4__설명.sql`을 추가한다. 적용 여부는 `flyway_schema_history`에 기록된다. 마이그레이션 계정은 스키마 변경용이며 애플리케이션 쿼리는 제한된 실행 계정의 별도 커넥션 풀을 사용한다.
 
 ## 요청 흐름과 현재 범위
 
@@ -83,9 +83,12 @@ GRANT USAGE ON SCHEMA public TO alpha_media_app;
 Browser → Next.js /api rewrite → Gateway → Service → PostgreSQL
                                              ├─ PlanRepository: 상품
                                              ├─ MemberRepository: 회원
-                                             └─ Spring Session: 로그인·CSRF 세션
+                                             ├─ Spring Session: 로그인·CSRF 세션
+                                             └─ OrderRepository: 주문
 ```
 
-회원가입·로그인·로그아웃·본인 정보와 상품 조회까지 동작한다. 주문·결제·발급·환불은 아직 화면 예시 단계다. 이메일 소유 확인·비밀번호 재설정·로그인 시도 제한도 아직 구현하지 않았다.
+회원가입·로그인·로그아웃·본인 정보·상품 조회·eSIM 주문 생성·본인 주문 조회까지 동작한다. 결제·발급·환불은 아직 실행되지 않는다. V3는 별도 임시 DB에서 검증했으며 운영 Neon에는 아직 적용하지 않았다. 이메일 소유 확인·비밀번호 재설정·로그인 시도 제한도 아직 구현하지 않았다.
 
 배포 시 HTTPS를 사용하고 `SESSION_COOKIE_SECURE=true`를 설정한다. DB 주소와 비밀번호는 배포 환경변수로 넣으며 Service와 DB의 외부 공개 여부는 배포 단계에서 제한한다.
+
+주문 통합 테스트는 두 JAR을 빌드한 뒤 루트에서 `npm run test:orders`로 실행한다. 별도 포트의 임시 PostgreSQL 클러스터를 사용하고 종료 시 정리하므로 기존 로컬 DB나 Neon 설정을 바꾸지 않는다. 일반 `spring-boot:run`은 현재 `.env`의 DB에 연결하므로, 로컬 DB를 켜는 것만으로 Service의 접속 대상이 바뀌지는 않는다.

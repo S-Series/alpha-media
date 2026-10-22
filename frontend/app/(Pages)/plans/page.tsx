@@ -8,7 +8,7 @@ export default function PlansPage(props: PageProps<"/plans">) {
   return (
     <>
       <h1>요금제 목록</h1>
-      <p>Service에서 조회한 예시 상품입니다. 주문·결제는 아직 연결되지 않았습니다.</p>
+      <p>상품을 조회하고 eSIM 주문을 생성할 수 있습니다. 결제·발급은 아직 연결되지 않았습니다.</p>
       <Suspense fallback={<p>요금제 확인 중…</p>}>
         <Plans {...props} />
       </Suspense>
