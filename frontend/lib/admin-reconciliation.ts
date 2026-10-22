@@ -14,13 +14,13 @@ export type ReconciliationItem = { id: string; kind: "PAYMENT" | "ISSUANCE" | "R
 export type ReconciliationRuns = { items: ReconciliationRun[]; lastSuccessfulAt: string | null; checkedAt: string };
 export type ReconciliationDetail = { run: ReconciliationRun; items: ReconciliationItem[]; page: number; size: number; hasNext: boolean };
 export type IncidentStatus = "OPEN" | "INVESTIGATING" | "RESOLVED";
-export type Incident = { id: string; orderId: string | null; kind: ReconciliationItem["kind"]; targetId: string;
+export type Incident = { id: string; orderId: string | null; kind: ReconciliationItem["kind"] | "WORKER" | "QUEUE" | "PROFILE" | "INBOUND"; targetId: string;
   code: string; status: IncidentStatus; version: number; actor: string | null; reason: string | null;
   externalReference: string | null; evidenceHash: string | null; firstSeenAt: string; lastSeenAt: string; resolvedAt: string | null };
 export type IncidentPage = { items: Incident[]; page: number; size: number; hasNext: boolean; checkedAt: string };
 export type IncidentDetail = { incident: Incident;
   events: { id: string; status: IncidentStatus; actor: string | null; reason: string | null; evidenceHash: string | null; recordedAt: string }[] };
-export const reconciliationKinds = { PAYMENT: "결제", ISSUANCE: "발급", REFUND: "환불" };
+export const reconciliationKinds = { PAYMENT: "결제", ISSUANCE: "발급", REFUND: "환불", WORKER: "워커", QUEUE: "작업 대기열", PROFILE: "SIM 추적", INBOUND: "웹훅" };
 export const incidentStatuses: Record<IncidentStatus, string> = { OPEN: "미확인", INVESTIGATING: "조사 중", RESOLVED: "해결 확인" };
 export const runStatuses: Record<ReconciliationRun["status"], string> = { QUEUED: "접수·대기", SCANNING: "대상 수집 중",
   PROCESSING: "결과 확인 중", SUCCEEDED: "대사 완료", REVIEW_REQUIRED: "실행 확인 필요" };

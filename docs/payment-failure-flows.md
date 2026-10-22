@@ -530,8 +530,19 @@ flowchart TD
 - 처음 누락된 승인·발급 결과는 기존 공통 검증 경로로 반영한다. 승인 최초 반영에 따른 후속 발급 작업은 기존처럼 같은 트랜잭션으로 저장한다. 내부 발급 작업이 없을 때는 공급사의 해당 주문 발급 목록도 조회한다. 외부 발급이 이미 있거나 내부에서 승인 완료인데 작업 연결이 없으면 새 발급번호를 만들지 않고 `MISSING_FULFILLMENT_LINK`로 격리한다. 발급 완료 행의 프로필만 누락된 경우도 `MISSING_PROFILE_LINK`로 보류한다. 기존 워커의 결제 완료 건에 대한 무조건적인 새 발급 작업 생성은 제거했다.
 - `incidents`는 업무 종류·ID·원인별로 사건을 합친다. 미연결 외부 거래도 주문을 추정하지 않고 주문 ID 없이 보관한다. `OPEN → INVESTIGATING → RESOLVED`로 관리하며 같은 원인이 재발하면 다시 연다. `POST /api/admin/incidents/{id}/investigations`는 운영자·사유·화면 버전·요청 키를 검사한다. 같은 근거의 반복 조회는 조사 상태·담당자를 바꾸거나 동일 변경 이력을 늘리지 않는다. `incident_events`와 조사 요청 이력은 앱 DB 계정으로 수정·삭제할 수 없다.
 - 사건은 최신 외부 근거, 주문·금전 상태, 환불 예약, 후속 작업·프로필과 충돌 여부가 정합할 때만 자동 해결된다. 화면에서 강제 해결하는 기능은 없다. 대사 실행의 `SUCCEEDED`는 모든 대상 조회를 완료했다는 뜻이며 모든 사건이 해결됐다는 뜻은 아니다. 사건 목록에서 주문 상세의 3단계 재조회·재개 기능으로 이동할 수 있다.
-- 외부 수동·부분 취소, 고아 결제·발급, 영구 충돌, 연결이 사라진 업무는 탐지·기록·차단까지 제공한다. 임의 주문 생성, 고아 거래 자동 연결, 부분 환불 원장·잔액 자동 복구, 충돌 강제 해제, 워커 heartbeat 감시와 외부 알림은 후속 범위다. 원장 페이지는 최대 100개, 한 결제의 취소 및 한 주문의 공급사 요청은 최대 1,000개를 검증하며 초과 시 누락해서 성공시키지 않고 확인 필요로 남긴다.
+- 외부 수동·부분 취소, 고아 결제·발급, 영구 충돌, 연결이 사라진 업무는 탐지·기록·차단까지 제공한다. 임의 주문 생성, 고아 거래 자동 연결, 부분 환불 원장·잔액 자동 복구, 충돌 강제 해제와 외부 알림 전송은 후속 범위다. 워커 감시는 아래 5단계로 추가했다. 원장 페이지는 최대 100개, 한 결제의 취소 및 한 주문의 공급사 요청은 최대 1,000개를 검증하며 초과 시 누락해서 성공시키지 않고 확인 필요로 남긴다.
 - 모의 외부 원장도 같은 PostgreSQL 안에 있으므로 검증에서 외부 기록을 남긴 채 내부 상태 누락을 주입한 것은 실제 외부 사업자·전체 DB 시점 복원 검증과 구분한다. 전체 DB 복원 전후의 모든 쓰기를 자동 차단하는 기능은 이번 단계에 없으며 복원 조사 중에는 운영 절차로 외부 쓰기 워커·요청을 중단한 뒤 원장·연결을 확인해야 한다. 원격 DB·배포 환경변수는 변경하지 않는다.
+
+### 5단계 구현: 장애 감시와 사건 알림
+
+- 최초 단계 계획의 자동 대사는 4단계에 구현됐으며, 이번 단계는 감시를 연결한다. 결제·환불·발급·SIM 추적·웹훅 수신함·운영자 복구·대사 7개 업무 워커의 실제 실행 루프가 최대 10초 간격으로 DB에 신호를 남긴다. 신호는 업무 성공을 뜻하지 않는다. 활성화되지 않은 PG·공급사·대사 워커는 누락 장애로 판단하지 않는다. DB에 기록된 비활성→활성 전환에는 첫 신호 대기시간을 새로 시작하며, 설정이 같은 일반 재시작에서는 과거 시각을 보존한다.
+- 신호가 60초를 초과해 없으면 `WORKER_HEARTBEAT_MISSING`, 실행 가능한 작업의 최장 대기가 120초를 초과하면 `EXECUTABLE_BACKLOG`, 발급·SIM 추적의 연속 확인 실패가 300초를 초과하면 `SUPPLIER_CONFIRMATION_DELAYED` 사건을 남긴다. 예약 시각 이전과 유효한 처리 lease는 적체에서 제외하고, lease 만료 뒤부터 대기 시간을 센다. 확인 필요로 자동 실행이 중단된 업무도 실행 대기열과 구분한다.
+- 공급사 실패 시작 시각은 최초 오류 때 저장한다. 반복 오류나 서버 재시작으로 초기화하지 않고 확인 성공 시 해제한다. 기존 오류의 실제 시작을 알 수 없는 마이그레이션 시점에는 그때부터 계산한다. 감시는 업무 상태, 외부 실행, 실행 회차·횟수를 변경하지 않는다.
+- 기본 점검은 5초 간격이며 업무 스케줄러와 별도 단일 스레드에서 수행한다. DB 잠금으로 여러 점검자의 경합을 제어하고, 사건·알림 이력·마지막 점검 완료 시각은 같은 트랜잭션으로 저장한다. 저장 실패 시 모두 롤백한 뒤 다음 점검에서 재확인한다. 감시 DB 기록 실패가 업무 워커의 새 재시도를 만드는 것은 아니다.
+- `order_conflicts`의 새 충돌은 같은 트랜잭션에서 즉시 `ORDER_RESULT_CONFLICT` 사건으로 연결한다. 고아 거래는 4단계 대사에서 발견하는 즉시 사건이 된다. 동일 조건의 반복 점검은 조사자·사유와 사건 ID를 유지하며 알림을 늘리지 않는다. 새 근거·조사·회복·재발은 `incident_events`에 보존한다.
+- 감시 조건이 해소되면 해당 감시 코드만 해결한다. 다른 거래 충돌을 함께 해결하거나 주문의 격리를 풀지 않는다. 업무 대사 역시 감시 사건을 해결하지 않는다. 서버가 중단됐다 돌아온 경우 과거 신호를 유지하여 60초 초과 공백과 복구 이력을 기록한다. 여러 Service 인스턴스에서는 논리적 워커 종류별 살아 있는 실행 신호를 확인하며 개별 인스턴스의 생존을 보장하지 않는다.
+- 운영자 `GET /api/admin/monitoring`과 `/admin/reconciliation`의 장애 감시 영역에 워커 신호·실행 대기열·연속 실패·최근 50개 사건 변경 알림을 표시한다. 알림에서 해당 사건의 조사 이력으로 이동한다. 마지막 점검이 30초 넘게 갱신되지 않으면 `STALE`, DB 조회가 불가능하면 `503 MONITORING_UNAVAILABLE`다. 화면 조회 실패 시 지난 결과를 현재 정상으로 표시하지 않는다.
+- `MONITORING_ENABLED=true`, `MONITORING_INTERVAL_MS=5000`이 기본값이다. Service 전체 종료·DB 전체 장애 중에는 내부 감시가 새 사건을 저장하거나 외부로 통지할 수 없다. 별도 외부 가용성 감시·이메일·Slack 연결은 이번 변경에 포함하지 않는다. 외부 메시지 전송이나 배포 환경 설정은 수행하지 않는다. 로컬 검증은 임시 DB의 시간·장애를 제어하며, 실제 외부 사업자와 전체 DB 복원 검증은 아니다.
 
 구현 참고:
 
@@ -540,8 +551,9 @@ flowchart TD
 - [웹훅 수신함](../backend/service/src/service/InboundEventService.java), [원자적 반영](../backend/service/src/service/InboundEventProcessor.java), [재처리 워커](../backend/service/src/service/InboundEventWorker.java), [수신함 스키마](../backend/database/migration/V12__durable_webhook_inbox.sql).
 - [운영자 복구 API](../backend/service/src/service/RecoveryController.java), [조회·재개 검증](../backend/service/src/service/RecoveryService.java), [복구 조회 워커](../backend/service/src/service/RecoveryWorker.java), [복구 이력 스키마](../backend/database/migration/V13__operator_recovery.sql).
 - [대사·사건 API](../backend/service/src/service/ReconciliationController.java), [주기·페이지 처리](../backend/service/src/service/ReconciliationService.java), [조회 결과 반영](../backend/service/src/service/ReconciliationProcessor.java), [대사 워커](../backend/service/src/service/ReconciliationWorker.java), [대사·사건 스키마](../backend/database/migration/V15__reconciliation_and_incidents.sql).
+- [장애 감시](../backend/service/src/service/MonitoringService.java), [독립 감시 실행](../backend/service/src/service/MonitoringWorker.java), [감시 API](../backend/service/src/service/MonitoringController.java), [신호·실패 시각·즉시 사건 스키마](../backend/database/migration/V16__operational_monitoring.sql).
 - [발급 워커](../backend/service/src/service/IssuanceWorker.java), [발급 반영](../backend/service/src/service/IssuanceService.java), [공급사 콜백](../backend/service/src/service/SupplierWebhookController.java).
 - [운영자 조치](../backend/service/src/service/AdminActionService.java), [환불 워커](../backend/service/src/service/RefundWorker.java), [환불 반영](../backend/service/src/service/RefundService.java).
 - [설치 반영](../backend/service/src/service/ProfileTrackingService.java), [SIM 생명주기](sim-lifecycle.md), [데이터 계약](data-contract.md), [기존 통합 테스트](../tests/orders.integration.test.mjs).
 
-위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계는 통합 테스트의 `retry policy`, `conflict policy`, 2단계는 `webhook inbox`, 3단계는 `operator recovery`, 4단계는 `reconciliation` 시나리오로 검증한다.
+위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계는 통합 테스트의 `retry policy`, `conflict policy`, 2단계는 `webhook inbox`, 3단계는 `operator recovery`, 4단계는 `reconciliation`, 5단계는 `monitoring` 시나리오로 검증한다.

@@ -90,6 +90,8 @@ public class ReconciliationService {
                     UNION SELECT 'REFUND',id,order_id FROM refunds WHERE created_at<=? AND (status IN ('UNKNOWN','REVIEW_REQUIRED')
                         OR (status IN ('REQUESTED','PROCESSING') AND created_at<clock_timestamp()-INTERVAL '2 minutes'))
                     UNION SELECT kind,target_id,order_id FROM incidents WHERE status<>'RESOLVED' AND first_seen_at<=?
+                        AND kind IN ('PAYMENT','ISSUANCE','REFUND')
+                        AND code NOT IN ('WORKER_HEARTBEAT_MISSING','EXECUTABLE_BACKLOG','SUPPLIER_CONFIRMATION_DELAYED')
                     UNION SELECT target,target_id,order_id FROM order_conflicts WHERE target IN ('PAYMENT','ISSUANCE','REFUND') AND recorded_at<=?
                 ) SELECT *,kind||':'||target_id::text AS cursor_key FROM candidates
                 WHERE (?::varchar IS NULL OR kind||':'||target_id::text>?) ORDER BY kind||':'||target_id::text LIMIT ?

@@ -17,16 +17,19 @@ public class ReconciliationWorker {
     private final IncidentRepository incidents;
     private final boolean schedule;
     private final long leaseMs,retryMs;
-    public ReconciliationWorker(ReconciliationRepository runs,ReconciliationService service,ReconciliationProcessor processor,IncidentRepository incidents,
+    private final MonitoringService monitoring;
+    public ReconciliationWorker(ReconciliationRepository runs,ReconciliationService service,ReconciliationProcessor processor,IncidentRepository incidents,MonitoringService monitoring,
             @Value("${reconciliation.schedule-enabled:true}") boolean schedule,@Value("${reconciliation.lease-ms:30000}") long leaseMs,
             @Value("${reconciliation.retry-base-ms:1000}") long retryMs) {
         Assert.isTrue(leaseMs>=1000 && retryMs>=100,"Invalid reconciliation retry settings");
+        this.monitoring=monitoring;
         this.runs=runs; this.service=service; this.processor=processor; this.incidents=incidents;
         this.schedule=schedule; this.leaseMs=leaseMs; this.retryMs=retryMs;
     }
     @Scheduled(fixedDelayString="${reconciliation.worker-delay-ms:1000}",initialDelayString="${reconciliation.worker-delay-ms:1000}")
     public void tick() {
         if (!service.available()) return;
+        monitoring.pulse("RECONCILIATION");
         try {
             if (schedule) service.schedule();
             var page=runs.claimPage(leaseMs);

@@ -14,14 +14,17 @@ public class InboundEventWorker {
     private final InboundEventRepository events;
     private final InboundEventProcessor processor;
     private final long leaseMs,retryBaseMs;
-    public InboundEventWorker(InboundEventRepository events,InboundEventProcessor processor,
+    private final MonitoringService monitoring;
+    public InboundEventWorker(InboundEventRepository events,InboundEventProcessor processor,MonitoringService monitoring,
             @Value("${webhook.lease-ms:30000}") long leaseMs,
             @Value("${webhook.retry-base-ms:1000}") long retryBaseMs) {
         Assert.isTrue(leaseMs>=1000 && retryBaseMs>=100,"Invalid webhook retry intervals");
+        this.monitoring=monitoring;
         this.events=events; this.processor=processor; this.leaseMs=leaseMs; this.retryBaseMs=retryBaseMs;
     }
     @Scheduled(fixedDelayString="${webhook.worker-delay-ms:500}",initialDelayString="${webhook.worker-delay-ms:500}")
     public void tick() {
+        monitoring.pulse("INBOUND");
         var next=events.claim(leaseMs);
         if (next.isEmpty()) return;
         var claim=next.get();

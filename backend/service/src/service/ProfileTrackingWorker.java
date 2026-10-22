@@ -13,11 +13,14 @@ public class ProfileTrackingWorker {
     private final ProfileTrackingService tracking;
     private final SupplierClient supplier;
     private final IssuanceSettings settings;
-    public ProfileTrackingWorker(JdbcTemplate jdbc,ProfileTrackingService tracking,SupplierClient supplier,IssuanceSettings settings) {
+    private final MonitoringService monitoring;
+    public ProfileTrackingWorker(JdbcTemplate jdbc,ProfileTrackingService tracking,SupplierClient supplier,IssuanceSettings settings,MonitoringService monitoring) {
+        this.monitoring=monitoring;
         this.jdbc=jdbc; this.tracking=tracking; this.supplier=supplier; this.settings=settings;
     }
     @Scheduled(fixedDelayString="${issuance.worker-delay-ms}",initialDelayString="${issuance.worker-delay-ms}")
     public void tick() {
+        monitoring.pulse("PROFILE");
         tracking.expire();
         UUID token=UUID.randomUUID();
         var due=jdbc.query("""

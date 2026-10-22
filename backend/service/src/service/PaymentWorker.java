@@ -17,14 +17,17 @@ public class PaymentWorker {
     private final PaymentSettings settings;
     private final PgClient pg;
     private final OrderConflicts conflicts;
+    private final MonitoringService monitoring;
 
     public PaymentWorker(PaymentRepository payments, PaymentTransitions transitions, PaymentSettings settings, PgClient pg,
-            OrderConflicts conflicts) {
+            OrderConflicts conflicts, MonitoringService monitoring) {
+        this.monitoring=monitoring;
         this.payments = payments; this.transitions = transitions; this.settings = settings; this.pg = pg; this.conflicts = conflicts;
     }
 
     @Scheduled(fixedDelayString = "${payment.worker-delay-ms}", initialDelayString = "${payment.worker-delay-ms}")
     public void tick() {
+        monitoring.pulse("PAYMENT");
         var next = payments.claim(settings.leaseMs());
         if (next.isEmpty()) return;
         var claim = next.get();

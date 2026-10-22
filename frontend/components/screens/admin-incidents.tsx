@@ -9,10 +9,11 @@ import { kst } from "@/lib/format";
 const base = "/api/admin/incidents";
 type Receipt = { incident: Incident; replayed: boolean };
 
-export default function AdminIncidents({ refresh, onRefresh }: { refresh: number; onRefresh: () => void }) {
+export default function AdminIncidents({ refresh, onRefresh, selected, onSelect }: {
+  refresh: number; onRefresh: () => void; selected: string; onSelect: (id: string) => void;
+}) {
   const [status, setStatus] = useState<IncidentStatus | "">("");
   const [page, setPage] = useState(0);
-  const [selected, setSelected] = useState("");
   const [reason, setReason] = useState("");
   const [message, setMessage] = useState("");
   const list = useReconciliationRead<IncidentPage>(`${base}?page=${page}&size=20${status ? `&status=${status}` : ""}`, refresh);
@@ -26,15 +27,15 @@ export default function AdminIncidents({ refresh, onRefresh }: { refresh: number
     const receipt = replay ? await action.replay() : await action.submit(`${base}/${incident!.id}/investigations`,
       { expectedVersion: incident!.version, reason: reason.trim() });
     if (receipt) {
-      setSelected(receipt.incident.id);
+      onSelect(receipt.incident.id);
       setMessage(`${receipt.replayed ? "기존 조사 기록 확인" : "조사 기록 접수 완료"} · 사건번호 ${receipt.incident.id}`);
     }
     onRefresh();
   }
 
-  return <section className="home-panel"><h2>운영 사건·조사 이력</h2>
+  return <section className="home-panel" id="operational-incidents"><h2>운영 사건·조사 이력</h2>
     <p>주문에 연결되지 않은 외부 처리도 사건으로 확인합니다. 조사 기록은 사건을 해결 처리하지 않습니다.</p>
-    <p>외부 원장을 확인한 뒤 위의 <strong>누락·미해결 건 재조회</strong>를 실행하세요. 서버가 불일치 해소를 확인한 경우에만 자동으로 해결 상태가 됩니다.</p>
+    <p>거래 사건은 외부 원장 확인 후 <strong>누락·미해결 건 재조회</strong>를 실행하세요. 워커·적체·공급사 지연 사건은 감시가 회복을 확인하면 해결됩니다. 조사 기록만으로 해결되지는 않습니다.</p>
     <div className="screen-form">
       <label>사건 상태 <select value={status} onChange={event => { setStatus(event.target.value as IncidentStatus | ""); setPage(0); }}>
         <option value="">전체</option>{Object.entries(incidentStatuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -51,7 +52,7 @@ export default function AdminIncidents({ refresh, onRefresh }: { refresh: number
           <td>{item.code}<br />{reconciliationKinds[item.kind]} · {item.targetId}</td>
           <td>{incidentStatuses[item.status]}<br />{item.actor || "조사자 미지정"}</td>
           <td>최초 {kst(item.firstSeenAt)}<br />최근 {kst(item.lastSeenAt)}</td>
-          <td><button aria-pressed={selected === item.id} onClick={() => setSelected(item.id)}>조사 이력 보기</button><br />
+          <td><button aria-pressed={selected === item.id} onClick={() => onSelect(item.id)}>조사 이력 보기</button><br />
             {item.orderId ? <Link href={`/admin/orders/${item.orderId}`}>주문 상세</Link> : "연결된 주문 없음"}</td>
         </tr>)}</tbody>
       </table></div>}

@@ -35,7 +35,15 @@ public class IncidentRepository {
             UPDATE incidents SET status='RESOLVED',version=version+1,actor_id=NULL,reason='EXTERNAL_AND_INTERNAL_STATE_VERIFIED',
                 evidence_hash=?,resolved_at=clock_timestamp(),last_seen_at=clock_timestamp()
             WHERE kind=? AND target_id=? AND status<>'RESOLVED'
+                AND code NOT IN ('WORKER_HEARTBEAT_MISSING','EXECUTABLE_BACKLOG','SUPPLIER_CONFIRMATION_DELAYED')
             """,hash,kind,target);
+    }
+    void resolveCode(String kind,UUID target,String code,String reason) {
+        jdbc.update("""
+            UPDATE incidents SET status='RESOLVED',version=version+1,actor_id=NULL,reason=?,
+                resolved_at=clock_timestamp(),last_seen_at=clock_timestamp()
+            WHERE kind=? AND target_id=? AND code=? AND status<>'RESOLVED'
+            """,reason,kind,target,code);
     }
     Incident get(UUID id) {
         return jdbc.query(SELECT+" WHERE i.id=?",MAPPER,id).stream().findFirst().orElseThrow(

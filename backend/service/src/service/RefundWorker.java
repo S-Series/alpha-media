@@ -16,11 +16,14 @@ public class RefundWorker {
     private final PaymentSettings settings;
     private final PgClient pg;
     private final OrderConflicts conflicts;
-    public RefundWorker(RefundRepository refunds,RefundService transitions,PaymentSettings settings,PgClient pg,OrderConflicts conflicts) {
+    private final MonitoringService monitoring;
+    public RefundWorker(RefundRepository refunds,RefundService transitions,PaymentSettings settings,PgClient pg,OrderConflicts conflicts,MonitoringService monitoring) {
+        this.monitoring=monitoring;
         this.refunds=refunds; this.transitions=transitions; this.settings=settings; this.pg=pg; this.conflicts=conflicts;
     }
     @Scheduled(fixedDelayString="${payment.worker-delay-ms}",initialDelayString="${payment.worker-delay-ms}")
     public void tick() {
+        monitoring.pulse("REFUND");
         var next=refunds.claim(settings.leaseMs());
         if (next.isEmpty()) return;
         var claim=next.get();

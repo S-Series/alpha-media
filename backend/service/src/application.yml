@@ -75,6 +75,10 @@ recovery:
   lease-ms: ${RECOVERY_LEASE_MS:30000}
   retry-base-ms: ${RECOVERY_RETRY_BASE_MS:1000}
 
+monitoring:
+  enabled: ${MONITORING_ENABLED:true}
+  interval-ms: ${MONITORING_INTERVAL_MS:5000}
+
 reconciliation:
   enabled: ${RECONCILIATION_ENABLED:true}
   schedule-enabled: ${RECONCILIATION_SCHEDULE_ENABLED:true}

@@ -119,6 +119,7 @@ function startService(extra = {}) {
     PAYMENT_WORKER_DELAY_MS: "100", WEBHOOK_WORKER_DELAY_MS: "50", WEBHOOK_LEASE_MS: "3000",
     WEBHOOK_RETRY_BASE_MS: "100", WEBHOOK_INBOX_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
     RECOVERY_WORKER_DELAY_MS: "100", RECOVERY_LEASE_MS: "1200", RECOVERY_RETRY_BASE_MS: "100",
+    MONITORING_ENABLED: "false", MONITORING_INTERVAL_MS: "500",
     RECONCILIATION_SCHEDULE_ENABLED: "false", RECONCILIATION_WORKER_DELAY_MS: "100",
     RECONCILIATION_LEASE_MS: "3000", RECONCILIATION_RETRY_BASE_MS: "100",
     ...accountHashes, ...extra });
@@ -3321,4 +3322,243 @@ test("reconciliation rejects a provider ledger cursor moving backwards without c
     assert.equal(proxy.calls.filter(matches).length, 1);
     assert.equal(reconciliationRow(run.id).page_attempt_count, 1);
   } finally { await restart(); await proxy.close(); }
+});
+
+const monitoringPaused = { MONITORING_ENABLED: "true", PAYMENT_WORKER_DELAY_MS: "3600000",
+  ISSUANCE_WORKER_DELAY_MS: "3600000", WEBHOOK_WORKER_DELAY_MS: "3600000",
+  RECOVERY_WORKER_DELAY_MS: "3600000", RECONCILIATION_WORKER_DELAY_MS: "3600000" };
+async function monitoringView(client = admin) {
+  const response = await client.request("/api/admin/monitoring");
+  assert.equal(response.status, 200); assert.equal(response.headers.get("cache-control"), "no-store");
+  return response.json();
+}
+async function monitorScan() {
+  const before = sql("SELECT last_checked_at FROM monitoring_status");
+  await until(() => sql("SELECT last_checked_at FROM monitoring_status") !== before);
+}
+async function pausedMonitor(extra = {}) {
+  await restart({ ...monitoringPaused, ...extra });
+  await until(() => sql("SELECT count(*) FROM worker_heartbeats") === "7");
+  sql("UPDATE worker_heartbeats SET initialized_at=clock_timestamp(),last_seen_at=clock_timestamp()");
+  await monitorScan();
+}
+function monitorIncident(kind, reference, code) {
+  const value = sql(`SELECT row_to_json(i) FROM incidents i WHERE kind='${kind}' AND external_reference='${reference}' AND code='${code}'`);
+  return value ? JSON.parse(value) : null;
+}
+function incidentEvents(id) { return Number(sql(`SELECT count(*) FROM incident_events WHERE incident_id='${id}'`)); }
+
+test("monitoring admin-only snapshots expose thresholds and worker signals without changing normal payment issuance or refund", { timeout: 90000 }, async () => {
+  await restart({ MONITORING_ENABLED: "true" });
+  try {
+    assert.equal((await new Client().request("/api/admin/monitoring")).status, 401);
+    assert.equal((await alice.request("/api/admin/monitoring")).status, 403);
+    assert.equal((await fetch(`http://127.0.0.1:${servicePort}/api/admin/monitoring`)).status, 403);
+    await until(async () => (await monitoringView()).workers.every(worker => !worker.enabled || worker.lastSeenAt));
+    const data = await monitoringView();
+    assert.equal(data.heartbeatThresholdSeconds, 60); assert.equal(data.backlogThresholdSeconds, 120);
+    assert.equal(data.supplierThresholdSeconds, 300); assert.equal(data.workers.length, 7);
+    assert.ok(!/activationCode|password|apiKey|leaseToken/.test(JSON.stringify(data)));
+    const issued = await trackingProfile(); assert.equal(issuanceRow(issued.order.id).status, "ISSUED");
+    const failed = await failedOrder();
+    assert.equal((await adminAction(failed.order.id, "refunds", refundRequest(failed.job))).status, 202);
+    await until(() => refundRow(failed.order.id)?.status === "SUCCEEDED");
+    assert.equal(orderState(failed.order.id), "REFUNDED");
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${failed.attempt.id}'`), "1");
+  } finally { await restart(); }
+});
+
+test("monitoring missed heartbeat deduplicates preserves investigation across restart and reopens after recovery", { timeout: 90000 }, async () => {
+  await pausedMonitor();
+  try {
+    sql("UPDATE worker_heartbeats SET last_seen_at=clock_timestamp()-INTERVAL '50 seconds' WHERE name='PAYMENT'");
+    await monitorScan();
+    assert.notEqual(monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING")?.status, "OPEN");
+    sql("UPDATE worker_heartbeats SET last_seen_at=clock_timestamp()-INTERVAL '61 seconds' WHERE name='PAYMENT'");
+    await until(() => monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING")?.status === "OPEN");
+    const incident = monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING");
+    const body = { expectedVersion: incident.version, reason: "워커 신호 누락 확인 중" }, key = randomUUID();
+    const investigate = () => admin.request(`/api/admin/incidents/${incident.id}/investigations`, { method: "POST",
+      headers: { "Idempotency-Key": key, ...investigationCsrf }, body });
+    const investigationCsrf = await admin.csrf();
+    const responses = await Promise.all(Array.from({ length: 20 }, investigate));
+    assert.equal(responses.filter(r => r.status === 202).length, 1);
+    assert.ok(responses.every(r => [200, 202].includes(r.status)));
+    const count = incidentEvents(incident.id);
+    await monitorScan(); await monitorScan(); assert.equal(incidentEvents(incident.id), count);
+    await restart(monitoringPaused); await monitorScan();
+    const retained = monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING");
+    assert.equal(retained.id, incident.id); assert.equal(retained.status, "INVESTIGATING");
+    assert.equal(retained.actor_id, admin.memberId); assert.equal(incidentEvents(incident.id), count);
+    await restart({ MONITORING_ENABLED: "true" });
+    await until(() => monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING")?.status === "RESOLVED");
+    assert.equal(incidentEvents(incident.id), count + 1);
+    await pausedMonitor();
+    sql("UPDATE worker_heartbeats SET last_seen_at=clock_timestamp()-INTERVAL '61 seconds' WHERE name='PAYMENT'");
+    await until(() => monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING")?.status === "OPEN");
+    assert.equal(monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING").id, incident.id);
+    assert.equal(incidentEvents(incident.id), count + 2);
+    sql(`UPDATE incident_events SET reason='tamper' WHERE incident_id='${incident.id}'`, true, true);
+    sql(`DELETE FROM incident_actions WHERE incident_id='${incident.id}'`, true, true);
+  } finally { await restart(); }
+});
+
+test("monitoring records a persisted signal gap even when the service restarts before its next scan", { timeout: 60000 }, async () => {
+  await pausedMonitor();
+  try {
+    const before = Number(sql("SELECT count(*) FROM incident_events e JOIN incidents i ON i.id=e.incident_id WHERE i.kind='WORKER' AND i.external_reference='REFUND'"));
+    await restart();
+    sql("UPDATE worker_heartbeats SET last_seen_at=clock_timestamp()-INTERVAL '70 seconds' WHERE name='REFUND'");
+    await restart({ MONITORING_ENABLED: "true" });
+    await until(() => monitorIncident("WORKER", "REFUND", "WORKER_HEARTBEAT_MISSING")?.status === "RESOLVED");
+    const incident = monitorIncident("WORKER", "REFUND", "WORKER_HEARTBEAT_MISSING");
+    assert.equal(incidentEvents(incident.id), before + 2);
+    assert.ok(sql(`SELECT string_agg(status,',' ORDER BY id) FROM incident_events WHERE incident_id='${incident.id}'`).endsWith("OPEN,RESOLVED"));
+  } finally { await restart(); }
+});
+
+test("monitoring executable backlog ignores future retries and active leases and clears only the queue incident", { timeout: 60000 }, async () => {
+  await pausedMonitor();
+  try {
+    const a = await newOrder(), b = await newOrder(), c = await newOrder();
+    const pa = await (await alice.pay(a.id)).json(), pb = await (await alice.pay(b.id)).json(), pc = await (await alice.pay(c.id)).json();
+    sql(`UPDATE payment_attempts SET next_attempt_at=clock_timestamp()+INTERVAL '1 hour' WHERE id='${pa.id}';
+      UPDATE payment_attempts SET status='PROCESSING',lease_token=gen_random_uuid(),lease_until=clock_timestamp()+INTERVAL '1 hour',
+      next_attempt_at=clock_timestamp()-INTERVAL '1 hour' WHERE id='${pb.id}';
+      UPDATE payment_attempts SET next_attempt_at=clock_timestamp()-INTERVAL '110 seconds' WHERE id='${pc.id}'`);
+    await monitorScan();
+    let queue = (await monitoringView()).queues.find(row => row.name === "PAYMENT");
+    assert.equal(queue.overdue, false); assert.equal(queue.oldestId, pc.id);
+    sql(`UPDATE payment_attempts SET next_attempt_at=clock_timestamp()-INTERVAL '121 seconds' WHERE id='${pc.id}'`);
+    await until(() => monitorIncident("QUEUE", "PAYMENT", "EXECUTABLE_BACKLOG")?.status === "OPEN");
+    const incident = monitorIncident("QUEUE", "PAYMENT", "EXECUTABLE_BACKLOG"), count = incidentEvents(incident.id);
+    await monitorScan(); assert.equal(incidentEvents(incident.id), count);
+    queue = (await monitoringView()).queues.find(row => row.name === "PAYMENT");
+    assert.equal(queue.oldestId, pc.id); assert.equal(queue.orderId, c.id);
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_payments WHERE payment_id IN ('${pa.id}','${pb.id}','${pc.id}')`), "0");
+    sql(`UPDATE payment_attempts SET next_attempt_at=clock_timestamp()+INTERVAL '1 hour' WHERE id='${pc.id}'`);
+    await until(() => monitorIncident("QUEUE", "PAYMENT", "EXECUTABLE_BACKLOG")?.status === "RESOLVED");
+    assert.equal(sql(`SELECT attempt_count FROM payment_attempts WHERE id='${pc.id}'`), "0");
+    assert.equal(sql(`SELECT status FROM payment_attempts WHERE id='${pb.id}'`), "PROCESSING");
+  } finally { await restart(); }
+});
+
+test("monitoring supplier failures retain their first failure time and resolve after a real supplier refresh", { timeout: 90000 }, async () => {
+  const { profile } = await trackingProfile();
+  await pausedMonitor();
+  try {
+    sql(`UPDATE sim_profiles SET sync_error='SUPPLIER_PROFILE_UNAVAILABLE' WHERE id='${profile.id}'`);
+    assert.ok(sql(`SELECT sync_failure_since FROM sim_profiles WHERE id='${profile.id}'`));
+    sql(`UPDATE sim_profiles SET sync_failure_since=clock_timestamp()-INTERVAL '290 seconds' WHERE id='${profile.id}'`);
+    await monitorScan(); assert.equal(incidentFor("PROFILE", profile.id, "SUPPLIER_CONFIRMATION_DELAYED"), null);
+    sql(`UPDATE sim_profiles SET sync_failure_since=clock_timestamp()-INTERVAL '301 seconds' WHERE id='${profile.id}'`);
+    const since = sql(`SELECT sync_failure_since FROM sim_profiles WHERE id='${profile.id}'`);
+    sql(`UPDATE sim_profiles SET sync_error='SUPPLIER_PROFILE_UNAVAILABLE' WHERE id='${profile.id}'`);
+    assert.equal(sql(`SELECT sync_failure_since FROM sim_profiles WHERE id='${profile.id}'`), since);
+    await until(() => incidentFor("PROFILE", profile.id, "SUPPLIER_CONFIRMATION_DELAYED")?.status === "OPEN");
+    const incident = incidentFor("PROFILE", profile.id, "SUPPLIER_CONFIRMATION_DELAYED"), count = incidentEvents(incident.id);
+    sql(`INSERT INTO incidents(id,kind,target_id,code,reason) VALUES(gen_random_uuid(),'PROFILE','${profile.id}','MANUAL_REVIEW','별도 조사')`);
+    await restart(monitoringPaused); await monitorScan();
+    assert.equal(incidentFor("PROFILE", profile.id, "SUPPLIER_CONFIRMATION_DELAYED").id, incident.id);
+    assert.equal(incidentEvents(incident.id), count);
+    sql(`UPDATE sim_profiles SET next_sync_at=clock_timestamp(),sync_lease_token=NULL,sync_lease_until=NULL WHERE id='${profile.id}'`);
+    await restart({ MONITORING_ENABLED: "true" });
+    await until(() => incidentFor("PROFILE", profile.id, "SUPPLIER_CONFIRMATION_DELAYED")?.status === "RESOLVED");
+    assert.equal(sql(`SELECT sync_failure_since FROM sim_profiles WHERE id='${profile.id}'`), "");
+    assert.equal(incidentFor("PROFILE", profile.id, "MANUAL_REVIEW").status, "OPEN");
+  } finally { await restart(); }
+});
+
+test("monitoring tracks issuance confirmation failure duration without resetting business retry budgets", { timeout: 60000 }, async () => {
+  const { order, job } = await failedOrder();
+  await pausedMonitor();
+  try {
+    sql(`UPDATE issuance_jobs SET status='REVIEW_REQUIRED',last_error='SUPPLIER_RETRY_LIMIT_REACHED' WHERE id='${job.id}';
+      UPDATE issuance_jobs SET supplier_failure_since=clock_timestamp()-INTERVAL '301 seconds' WHERE id='${job.id}'`);
+    const counts = sql(`SELECT check_count||':'||submission_count||':'||execution_round FROM issuance_jobs WHERE id='${job.id}'`);
+    await until(() => incidentFor("ISSUANCE", job.id, "SUPPLIER_CONFIRMATION_DELAYED")?.status === "OPEN");
+    assert.equal(sql(`SELECT check_count||':'||submission_count||':'||execution_round FROM issuance_jobs WHERE id='${job.id}'`), counts);
+    assert.equal(orderState(order.id), "PAID");
+    sql(`UPDATE issuance_jobs SET status='FAILED',last_error=NULL WHERE id='${job.id}'`);
+    await until(() => incidentFor("ISSUANCE", job.id, "SUPPLIER_CONFIRMATION_DELAYED")?.status === "RESOLVED");
+  } finally { await restart(); }
+});
+
+test("monitoring conflict alerts are immediate transactional and do not wait for scheduled reconciliation", { timeout: 75000 }, async () => {
+  const { order, attempt } = await reviewPayment(true);
+  const approved = await (await pg(`/payments/${attempt.id}`)).json();
+  const mismatch = { ...approved, amount: order.amount + 1 };
+  await webhookCopies(await Promise.all(Array.from({ length: 20 }, () => notify(mismatch))), 409);
+  const incident = incidentFor("PAYMENT", attempt.id, "ORDER_RESULT_CONFLICT");
+  assert.ok(incident); assert.equal(incident.status, "OPEN"); assert.equal(incidentEvents(incident.id), 1);
+  const snapshot = await monitoringView();
+  assert.ok(snapshot.alerts.some(alert => alert.incidentId === incident.id));
+  assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+  const other = await newOrder(), target = randomUUID(), before = sql("SELECT count(*) FROM incidents");
+  sql(`BEGIN; INSERT INTO order_conflicts(id,order_id,target,target_id,code,source,payload_hash)
+    VALUES(gen_random_uuid(),'${other.id}','PAYMENT','${target}','TEST_ROLLBACK','TEST','${"b".repeat(64)}'); ROLLBACK;`);
+  assert.equal(sql("SELECT count(*) FROM incidents"), before);
+  await restart();
+});
+
+test("monitoring scan DB failure rolls back incidents and alerts and stale snapshots cannot claim health", { timeout: 90000 }, async () => {
+  await pausedMonitor();
+  try {
+    const old = monitorIncident("WORKER", "RECOVERY", "WORKER_HEARTBEAT_MISSING");
+    const oldEvents = old ? incidentEvents(old.id) : 0;
+    sql("CREATE FUNCTION fail_monitor_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'monitor storage failure'; END $$; CREATE TRIGGER fail_monitor_commit BEFORE UPDATE ON monitoring_status FOR EACH ROW EXECUTE FUNCTION fail_monitor_commit();");
+    sql("ALTER TABLE monitoring_status DISABLE TRIGGER fail_monitor_commit; UPDATE monitoring_status SET last_checked_at=clock_timestamp()-INTERVAL '31 seconds'; ALTER TABLE monitoring_status ENABLE TRIGGER fail_monitor_commit;");
+    sql("UPDATE worker_heartbeats SET last_seen_at=clock_timestamp()-INTERVAL '61 seconds' WHERE name='RECOVERY'");
+    const before = sql("SELECT last_checked_at FROM monitoring_status");
+    await delay(1400);
+    assert.equal(sql("SELECT last_checked_at FROM monitoring_status"), before);
+    assert.equal(monitorIncident("WORKER", "RECOVERY", "WORKER_HEARTBEAT_MISSING")?.status, old?.status);
+    assert.equal((await monitoringView()).status, "STALE");
+    await restart(monitoringPaused); await delay(1000);
+    assert.equal(monitorIncident("WORKER", "RECOVERY", "WORKER_HEARTBEAT_MISSING")?.status, old?.status);
+    sql("DROP TRIGGER fail_monitor_commit ON monitoring_status; DROP FUNCTION fail_monitor_commit();");
+    await until(() => monitorIncident("WORKER", "RECOVERY", "WORKER_HEARTBEAT_MISSING")?.status === "OPEN");
+    const incident = monitorIncident("WORKER", "RECOVERY", "WORKER_HEARTBEAT_MISSING");
+    assert.equal(incidentEvents(incident.id), oldEvents + 1);
+    sql("REVOKE SELECT ON monitoring_status FROM alpha_media_app");
+    const unavailable = await admin.request("/api/admin/monitoring");
+    assert.equal(unavailable.status, 503); assert.equal((await unavailable.json()).code, "MONITORING_UNAVAILABLE");
+  } finally {
+    sql("DROP TRIGGER IF EXISTS fail_monitor_commit ON monitoring_status; DROP FUNCTION IF EXISTS fail_monitor_commit(); GRANT SELECT ON monitoring_status TO alpha_media_app;");
+    await restart();
+  }
+});
+
+test("monitoring disabled providers do not raise heartbeat incidents and operational incidents never become payment reconciliation items", { timeout: 60000 }, async () => {
+  await pausedMonitor({ MOCK_PG_ENABLED: "false", MOCK_SUPPLIER_ENABLED: "false" });
+  try {
+    sql("UPDATE worker_heartbeats SET last_seen_at=clock_timestamp()-INTERVAL '1 hour' WHERE name IN ('PAYMENT','REFUND','ISSUANCE','PROFILE','RECONCILIATION')");
+    await monitorScan();
+    const data = await monitoringView();
+    assert.ok(data.workers.filter(w => ['PAYMENT','REFUND','ISSUANCE','PROFILE','RECONCILIATION'].includes(w.name)).every(w => !w.enabled));
+    assert.equal(sql("SELECT count(*) FROM incidents WHERE kind='WORKER' AND external_reference IN ('PAYMENT','REFUND','ISSUANCE','PROFILE','RECONCILIATION') AND status<>'RESOLVED'"), "0");
+    await restart({ ...monitoringPaused, RECONCILIATION_WORKER_DELAY_MS: "100" });
+    await monitorScan();
+    assert.equal(sql("SELECT count(*) FROM incidents WHERE kind='WORKER' AND external_reference IN ('PAYMENT','REFUND','ISSUANCE','PROFILE','RECONCILIATION') AND status<>'RESOLVED'"), "0");
+    const enabledPayment = (await monitoringView()).workers.find(worker => worker.name === "PAYMENT");
+    assert.equal(enabledPayment.lastSeenAt, null); assert.ok(enabledPayment.silentSeconds < 60);
+    sql("UPDATE worker_heartbeats SET last_seen_at=clock_timestamp()-INTERVAL '61 seconds' WHERE name='PAYMENT'");
+    await until(() => monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING")?.status === "OPEN");
+    const run = await runReconciliation({ mode: "PENDING" });
+    assert.equal(sql(`SELECT count(*) FROM reconciliation_items WHERE run_id='${run.id}' AND kind NOT IN ('PAYMENT','ISSUANCE','REFUND')`), "0");
+    assert.equal(monitorIncident("WORKER", "PAYMENT", "WORKER_HEARTBEAT_MISSING").status, "OPEN");
+  } finally { await restart(); }
+});
+
+test("monitoring heartbeat storage failure cannot prevent business processing or create duplicate approvals", { timeout: 60000 }, async () => {
+  await restart({ MONITORING_ENABLED: "true" });
+  try {
+    sql("REVOKE UPDATE(last_seen_at) ON worker_heartbeats FROM alpha_media_app");
+    await restart({ MONITORING_ENABLED: "true" });
+    const { order, attempt } = await trackingProfile();
+    assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+  } finally { sql("GRANT UPDATE(last_seen_at) ON worker_heartbeats TO alpha_media_app"); await restart(); }
 });

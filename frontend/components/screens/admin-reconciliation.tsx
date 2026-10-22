@@ -6,6 +6,7 @@ import { activeRun, reconciliationKinds, runModes, runStatuses, useReconciliatio
   type ReconciliationDetail, type ReconciliationRun, type ReconciliationRuns } from "@/lib/admin-reconciliation";
 import { kst } from "@/lib/format";
 import AdminIncidents from "./admin-incidents";
+import AdminMonitoring from "./admin-monitoring";
 
 const base = "/api/admin/reconciliation-runs";
 type Receipt = { run: ReconciliationRun; replayed: boolean };
@@ -19,6 +20,7 @@ export default function AdminReconciliation() {
   const [selected, setSelected] = useState("");
   const [page, setPage] = useState(0);
   const [message, setMessage] = useState("");
+  const [incidentId, setIncidentId] = useState("");
   const list = useReconciliationRead<ReconciliationRuns>(base, refresh);
   const id = selected || list.data?.items[0]?.id || "";
   const detail = useReconciliationRead<ReconciliationDetail>(id ? `${base}/${id}?page=${page}&size=50` : null, refresh, 5000);
@@ -40,6 +42,7 @@ export default function AdminReconciliation() {
   }
 
   return <>
+    <AdminMonitoring refresh={refresh} onSelect={setIncidentId} />
     <section className="home-panel"><h2>주기적 대사 상태</h2>
       <p>마지막 대사 성공: {list.data?.lastSuccessfulAt ? kst(list.data.lastSuccessfulAt) : "성공 기록 확인 대기"}<br />
         화면 조회: {list.data?.checkedAt ? kst(list.data.checkedAt) : "조회 중"} · 실행 중 {activeCount}건</p>
@@ -112,6 +115,6 @@ export default function AdminReconciliation() {
         </>}
       </>}
     </section>
-    <AdminIncidents refresh={refresh} onRefresh={() => setRefresh(value => value + 1)} />
+    <AdminIncidents refresh={refresh} onRefresh={() => setRefresh(value => value + 1)} selected={incidentId} onSelect={setIncidentId} />
   </>;
 }

@@ -16,11 +16,14 @@ public class IssuanceWorker {
     private final IssuanceSettings settings;
     private final SupplierClient supplier;
     private final OrderConflicts conflicts;
-    public IssuanceWorker(IssuanceRepository jobs, IssuanceService transitions, IssuanceSettings settings, SupplierClient supplier,OrderConflicts conflicts) {
+    private final MonitoringService monitoring;
+    public IssuanceWorker(IssuanceRepository jobs, IssuanceService transitions, IssuanceSettings settings, SupplierClient supplier,OrderConflicts conflicts,MonitoringService monitoring) {
+        this.monitoring=monitoring;
         this.jobs = jobs; this.transitions = transitions; this.settings = settings; this.supplier = supplier; this.conflicts=conflicts;
     }
     @Scheduled(fixedDelayString = "${issuance.worker-delay-ms}", initialDelayString = "${issuance.worker-delay-ms}")
     public void tick() {
+        monitoring.pulse("ISSUANCE");
         var claimed = jobs.claim(settings.leaseMs());
         if (claimed.isEmpty()) return;
         var claim = claimed.get();
