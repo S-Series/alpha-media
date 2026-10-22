@@ -54,8 +54,9 @@ final class ProxyExchangeFilter implements HandlerFilterFunction<ServerResponse,
             var status = timeout ? HttpStatus.GATEWAY_TIMEOUT : HttpStatus.BAD_GATEWAY;
             String code = timeout ? "SERVICE_TIMEOUT" : "SERVICE_UNAVAILABLE";
             // 요청 본문·인증 토큰을 기록하지 않고 추적 ID와 실패 종류만 남긴다.
-            log.warn("Service request failed requestId={} method={} status={} code={}",
-                    requestId, request.method(), status.value(), code);
+            log.warn("Service request failed requestId={} method={} status={} code={} cause={}",
+                    requestId, request.method(), status.value(), code,
+                    exception.getMostSpecificCause().getClass().getSimpleName());
             // 읽기 시간 초과는 504, 그 밖의 연결 실패는 502로 응답한다.
             // 응답을 못 받았어도 결제 처리는 완료됐을 수 있으므로 여기서 재시도하거나 실패로 확정하지 않는다.
             return ServerResponse.status(status)
