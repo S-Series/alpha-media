@@ -52,11 +52,15 @@ public class SecurityConfiguration {
         http
                 .httpBasic(AbstractHttpConfigurer::disable)
                 .requestCache(AbstractHttpConfigurer::disable)
+                // 외부 통지는 세션 대신 본문 HMAC, 내부 모의 PG는 별도 API 키로 인증한다.
+                .csrf(csrf -> csrf.ignoringRequestMatchers("/webhooks/pg", "/internal/mock-pg/**"))
                 .authorizeHttpRequests(auth -> auth
                         .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(HttpMethod.GET, "/health").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/plans", "/api/plans/**", "/api/auth/csrf").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/signup", "/api/auth/login").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/webhooks/pg").permitAll()
+                        .requestMatchers("/internal/mock-pg/**").permitAll()
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
                         .requestMatchers("/api/me", "/api/auth/logout", "/api/orders/**", "/api/sims/**").authenticated()
                         .anyRequest().denyAll())

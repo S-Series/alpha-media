@@ -52,7 +52,7 @@ export default function OrderForm({ memberId, planId, travelStartDate, today }: 
         <input name="travelStartDate" type="date" min={today} value={selectedDate}
           onChange={event => setSelectedDate(event.target.value)} required disabled={pending} />
       </label>
-      <p>주문 생성만 진행합니다. 결제와 발급은 아직 실행되지 않습니다.</p>
+      <p>주문을 생성한 뒤 주문 상세에서 모의 결제를 진행할 수 있습니다. 발급은 아직 연결되지 않았습니다.</p>
       {error && <p role="alert">{error}</p>}
       {loginRequired && <Link href={loginUrl}>로그인 후 다시 주문하기</Link>}
       <button type="submit" disabled={pending}>{pending ? "주문 확인 중…" : "주문 생성"}</button>

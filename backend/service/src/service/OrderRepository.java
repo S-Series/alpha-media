@@ -40,6 +40,31 @@ public class OrderRepository {
                 .stream().findFirst();
     }
 
+    Optional<Order> lock(UUID memberId, UUID orderId) {
+        return jdbc.query(SELECT + " WHERE member_id=? AND id=? FOR UPDATE", MAPPER, memberId, orderId)
+                .stream().findFirst();
+    }
+
+    Order lock(UUID orderId) {
+        return jdbc.query(SELECT + " WHERE id=? FOR UPDATE", MAPPER, orderId).getFirst();
+    }
+
+    boolean startPayment(UUID orderId) {
+        // 잠금을 기다린 시간도 포함해 실제 갱신 시점에 유효 기한을 검사한다.
+        return jdbc.update("""
+                UPDATE orders SET status='PAYMENT_PROCESSING', updated_at=clock_timestamp()
+                WHERE id=? AND status='PENDING_PAYMENT' AND expires_at > clock_timestamp()
+                """, orderId) == 1;
+    }
+
+    void finishPayment(UUID orderId, boolean approved) {
+        jdbc.update("""
+                UPDATE orders SET status=CASE WHEN ? THEN 'PAID'
+                    WHEN expires_at > clock_timestamp() THEN 'PENDING_PAYMENT' ELSE 'EXPIRED' END,
+                    updated_at=clock_timestamp() WHERE id=? AND status='PAYMENT_PROCESSING'
+                """, approved, orderId);
+    }
+
     public List<Order> findAll(UUID memberId, int page, int size) {
         return jdbc.query(SELECT + " WHERE member_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
                 MAPPER, memberId, size + 1, (long) page * size);

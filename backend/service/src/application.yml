@@ -4,6 +4,10 @@ spring:
     import: optional:file:./.env[.properties]
   application:
     name: service
+  task:
+    scheduling:
+      pool:
+        size: 3
   datasource:
     url: ${DB_URL:jdbc:postgresql://127.0.0.1:5432/alpha_media}
     username: ${DB_USERNAME:alpha_media_app}
@@ -43,3 +47,14 @@ server:
         http-only: true
         same-site: lax
         secure: ${SESSION_COOKIE_SECURE:false}
+
+payment:
+  mock-enabled: ${MOCK_PG_ENABLED:false}
+  pg-base-url: ${MOCK_PG_BASE_URL:http://127.0.0.1:${server.port}/internal/mock-pg}
+  webhook-url: ${PG_WEBHOOK_URL:http://127.0.0.1:8080/webhooks/pg}
+  api-key: ${MOCK_PG_API_KEY:}
+  webhook-secret: ${PG_WEBHOOK_SECRET:}
+  http-timeout-ms: ${PG_HTTP_TIMEOUT_MS:2000}
+  lease-ms: ${PAYMENT_LEASE_MS:30000}
+  retry-base-ms: ${PAYMENT_RETRY_BASE_MS:1000}
+  worker-delay-ms: ${PAYMENT_WORKER_DELAY_MS:500}

@@ -13,7 +13,7 @@ export default function PlanDetailPage(props: PageProps<"/plans/[planId]">) {
   return (
     <>
       <h1>요금제 상세</h1>
-      <p>상품을 확인하고 eSIM 주문을 생성할 수 있습니다. 결제·발급은 아직 연결되지 않았습니다.</p>
+      <p>상품을 확인하고 eSIM 주문을 생성한 뒤 모의 결제를 진행할 수 있습니다. 발급은 아직 연결되지 않았습니다.</p>
       <Suspense fallback={<p role="status">상품 정보 확인 중…</p>}>
         <PlanDetail {...props} />
       </Suspense>

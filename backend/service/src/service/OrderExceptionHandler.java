@@ -10,7 +10,8 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 
 import service.OrderService.OrderException;
 
-@RestControllerAdvice(assignableTypes = OrderController.class)
+@RestControllerAdvice(assignableTypes = { OrderController.class, PaymentController.class,
+        PgWebhookController.class, MockPgController.class })
 public class OrderExceptionHandler {
 
     @ExceptionHandler(OrderException.class)
@@ -22,6 +23,6 @@ public class OrderExceptionHandler {
             MissingRequestHeaderException.class, MethodArgumentTypeMismatchException.class})
     ResponseEntity<ApiError> invalid() {
         return ResponseEntity.badRequest().body(new ApiError("INVALID_REQUEST",
-                "상품·여행 시작일·UUID 형식의 요청 키를 확인해 주세요."));
+                "요청 본문·입력 범위·UUID 형식의 요청 키를 확인해 주세요."));
     }
 }

@@ -3,15 +3,7 @@
 import { useState, type FormEvent } from "react";
 import { login, signup } from "@/lib/auth";
 
-<<<<<<< Updated upstream
-export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
-<<<<<<< HEAD
-=======
-  const router = useRouter();
-=======
 export default function AuthForm({ mode, nextPath = "/mypage" }: { mode: "login" | "signup"; nextPath?: string }) {
->>>>>>> Stashed changes
->>>>>>> develop
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [registered, setRegistered] = useState(false);
@@ -30,18 +22,8 @@ export default function AuthForm({ mode, nextPath = "/mypage" }: { mode: "login"
         setRegistered(true);
       } else {
         await login(email, password);
-<<<<<<< HEAD
-        // 프록시가 바꾼 세션 쿠키를 다시 읽고 이전 비로그인 화면 캐시를 버린다.
-        window.location.replace("/mypage");
-=======
-<<<<<<< Updated upstream
-        router.replace("/mypage");
-        router.refresh();
-=======
         // 프록시가 바꾼 세션 쿠키를 다시 읽고 이전 비로그인 화면 캐시를 버린다.
         window.location.replace(nextPath);
->>>>>>> Stashed changes
->>>>>>> develop
       }
     } catch (error) {
       setError(error instanceof Error ? error.message : "서버에 연결하지 못했습니다.");

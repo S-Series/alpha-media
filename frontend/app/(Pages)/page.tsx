@@ -7,7 +7,7 @@ export default function Home() {
   return (
     <>
       <h1>홈</h1>
-      <p>eSIM 주문을 생성하고 내역을 확인할 수 있습니다. 결제·발급·환불은 아직 실행되지 않습니다.</p>
+      <p>eSIM 주문 생성과 모의 결제를 진행하고 내역을 확인할 수 있습니다. 발급·고객 환불은 아직 연결되지 않았습니다.</p>
       <section className="home-panel" aria-labelledby="search-title">
         <h2 id="search-title">여행 요금제 찾기</h2>
         <form action="/plans" method="get" className="plan-search">
