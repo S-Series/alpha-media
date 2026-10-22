@@ -43,6 +43,9 @@ services:
         sync: false
       - key: PG_WEBHOOK_SECRET
         sync: false
+      # Preserve this 32-byte Base64 key to decrypt persisted webhook payloads.
+      - key: WEBHOOK_INBOX_ENCRYPTION_KEY
+        sync: false
       - key: PG_WEBHOOK_URL
         value: https://alpha-media-gateway.onrender.com/webhooks/pg
       - key: MOCK_SUPPLIER_ENABLED

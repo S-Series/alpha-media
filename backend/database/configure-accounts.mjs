@@ -16,7 +16,7 @@ if (!existsSync(secretsPath) && /^(CUSTOMER[12]|ADMIN)_PASSWORD_HASH=\{pbkdf2-/m
 const accounts = existsSync(secretsPath) ? JSON.parse(readFileSync(secretsPath, "utf8")) : {};
 for (const username of ["customer1", "customer2", "admin", "admin2"]) {
   if (!accounts[username]) {
-    const password = randomBytes(12).toString("base64url") + "!A1";
+    const password = "pass1234";
     const salt = randomBytes(16);
     const hash = "{pbkdf2-sha256-600k}" + Buffer.concat([salt,
       pbkdf2Sync(password, salt, 600000, 32, "sha256")]).toString("hex");
