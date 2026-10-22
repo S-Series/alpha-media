@@ -46,8 +46,17 @@ public class MockPgController {
 
     @PostMapping("/{id}/cancel")
     MockPgService.Cancellation cancel(@RequestHeader(value = "Authorization", required = false) String auth,
-            @PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, @Valid @RequestBody Cancel request) {
-        authorize(auth); return pg.cancel(id, key, request.amount());
+            @PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, @Valid @RequestBody Cancel request) throws InterruptedException {
+        authorize(auth);
+        var reply=pg.cancel(id,key,request.amount(),request.scenario()==null?Refund.Scenario.SUCCESS:request.scenario());
+        if (reply.loseResponse()) Thread.sleep(settings.httpTimeoutMs()*2L+250);
+        return reply.result();
+    }
+
+    @GetMapping("/{id}/cancellations/{key}")
+    MockPgService.Cancellation cancellation(@RequestHeader(value="Authorization",required=false) String auth,
+            @PathVariable UUID id,@PathVariable UUID key) {
+        authorize(auth); return pg.cancellation(id,key);
     }
 
     private void authorize(String supplied) {
@@ -57,5 +66,5 @@ public class MockPgController {
         }
     }
 
-    public record Cancel(@Min(1) long amount) {}
+    public record Cancel(@Min(1) long amount, Refund.Scenario scenario) {}
 }

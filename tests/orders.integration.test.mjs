@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHmac, pbkdf2Sync, randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { once } from "node:events";
 import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
@@ -619,7 +620,7 @@ async function supplierNotify(result, valid = true) {
 }
 
 function issuanceRow(orderId) {
-  const value = sql(`SELECT row_to_json(j) FROM issuance_jobs j WHERE order_id='${orderId}'`);
+  const value = sql(`SELECT row_to_json(j) FROM issuance_jobs j WHERE order_id='${orderId}' AND is_current`);
   return value ? JSON.parse(value) : null;
 }
 
@@ -787,4 +788,206 @@ test("issuance unknown supplier result stops after six checks and is visible for
   const issues = await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json();
   assert.ok(issues.items.some(item => item.order.id === order.id));
   await restart();
+});
+
+async function failedOrder() {
+  const data = await issueOrder({ scenario: "FAIL", callbackCopies: 0, callbackDelayMs: 0 });
+  await until(() => issuanceRow(data.order.id).status === "FAILED");
+  return data;
+}
+function refundRow(orderId) {
+  const row = sql(`SELECT row_to_json(r) FROM refunds r WHERE order_id='${orderId}'`);
+  return row ? JSON.parse(row) : null;
+}
+async function adminAction(orderId, type, body, key = randomUUID(), client = admin) {
+  return client.request(`/api/admin/orders/${orderId}/${type}`, { method: "POST",
+    headers: { ...await client.csrf(), "Idempotency-Key": key }, body });
+}
+function refundRequest(job, scenario = "SUCCESS") { return { issuanceId: job.id, reason: "발급 실패 고객 전액 환불", scenario }; }
+function retryRequest(job, scenario = "SUCCEED") {
+  return { issuanceId: job.id, reason: "공급사 오류 확인 후 재발급", simulation: { scenario, callbackCopies: 3, callbackDelayMs: 100 } };
+}
+
+test("refund admin actions require administrator, CSRF, reason and a confirmed current failure", async () => {
+  const { order, job } = await failedOrder(), body = refundRequest(job);
+  assert.equal((await adminAction(order.id,"refunds",body,randomUUID(),new Client())).status,401);
+  assert.equal((await adminAction(order.id,"refunds",body,randomUUID(),alice)).status,403);
+  assert.equal((await adminAction(order.id,"issuance-retries",retryRequest(job),randomUUID(),bob)).status,403);
+  assert.equal((await admin.request(`/api/admin/orders/${order.id}/refunds`, { method: "POST", body,
+    headers: { "Idempotency-Key": randomUUID() } })).status,403);
+  for (const invalid of [{ ...body, reason: " " }, { ...body, reason: "x".repeat(301) }, { ...body, scenario: "INVALID" }, { ...body, issuanceId: null }]) {
+    assert.equal((await adminAction(order.id,"refunds",invalid)).status,400);
+  }
+  assert.equal((await adminAction(randomUUID(),"refunds",body)).status,404);
+  const issued = await issueOrder(); await until(() => issuanceRow(issued.order.id).status === "ISSUED");
+  assert.equal((await adminAction(issued.order.id,"refunds",refundRequest(issued.job))).status,409);
+  assert.equal((await adminAction(issued.order.id,"issuance-retries",retryRequest(issued.job))).status,409);
+  const pending = await newOrder();
+  assert.equal((await adminAction(pending.id,"refunds",body)).status,409);
+  sql(`UPDATE issuance_jobs SET status='REVIEW_REQUIRED' WHERE id='${job.id}'`);
+  assert.equal((await adminAction(order.id,"refunds",body)).status,409);
+  assert.equal((await adminAction(order.id,"issuance-retries",retryRequest(job))).status,409);
+});
+
+test("refund twenty simultaneous identical requests cancel once and retain one immutable audit action", async () => {
+  const { order, job, attempt } = await failedOrder(), key = randomUUID(), body = { ...refundRequest(job), amount: 1, currency: "USD", actor: "customer2" };
+  const headers = { ...await admin.csrf(), "Idempotency-Key": key };
+  const responses = await Promise.all(Array.from({ length: 20 }, () => admin.request(`/api/admin/orders/${order.id}/refunds`, { method: "POST", headers, body })));
+  assert.equal(responses.filter(r => r.status === 202).length,1);
+  assert.equal(responses.filter(r => r.status === 200).length,19);
+  assert.equal(new Set((await Promise.all(responses.map(r => r.json()))).map(r => r.action.id)).size,1);
+  await until(() => refundRow(order.id)?.status === "SUCCEEDED");
+  assert.equal(orderState(order.id),"REFUNDED");
+  assert.equal((await (await alice.request(`/api/orders/${order.id}`)).json()).status,"REFUNDED");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`),"1");
+  assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${attempt.id}'`),String(order.amount));
+  const replay = await adminAction(order.id,"refunds",body,key); assert.equal(replay.status,200);
+  assert.equal(replay.headers.get("Idempotency-Replayed"),"true");
+  for (const changed of [{ ...body, reason: "다른 사유" }, { ...body, scenario: "RESPONSE_LOST" }]) {
+    assert.equal((await adminAction(order.id,"refunds",changed,key)).status,409);
+  }
+  assert.equal((await adminAction(order.id,"issuance-retries",retryRequest(job),key)).status,409);
+  const detail = await (await admin.request(`/api/admin/orders/${order.id}`)).json();
+  assert.equal(detail.actions.length,1); assert.equal(detail.actions[0].actor,"admin");
+  assert.equal(detail.actions[0].payloadHash,undefined); assert.equal(detail.actions[0].reason,body.reason);
+  assert.deepEqual(detail.actionEvents.map(e => e.status),["REQUESTED","SUCCEEDED"]);
+  const issues = await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json();
+  assert.ok(!issues.items.some(i => i.order.id===order.id));
+  sql(`UPDATE admin_actions SET reason='tamper' WHERE order_id='${order.id}'`,true,true);
+  sql(`DELETE FROM admin_action_events WHERE action_id='${detail.actions[0].id}'`,true,true);
+  assert.equal((await alice.pay(order.id)).status,409);
+});
+
+test("refund different keys and a simultaneous issuance retry cannot produce two operations", async () => {
+  for (const mix of [false,true]) {
+    const { order, job } = await failedOrder();
+    const results = await Promise.all(Array.from({ length: 12 }, (_,i) => adminAction(order.id,
+      mix && i%2 ? "issuance-retries":"refunds",mix && i%2 ? retryRequest(job):refundRequest(job))));
+    assert.equal(results.filter(r => r.status===202).length,1);
+    assert.equal(results.filter(r => r.status===409).length,11);
+    assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${order.id}'`),"1");
+    await until(() => orderState(order.id)==="REFUNDED" || issuanceRow(order.id).status==="ISSUED");
+    assert.ok(!(refundRow(order.id) && sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`)!=="0"));
+  }
+});
+
+test("refund issuance retry preserves failed attempts and ignores old callbacks without duplicate profiles", async () => {
+  const { order, job } = await failedOrder();
+  const oldResult = await (await supplier(`/orders/${job.id}`)).json();
+  const key=randomUUID(), body=retryRequest(job,"FAIL");
+  const headers={ ...await admin.csrf(),"Idempotency-Key":key };
+  const responses=await Promise.all(Array.from({ length:20 },()=>admin.request(`/api/admin/orders/${order.id}/issuance-retries`,{ method:"POST",headers,body })));
+  assert.equal(responses.filter(r=>r.status===202).length,1); assert.equal(responses.filter(r=>r.status===200).length,19);
+  await until(()=>issuanceRow(order.id).id!==job.id && issuanceRow(order.id).status==="FAILED");
+  assert.equal((await adminAction(order.id,"issuance-retries",body,key)).status,200);
+  assert.equal((await adminAction(order.id,"issuance-retries",body)).status,409);
+  assert.equal((await supplierNotify(oldResult)).status,200);
+  const second=issuanceRow(order.id), last=await adminAction(order.id,"issuance-retries",retryRequest(second));
+  assert.equal(last.status,202);
+  await until(()=>issuanceRow(order.id).status==="ISSUED");
+  assert.equal((await supplierNotify(oldResult)).status,200);
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`),"3");
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`),"1");
+  assert.equal(sql(`SELECT sum(issue_executions) FROM mock_supplier_orders WHERE order_id='${order.id}'`),"1");
+  const detail=await (await admin.request(`/api/admin/orders/${order.id}`)).json();
+  assert.equal(detail.actions.length,2);
+  assert.equal(detail.actionEvents.filter(e=>e.status==="FAILED").length,1);
+  assert.equal(detail.actionEvents.filter(e=>e.status==="ISSUED").length,1);
+});
+
+test("refund cancellation response loss reconciles the same refund reference with exactly one PG cancellation", async () => {
+  const { order, job, attempt }=await failedOrder();
+  const r=await adminAction(order.id,"refunds",refundRequest(job,"RESPONSE_LOST")); assert.equal(r.status,202);
+  await until(()=>refundRow(order.id)?.status==="SUCCEEDED");
+  const refund=refundRow(order.id); assert.equal(refund.attempt_count,2);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}' AND idempotency_key='${refund.id}'`),"1");
+  assert.equal(orderState(order.id),"REFUNDED");
+  const detail=await (await admin.request(`/api/admin/orders/${order.id}`)).json();
+  assert.deepEqual(detail.actionEvents.map(e=>e.status),["REQUESTED","UNKNOWN","SUCCEEDED"]);
+  const old=await (await supplier(`/orders/${job.id}`)).json();
+  assert.equal((await supplierNotify(old)).status,200);
+  assert.equal((await notify(await (await pg(`/payments/${attempt.id}`)).json())).status,200);
+  assert.equal(orderState(order.id),"REFUNDED");
+});
+
+test("refund queued work survives server restart and discarded intake response", async () => {
+  const { order, job, attempt }=await failedOrder();
+  await restart({ PAYMENT_WORKER_DELAY_MS:"60000" });
+  const key=randomUUID(), body=refundRequest(job), response=await adminAction(order.id,"refunds",body,key);
+  assert.equal(response.status,202); await response.body.cancel();
+  assert.equal(refundRow(order.id).status,"REQUESTED");
+  await restart();
+  assert.equal((await adminAction(order.id,"refunds",body,key)).status,200);
+  await until(()=>orderState(order.id)==="REFUNDED");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`),"1");
+});
+
+test("refund PG outage stops after three attempts, blocks reissue and remains in operator issues", async () => {
+  const { order, job, attempt }=await failedOrder(), key=randomUUID(), body=refundRequest(job,"UNAVAILABLE");
+  assert.equal((await adminAction(order.id,"refunds",body,key)).status,202);
+  await until(()=>refundRow(order.id)?.status==="REVIEW_REQUIRED");
+  const refund=refundRow(order.id); assert.equal(refund.attempt_count,3); assert.equal(orderState(order.id),"REFUND_PROCESSING");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`),"0");
+  assert.equal((await adminAction(order.id,"refunds",body,key)).status,200);
+  assert.equal((await adminAction(order.id,"refunds",body)).status,409);
+  assert.equal((await adminAction(order.id,"issuance-retries",retryRequest(job))).status,409);
+  const issues=await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json();
+  assert.ok(issues.items.some(i=>i.order.id===order.id));
+  await delay(1000); assert.equal(refundRow(order.id).attempt_count,3);
+});
+
+test("refund DB completion failure recovers PG cancellation after lease expiry without losing audit or double refund", async () => {
+  const { order, job, attempt }=await failedOrder();
+  sql(`CREATE FUNCTION reject_refund_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.status='SUCCEEDED' THEN RAISE EXCEPTION 'simulated database failure'; END IF; RETURN NEW; END $$;
+    CREATE TRIGGER reject_refund_completion BEFORE UPDATE ON refunds FOR EACH ROW EXECUTE FUNCTION reject_refund_completion();`);
+  try {
+    assert.equal((await adminAction(order.id,"refunds",refundRequest(job))).status,202);
+    await until(()=>sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`)==="1");
+    assert.equal(orderState(order.id),"REFUND_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM admin_action_events e JOIN admin_actions a ON a.id=e.action_id WHERE a.order_id='${order.id}' AND e.status='SUCCEEDED'`),"0");
+  } finally { sql("DROP TRIGGER reject_refund_completion ON refunds; DROP FUNCTION reject_refund_completion();"); }
+  await until(()=>refundRow(order.id).status==="SUCCEEDED");
+  assert.equal(orderState(order.id),"REFUNDED");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`),"1");
+});
+
+test("refund intake and audit are atomic and preexisting partial cancellation cannot over-refund", async () => {
+  const { order, job, attempt }=await failedOrder(), body=refundRequest(job), key=randomUUID();
+  sql("REVOKE INSERT ON admin_action_events FROM alpha_media_app");
+  try {
+    assert.equal((await adminAction(order.id,"issuance-retries",retryRequest(job))).status,500);
+    assert.equal(issuanceRow(order.id).id,job.id);
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`),"1");
+    assert.equal((await adminAction(order.id,"refunds",body,key)).status,500);
+  }
+  finally { sql("GRANT INSERT ON admin_action_events TO alpha_media_app"); }
+  assert.equal(refundRow(order.id),null); assert.equal(orderState(order.id),"PAID");
+  assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${order.id}'`),"0");
+  assert.equal((await pg(`/payments/${attempt.id}/cancel`,{ amount:100 })).status,200);
+  assert.equal((await adminAction(order.id,"refunds",body,key)).status,202);
+  await until(()=>refundRow(order.id)?.status==="REVIEW_REQUIRED");
+  assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${attempt.id}'`),"100");
+  assert.equal(orderState(order.id),"REFUND_PROCESSING");
+});
+
+test("refund mismatched PG cancellation identifiers or amounts never mark an order refunded", async () => {
+  const { order, job, attempt }=await failedOrder();
+  const fake=createHttpServer((request,response) => {
+    const refund=refundRow(order.id);
+    response.writeHead(200,{ "Content-Type":"application/json" });
+    response.end(JSON.stringify({ id:randomUUID(),paymentId:randomUUID(),idempotencyKey:refund?.id,
+      amount:1,cancelledTotal:1 }));
+  });
+  fake.listen(0,"127.0.0.1"); await once(fake,"listening");
+  try {
+    await restart({ MOCK_PG_BASE_URL:`http://127.0.0.1:${fake.address().port}/internal/mock-pg` });
+    assert.equal((await adminAction(order.id,"refunds",refundRequest(job))).status,202);
+    await until(()=>refundRow(order.id)?.status==="REVIEW_REQUIRED");
+    assert.equal(orderState(order.id),"REFUND_PROCESSING");
+    assert.equal(refundRow(order.id).pg_cancellation_id,null);
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`),"0");
+  } finally {
+    fake.closeAllConnections(); await new Promise(resolve=>fake.close(resolve)); await restart();
+  }
 });

@@ -24,7 +24,7 @@ public class IssuanceRepository {
         var config = payment.issuance();
         jdbc.update("""
             INSERT INTO issuance_jobs(id,order_id,scenario,callback_copies,callback_delay_ms)
-            VALUES(?,?,?,?,?) ON CONFLICT(order_id) DO NOTHING
+            VALUES(?,?,?,?,?) ON CONFLICT(order_id) WHERE is_current DO NOTHING
             """, UUID.randomUUID(), payment.orderId(), config.scenario().name(), config.callbackCopies(), config.callbackDelayMs());
     }
 
@@ -36,12 +36,12 @@ public class IssuanceRepository {
             FROM payment_attempts p JOIN orders o ON o.id=p.order_id
             WHERE p.status='APPROVED' AND o.status='PAID'
                 AND NOT EXISTS (SELECT 1 FROM issuance_jobs j WHERE j.order_id=o.id)
-            ORDER BY p.created_at LIMIT 100 ON CONFLICT(order_id) DO NOTHING
+            ORDER BY p.created_at LIMIT 100 ON CONFLICT(order_id) WHERE is_current DO NOTHING
             """);
     }
 
     Optional<Issuance> find(UUID orderId) {
-        return jdbc.query("SELECT * FROM issuance_jobs WHERE order_id=?", MAPPER, orderId).stream().findFirst();
+        return jdbc.query("SELECT * FROM issuance_jobs WHERE order_id=? AND is_current", MAPPER, orderId).stream().findFirst();
     }
     Issuance lock(UUID id) {
         return jdbc.query("SELECT * FROM issuance_jobs WHERE id=? FOR UPDATE", MAPPER, id).stream().findFirst()

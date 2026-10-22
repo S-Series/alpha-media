@@ -41,6 +41,30 @@ public class PgClient {
         return send(HttpRequest.newBuilder(URI.create(settings.pgBaseUrl() + "/payments/" + p.id())).GET(), true);
     }
 
+    MockPgService.Cancellation cancel(Refund refund) throws IOException, InterruptedException {
+        return cancellation(HttpRequest.newBuilder(URI.create(settings.pgBaseUrl()+"/payments/"+refund.paymentId()+"/cancel"))
+            .header("Content-Type","application/json").header("Idempotency-Key",refund.id().toString())
+            .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(new MockPgController.Cancel(refund.amount(),refund.scenario())))),false).orElseThrow();
+    }
+    Optional<MockPgService.Cancellation> lookupCancellation(Refund refund) throws IOException, InterruptedException {
+        return cancellation(HttpRequest.newBuilder(URI.create(settings.pgBaseUrl()+"/payments/"+refund.paymentId()+"/cancellations/"+refund.id())).GET(),true);
+    }
+    private Optional<MockPgService.Cancellation> cancellation(HttpRequest.Builder request,boolean allowMissing) throws IOException,InterruptedException {
+        var response=http.send(request.timeout(Duration.ofMillis(settings.httpTimeoutMs()))
+            .header("Authorization","Bearer "+settings.apiKey()).header("X-Gateway-Token",gatewayToken).build(),HttpResponse.BodyHandlers.ofString());
+        if (allowMissing && response.statusCode()==404) return Optional.empty();
+        if (response.statusCode()>=500) throw new IOException("PG_CANCEL_UNAVAILABLE");
+        if (response.statusCode()!=200) throw new InvalidResult();
+        try {
+            var tree=mapper.readTree(response.body());
+            for (String field:new String[]{"amount","cancelledTotal"}) {
+                var value=tree.get(field);
+                if (value==null || !value.isIntegralNumber() || !value.canConvertToLong()) throw new InvalidResult();
+            }
+            return Optional.of(mapper.treeToValue(tree,MockPgService.Cancellation.class));
+        } catch (RuntimeException exception) { throw new InvalidResult(); }
+    }
+
     private Optional<PgResult> send(HttpRequest.Builder request, boolean allowMissing) throws IOException, InterruptedException {
         var response = http.send(request.timeout(Duration.ofMillis(settings.httpTimeoutMs()))
                 .header("Authorization", "Bearer " + settings.apiKey()).header("X-Gateway-Token", gatewayToken).build(),

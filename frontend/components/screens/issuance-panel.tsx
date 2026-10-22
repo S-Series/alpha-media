@@ -39,14 +39,15 @@ export default function IssuancePanel({ orderId, status }: { orderId: string; st
   const job = view?.issuance, profile = view?.profile;
   return <section className="home-panel">
     <h2>eSIM 발급</h2>
-    {status !== "PAID" && status !== "PAYMENT_PROCESSING" ? <p>결제가 승인되면 서버가 자동으로 발급을 요청합니다.</p> : <>
+    {status === "REFUND_PROCESSING" || status === "REFUNDED" ? <p>{status === "REFUNDED" ? "환불이 완료된 주문입니다." : "환불 확인 중입니다."} 발급 재시도는 중단됩니다.</p> :
+    status !== "PAID" && status !== "PAYMENT_PROCESSING" ? <p>결제가 승인되면 서버가 자동으로 발급을 요청합니다.</p> : <>
       <p aria-live="polite">{job ? issuanceStatus(job.status) : "발급 작업을 확인 중입니다."}</p>
       {job && <>
         <p>발급 요청번호: {job.id}<br />공급사 접수번호: {job.supplierOrderNo ?? "접수 확인 중"}</p>
         <p>접수한 설정: {job.simulation.scenario === "SUCCEED" ? "발급 성공" : "발급 실패"}
           {" · "}콜백 지연 {job.simulation.callbackDelayMs / 1000}초 · 총 {job.simulation.callbackCopies}회 전송</p>
         <p>공급사 확인 {job.checkCount}회 · 마지막 상태 변경 {kst(job.updatedAt)}</p>
-        {job.status === "FAILED" && <p role="alert">발급이 최종 실패했습니다. 결제는 승인 상태이며 운영자 이상 건에 등록됐습니다. 자동 환불은 아직 연결되지 않았습니다.</p>}
+        {job.status === "FAILED" && <p role="alert">발급이 최종 실패했습니다. 운영자가 상태를 확인한 뒤 재시도 또는 전액 환불을 접수할 수 있습니다.</p>}
         {job.status === "REVIEW_REQUIRED" && <p role="alert">자동 확인을 중단하고 운영자 확인 대상으로 남겼습니다. 새 발급 요청을 중복 생성하지 않습니다.</p>}
         {job.lastError && <p>확인 사유: {job.lastError}</p>}
       </>}

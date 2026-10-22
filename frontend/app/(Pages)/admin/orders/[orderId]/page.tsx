@@ -6,6 +6,7 @@ import { kst } from "@/lib/format";
 import { paymentStatus } from "@/lib/payments";
 import OrderSummary from "@/components/screens/order-summary";
 import { issuanceStatus } from "@/lib/issuance";
+import AdminOrderActions from "@/components/screens/admin-order-actions";
 
 export default function AdminOrderDetailPage(props: PageProps<"/admin/orders/[orderId]">) {
   return <><h1>운영자 주문 상세</h1><Suspense fallback={<p>주문 조회 중…</p>}><Detail {...props} /></Suspense></>;
@@ -40,7 +41,7 @@ async function Detail({ params }: PageProps<"/admin/orders/[orderId]">) {
         {profile && <p>발급 ICCID: {profile.iccid}</p>}
       </> : <p>아직 발급 작업이 없습니다.</p>}
     </section>
-    <p>설치·개통 추적과 환불·운영자 수동 조치는 아직 연결되지 않았습니다.</p>
+    <AdminOrderActions key={orderId} initial={result.data} />
     <form action={`/admin/orders/${orderId}`} method="get"><button type="submit">상태 다시 확인</button></form>
     <Link href="/admin/orders">주문 목록</Link>
   </>;

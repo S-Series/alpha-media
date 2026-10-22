@@ -1,0 +1,44 @@
+package service;
+
+import java.io.IOException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+@ConditionalOnProperty(name="payment.mock-enabled",havingValue="true")
+public class RefundWorker {
+    private static final Logger LOG=LoggerFactory.getLogger(RefundWorker.class);
+    private final RefundRepository refunds;
+    private final RefundService transitions;
+    private final PaymentSettings settings;
+    private final PgClient pg;
+    public RefundWorker(RefundRepository refunds,RefundService transitions,PaymentSettings settings,PgClient pg) {
+        this.refunds=refunds; this.transitions=transitions; this.settings=settings; this.pg=pg;
+    }
+    @Scheduled(fixedDelayString="${payment.worker-delay-ms}",initialDelayString="${payment.worker-delay-ms}")
+    public void tick() {
+        var next=refunds.claim(settings.leaseMs());
+        if (next.isEmpty()) return;
+        var claim=next.get();
+        try {
+            // 재시작과 응답 유실 뒤에도 같은 환불번호를 조회하고 취소한다.
+            var result=pg.lookupCancellation(claim.refund()).orElse(null);
+            if (result==null) {
+                if (claim.refund().attemptCount()>3) { transitions.uncertain(claim,true,"REFUND_RETRY_LIMIT_REACHED"); return; }
+                result=pg.cancel(claim.refund());
+            }
+            transitions.complete(claim,result);
+        } catch (IOException exception) {
+            transitions.uncertain(claim,false,"PG_CANCEL_RESULT_UNKNOWN");
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt(); transitions.uncertain(claim,false,"PG_CANCEL_INTERRUPTED");
+        } catch (PgClient.InvalidResult | OrderService.OrderException | org.springframework.dao.DataIntegrityViolationException exception) {
+            transitions.uncertain(claim,true,"PG_CANCEL_REQUIRES_REVIEW");
+        } catch (RuntimeException exception) {
+            LOG.warn("Refund {} will recover after lease expiry ({})",claim.refund().id(),exception.getClass().getSimpleName());
+        }
+    }
+}

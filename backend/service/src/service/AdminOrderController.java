@@ -19,9 +19,12 @@ public class AdminOrderController {
     private final OrderRepository orders;
     private final PaymentRepository payments;
     private final IssuanceService issuances;
+    private final RefundRepository refunds;
+    private final AdminActionRepository actions;
 
-    public AdminOrderController(OrderRepository orders, PaymentRepository payments, IssuanceService issuances) {
-        this.orders = orders; this.payments = payments; this.issuances = issuances;
+    public AdminOrderController(OrderRepository orders, PaymentRepository payments, IssuanceService issuances,
+            RefundRepository refunds,AdminActionRepository actions) {
+        this.orders = orders; this.payments = payments; this.issuances = issuances; this.refunds=refunds; this.actions=actions;
     }
 
     @GetMapping
@@ -31,7 +34,7 @@ public class AdminOrderController {
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
             @RequestParam(defaultValue = "false") boolean needsReview) {
         if (page < 0 || size < 1 || size > 100 || (status != null && !Set.of(
-                "PENDING_PAYMENT", "PAYMENT_PROCESSING", "PAID", "EXPIRED").contains(status))
+                "PENDING_PAYMENT", "PAYMENT_PROCESSING", "PAID", "EXPIRED","REFUND_PROCESSING","REFUNDED").contains(status))
                 || (simType != null && !Set.of("ESIM", "USIM").contains(simType))
                 || (from != null && to != null && from.isAfter(to))) {
             throw new OrderService.OrderException(400, "INVALID_FILTER", "페이지·상태·기간 필터를 확인해 주세요.");
@@ -45,9 +48,11 @@ public class AdminOrderController {
     ResponseEntity<Detail> detail(@PathVariable UUID orderId) {
         var order = orders.findForAdmin(orderId).orElseThrow(
                 () -> new OrderService.OrderException(404, "ORDER_NOT_FOUND", "주문을 찾을 수 없습니다."));
-        return ResponseEntity.ok().header("Cache-Control", "no-store").body(new Detail(order, payments.list(orderId), issuances.forOrder(orderId)));
+        return ResponseEntity.ok().header("Cache-Control", "no-store").body(new Detail(order, payments.list(orderId), issuances.forOrder(orderId),
+            refunds.find(orderId).orElse(null),actions.list(orderId),actions.events(orderId)));
     }
 
     public record Page(List<OrderRepository.AdminOrder> items, int page, int size, boolean hasNext) {}
-    public record Detail(OrderRepository.AdminOrder order, List<PaymentAttempt> payments, IssuanceService.View issuance) {}
+    public record Detail(OrderRepository.AdminOrder order, List<PaymentAttempt> payments, IssuanceService.View issuance,
+        Refund refund,List<AdminActionRepository.Action> actions,List<AdminActionRepository.Event> actionEvents) {}
 }

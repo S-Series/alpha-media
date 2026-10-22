@@ -15,8 +15,9 @@ public class IssuanceService {
     private final IssuanceRepository jobs;
     private final IssuanceSettings settings;
     private final ObjectMapper mapper;
-    public IssuanceService(OrderRepository orders, IssuanceRepository jobs, IssuanceSettings settings, ObjectMapper mapper) {
-        this.orders = orders; this.jobs = jobs; this.settings = settings; this.mapper = mapper;
+    private final AdminActionRepository actions;
+    public IssuanceService(OrderRepository orders, IssuanceRepository jobs, IssuanceSettings settings, ObjectMapper mapper,AdminActionRepository actions) {
+        this.orders = orders; this.jobs = jobs; this.settings = settings; this.mapper = mapper; this.actions=actions;
     }
 
     public View view(UUID memberId, UUID orderId) {
@@ -36,12 +37,15 @@ public class IssuanceService {
         try { order = orders.lock(result.orderId()); }
         catch (java.util.NoSuchElementException exception) { throw new OrderException(404, "ORDER_NOT_FOUND", "콜백의 주문을 찾을 수 없습니다."); }
         Issuance job = jobs.lock(result.requestId());
-        if (!job.orderId().equals(order.id()) || !"PAID".equals(order.status())
+        if (!job.orderId().equals(order.id())
                 || (job.supplierOrderNo() != null && !job.supplierOrderNo().equals(result.supplierOrderNo()))) {
             throw new OrderException(409, "SUPPLIER_RESULT_MISMATCH", "공급사 결과의 주문·발급 요청이 일치하지 않습니다.");
         }
         if (token != null && !jobs.owns(job.id(), token)) return;
         boolean terminal = List.of("ISSUED", "FAILED").contains(job.status());
+        if (!terminal && (!"PAID".equals(order.status()) || !jobs.find(order.id()).map(j -> j.id().equals(job.id())).orElse(false))) {
+            throw new OrderException(409,"SUPPLIER_RESULT_MISMATCH","현재 처리 중인 발급 요청이 아닙니다.");
+        }
         if (terminal && result.revision() >= job.revision()) {
             if (!job.status().equals(result.status())) throw new OrderException(409, "SUPPLIER_RESULT_CONFLICT", "이미 확정된 발급 결과와 다릅니다.");
             if ("ISSUED".equals(job.status())) {
@@ -59,6 +63,7 @@ public class IssuanceService {
         } else if (newEvent) {
             if ("ISSUED".equals(result.status())) jobs.insertProfile(result);
             jobs.save(job.id(), result.status(), result.supplierOrderNo(), 2, result.reason(), settings.pollMs());
+            actions.issuanceEvent(job.id(),result.status(),result.reason());
         }
     }
 
@@ -70,6 +75,7 @@ public class IssuanceService {
         boolean stop = review || current.checkCount() >= 6;
         jobs.save(current.id(), stop ? "REVIEW_REQUIRED" : "WAITING_CALLBACK", current.supplierOrderNo(),
             current.revision(), stop && !review ? "SUPPLIER_RETRY_LIMIT_REACHED" : reason, settings.pollMs());
+        if (stop) actions.issuanceEvent(current.id(),"REVIEW_REQUIRED",reason);
     }
 
     private String hash(SupplierResult result) {

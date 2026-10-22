@@ -6,12 +6,18 @@ export type Member = {
   createdAt: string;
 };
 
-export async function post(path: string, body?: string, contentType?: string,
-  extraHeaders: Record<string, string> = {}) {
+type CsrfToken = { headerName: string; token: string };
+
+export async function getCsrfToken(): Promise<CsrfToken> {
   // 로그인·로그아웃으로 토큰이 교체될 수 있으므로 변경 요청 전에 새로 조회한다.
   const csrfResponse = await fetch("/api/auth/csrf", { cache: "no-store", credentials: "same-origin" });
   if (!csrfResponse.ok) throw new Error("로그인 서버에 연결하지 못했습니다.");
-  const csrf: { headerName: string; token: string } = await csrfResponse.json();
+  return csrfResponse.json();
+}
+
+export async function post(path: string, body?: string, contentType?: string,
+  extraHeaders: Record<string, string> = {}, token?: CsrfToken) {
+  const csrf = token ?? await getCsrfToken();
   const headers: Record<string, string> = { ...extraHeaders, [csrf.headerName]: csrf.token };
   if (contentType) headers["Content-Type"] = contentType;
   const response = await fetch(path, {

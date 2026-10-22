@@ -61,27 +61,37 @@ public class MockPgService {
     }
 
     @Transactional
-    public Cancellation cancel(UUID id, UUID key, long amount) {
+    public CancelReply cancel(UUID id, UUID key, long amount, Refund.Scenario scenario) {
         var rows = jdbc.queryForList("SELECT * FROM mock_pg_payments WHERE payment_id=? FOR UPDATE", id);
         if (rows.isEmpty()) throw new OrderException(404, "PG_PAYMENT_NOT_FOUND", "PG 결제 기록이 없습니다.");
         var original = rows.getFirst();
         var existing = jdbc.query("SELECT * FROM mock_pg_cancellations WHERE payment_id=? AND idempotency_key=?",
-                (r, i) -> new Cancellation(r.getObject("id", UUID.class), r.getLong("amount"), r.getLong("cancelled_total")), id, key);
+                CANCELLATION, id, key);
         if (!existing.isEmpty()) {
             if (existing.getFirst().amount() != amount) throw new OrderException(409, "PG_CANCEL_CONFLICT", "같은 취소 키의 금액이 다릅니다.");
-            return existing.getFirst();
+            String storedScenario=jdbc.queryForObject("SELECT scenario FROM mock_pg_cancellations WHERE payment_id=? AND idempotency_key=?",String.class,id,key);
+            if (!scenario.name().equals(storedScenario)) throw new OrderException(409,"PG_CANCEL_CONFLICT","같은 취소 키의 시연 조건이 다릅니다.");
+            return new CancelReply(existing.getFirst(),false);
         }
+        if (scenario==Refund.Scenario.UNAVAILABLE) throw new OrderException(503,"MOCK_CANCEL_UNAVAILABLE","모의 PG 취소 장애입니다.");
         long total = ((Number) original.get("cancelled_amount")).longValue();
         long approved = ((Number) original.get("amount")).longValue();
         if (!"APPROVED".equals(original.get("status")) || amount <= 0 || amount > approved - total) {
             throw new OrderException(409, "PG_CANCEL_NOT_ALLOWED", "취소 가능한 잔액을 확인해 주세요.");
         }
         jdbc.update("UPDATE mock_pg_payments SET cancelled_amount=cancelled_amount+? WHERE payment_id=?", amount, id);
-        return jdbc.query("""
-                INSERT INTO mock_pg_cancellations(id,payment_id,idempotency_key,amount,cancelled_total)
-                VALUES(?,?,?,?,?) RETURNING *
-                """, (r, i) -> new Cancellation(r.getObject("id", UUID.class), r.getLong("amount"), r.getLong("cancelled_total")),
-                UUID.randomUUID(), id, key, amount, total + amount).getFirst();
+        var result=jdbc.query("""
+                INSERT INTO mock_pg_cancellations(id,payment_id,idempotency_key,amount,cancelled_total,scenario)
+                VALUES(?,?,?,?,?,?) RETURNING *
+                """, CANCELLATION,UUID.randomUUID(), id, key, amount, total + amount,scenario.name()).getFirst();
+        return new CancelReply(result,scenario==Refund.Scenario.RESPONSE_LOST);
+    }
+
+    static final RowMapper<Cancellation> CANCELLATION=(r,i) -> new Cancellation(r.getObject("id",UUID.class),
+        r.getObject("payment_id",UUID.class),r.getObject("idempotency_key",UUID.class),r.getLong("amount"),r.getLong("cancelled_total"));
+    public Cancellation cancellation(UUID id,UUID key) {
+        return jdbc.query("SELECT * FROM mock_pg_cancellations WHERE payment_id=? AND idempotency_key=?",CANCELLATION,id,key)
+            .stream().findFirst().orElseThrow(() -> new OrderException(404,"PG_CANCELLATION_NOT_FOUND","PG 취소 기록이 없습니다."));
     }
 
     public record Approval(@NotNull UUID paymentId, @NotNull UUID orderId, @Min(0) long amount,
@@ -89,5 +99,6 @@ public class MockPgService {
             @Min(0) @Max(20) int webhookCopies, @Min(0) @Max(60000) int webhookDelayMs) {}
     public record ApprovalReply(PgResult result, boolean loseResponse) {}
     public record Stats(int approvalRequests, int approvalExecutions, long cancelledAmount, int webhookSent, int webhookFailures) {}
-    public record Cancellation(UUID id, long amount, long cancelledTotal) {}
+    public record Cancellation(UUID id, UUID paymentId, UUID idempotencyKey, long amount, long cancelledTotal) {}
+    public record CancelReply(Cancellation result,boolean loseResponse) {}
 }
