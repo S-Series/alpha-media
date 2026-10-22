@@ -118,9 +118,9 @@ GATEWAY_REQUEST_TIMEOUT_MS=150000
 
 프론트엔드는 이 값을 바꾼 뒤 다시 빌드한다. Next.js rewrite가 같은 출처의 `/api/**`를 Gateway로 전달한다. `GATEWAY_REQUEST_TIMEOUT_MS`는 서버 조회와 rewrite 프록시의 대기 시간에 사용한다. 이 값은 사용하는 프론트엔드 호스팅의 최대 요청 시간도 넘지 않아야 한다.
 
-`FRONTEND_ORIGINS`는 현재 로컬 주소 2개다. 프론트엔드가 Gateway를 브라우저에서 직접 호출하는 경우 실제 HTTPS 출처도 추가한다. 현재처럼 Next.js rewrite를 거치는 서버 간 호출에는 브라우저 CORS가 적용되지 않는다.
+`FRONTEND_ORIGINS`에는 localhost와 127.0.0.1의 HTTP·HTTPS 개발 출처를 등록했다. 프론트엔드가 Gateway를 브라우저에서 직접 호출하는 경우 실제 HTTPS 출처도 추가한다. 현재처럼 Next.js rewrite를 거치는 서버 간 호출에는 브라우저 CORS가 적용되지 않는다.
 
-CI에서는 프론트엔드의 `npm run build`와 두 Maven `package`를 검증한다. CD는 Render Git 연동으로 실행한다. 무료 리소스 두 개와 환경변수를 준비한 뒤, 사용자 승인에 따라 배포 파일을 커밋·푸시한다.
+커밋 전에 프론트엔드의 `npm run build`와 두 Maven `package`를 검증했다. 별도 GitHub Actions 워크플로는 아직 없다. CD는 Render Git 연동으로 실행하며, 승인된 배포 파일은 `main`에 반영했다.
 
 ## 5 무료 플랜의 동작 범위
 
@@ -151,11 +151,31 @@ PASS logout invalidates Neon session
 PASS runtime price and role changes denied
 ```
 
-그 밖에 Service 직접 접근 차단, 위조된 내부 헤더 교체, 두 상태 확인 API, Render 공식 JSON Schema에 대한 Blueprint 검증, SQL의 JAR 포함을 확인했다. 검증용 회원·인증 세션은 삭제했다.
+추가로 Render에 Gateway·Service를 실제 배포하고 로컬 프론트엔드를 원격 Gateway에 연결해 22개 검증을 통과했다.
+
+```text
+Render Gateway Docker build: BUILD SUCCESS, live
+Render Service Docker build: BUILD SUCCESS, live
+PASS Gateway reads 3 Neon plans HTTP 200
+PASS direct Service blocked HTTP 403
+PASS signup persisted to Neon HTTP 201
+PASS duplicate signup HTTP 409
+PASS login HTTP 200, session ID rotation
+PASS Secure HttpOnly SameSite=Lax cookie
+PASS authenticated me HTTP 200, USER admin access HTTP 403
+PASS logout HTTP 204, logged-out me HTTP 401
+PASS Frontend -> Render -> Neon HTTP 200
+PASS gzip response headers match compressed body
+PASS 22 remote checks total
+```
+
+첫 원격 Gateway 요청은 압축 응답 처리 중 `HttpException`으로 502가 발생했다. HTTP 클라이언트의 자동 압축 해제를 끄고 압축 본문과 `Content-Encoding`을 함께 전달한 뒤 정상화됐다. HTTPS 인증서 검증과 공유 키 검사는 유지했다.
+
+두 상태 확인 API, Render 공식 CLI의 Blueprint 검증, SQL의 JAR 포함도 확인했다. 검증용 회원·인증 세션은 삭제했고, SQL에서 해당 회원이 0건인지 확인했다.
 
 `npm --prefix frontend run lint`도 통과했다. 루트 Neon 패키지를 추가한 뒤 발생한 중첩 `.next` 캐시가 lint에 포함되는 문제는 생성물 제외 경로를 `**/.next/**`로 조정해 해결했다.
 
-첫 `neon init`은 Copilot 플러그인 설치 오류가 있었고, 첫 JDBC 접속은 기본 LibPQFactory가 `root.crt`를 찾지 못해 실패했다. 추가 에이전트 설치를 건너뛰고 Java 기본 SSL Factory를 명시한 뒤 두 문제 모두 해결했다. Docker 실행 도구가 이 PC에 없어 실제 컨테이너 빌드·실행과 Render 원격 배포는 아직 검증하지 않았다. 두 Dockerfile에서 사용하는 Maven 빌드·JAR 실행은 로컬에서 확인했다.
+첫 `neon init`은 Copilot 플러그인 설치 오류가 있었고, 첫 JDBC 접속은 기본 LibPQFactory가 `root.crt`를 찾지 못해 실패했다. 추가 에이전트 설치를 건너뛰고 Java 기본 SSL Factory를 명시한 뒤 두 문제 모두 해결했다. Docker 실행 도구가 이 PC에 없어 로컬 컨테이너 실행은 생략했다. Render에서 두 Dockerfile의 실제 이미지 빌드 성공과 `/health` 200 응답을 확인했다.
 
 ## 공식 문서
 
