@@ -5,7 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { once } from "node:events";
-import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,9 +70,7 @@ async function until(check, timeout = 30000) {
 }
 
 async function startJava(name, env) {
-  const jar = join(root, "backend", name, "target", `${name}-0.0.1-SNAPSHOT.jar`);
-  const built = await stat(jar).catch(() => null);
-  assert.ok(built, `Build backend/${name} with Maven package first`);
+  const jar = join(directory, `${name}.jar`);
   const logPath = join(directory, `${name}.log`);
   const log = createWriteStream(logPath, { flags: "a" });
   const processChild = spawn("java", ["-jar", jar], {
@@ -168,6 +166,12 @@ async function member(name) {
 before(async () => {
   await mkdir(join(root, ".local"), { recursive: true });
   directory = await mkdtemp(join(root, ".local", "order-tests-"));
+  // Keep restarts on the same build if an editor or another task rebuilds target/.
+  for (const name of ["service", "gateway"]) {
+    const jar = join(root, "backend", name, "target", `${name}-0.0.1-SNAPSHOT.jar`);
+    assert.ok(await stat(jar).catch(() => null), `Build backend/${name} with Maven package first`);
+    await copyFile(jar, join(directory, `${name}.jar`));
+  }
   [dbPort, servicePort, gatewayPort] = await Promise.all([port(), port(), port()]);
   const passwordFile = join(directory, "password");
   await writeFile(passwordFile, secret, { mode: 0o600 });
@@ -311,13 +315,20 @@ test("invalid dates, missing products, USIM and malformed keys are rejected", as
 });
 
 test("price changes cannot alter saved snapshots or replay amounts", async () => {
-  sql("UPDATE plans SET price=79999, name='Changed plan' WHERE id='jp-esim-7d'");
-  const original = await (await alice.request(`/api/orders/${first.id}`)).json();
-  assert.equal(original.amount, 15900); assert.equal(original.planName, first.planName);
-  assert.equal((await (await alice.create(firstKey)).json()).amount, 15900);
-  const current = await (await alice.create()).json(); assert.equal(current.amount, 79999);
-  sql(`UPDATE orders SET amount=1 WHERE id='${first.id}'`, true, true);
-  sql(`UPDATE orders SET member_id='${bob.memberId}' WHERE id='${first.id}'`, true, true);
+  const restorePlan = sql(`SELECT format('UPDATE plans SET price=%L, name=%L WHERE id=%L', price, name, id)
+    FROM plans WHERE id='jp-esim-7d'`);
+  try {
+    sql("UPDATE plans SET price=79999, name='Changed plan' WHERE id='jp-esim-7d'");
+    const original = await (await alice.request(`/api/orders/${first.id}`)).json();
+    assert.equal(original.amount, 15900); assert.equal(original.planName, first.planName);
+    assert.equal((await (await alice.create(firstKey)).json()).amount, 15900);
+    const current = await (await alice.create()).json(); assert.equal(current.amount, 79999);
+    sql(`UPDATE orders SET amount=1 WHERE id='${first.id}'`, true, true);
+    sql(`UPDATE orders SET member_id='${bob.memberId}' WHERE id='${first.id}'`, true, true);
+  } finally {
+    // Later refund tests must see the original catalog even if an assertion fails.
+    sql(restorePlan);
+  }
 });
 
 test("pagination is bounded and does not repeat rows", async () => {
