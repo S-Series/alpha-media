@@ -10,6 +10,7 @@ import { kst, money } from "@/lib/format";
 import OrderSummary from "./order-summary";
 import AdminOrderTimeline from "./admin-order-timeline";
 import AdminConcurrencyDemo from "./admin-concurrency-demo";
+import AdminOrderRecovery from "./admin-order-recovery";
 
 type Draft = { key: string; path: string; body: string };
 const states: Record<string, string> = { REQUESTED: "환불 접수", QUEUED: "발급 재시도 접수", UNKNOWN: "PG 취소 결과 확인 중",
@@ -53,7 +54,8 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
         } catch { /* 저장할 수 없어도 같은 화면에서는 요청 키를 유지한다. */ }
         const active = ["REQUESTED", "PROCESSING", "UNKNOWN"].includes(data.refund?.status || "")
           || ["QUEUED", "PROCESSING", "WAITING_CALLBACK"].includes(data.issuance?.issuance?.status || "")
-          || (data.inboundEvents || []).some(event => ["PENDING", "PROCESSING", "RETRY"].includes(event.status));
+          || (data.inboundEvents || []).some(event => ["PENDING", "PROCESSING", "RETRY"].includes(event.status))
+          || (data.recoveryActions || []).some(action => ["QUEUED", "PROCESSING", "RETRY"].includes(action.status));
         timer = setTimeout(poll, active ? 1500 : 5000);
       } catch {
         if (!controller.signal.aborted) {
@@ -137,6 +139,7 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
       {(view.inboundEvents || []).length === 0 ? <p>아직 수신한 웹훅이 없습니다.</p> : view.inboundEvents?.map(event => <article key={event.id}>
         <h3>{inboundSources[event.source]} · {inboundStates[event.status]}</h3>
         <p>이벤트 번호: {event.eventId}<br />수신 기록번호: {event.id}<br />수신 {event.receiveCount}회 · 처리 시도 {event.attemptCount}회</p>
+        {event.executionRound !== undefined && <p>실행 회차 {event.executionRound} · 이번 회차 처리 시도 {event.roundAttemptCount ?? event.attemptCount}/6회</p>}
         <p>최초 수신: {kst(event.receivedAt)}<br />마지막 수신: {kst(event.lastReceivedAt)}<br />
           처리 완료: {event.processedAt ? kst(event.processedAt) : "미완료"}
           {event.nextAttemptAt && <><br />다음 처리 시각: {kst(event.nextAttemptAt)}</>}</p>
@@ -144,6 +147,8 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
         {event.status === "REVIEW_REQUIRED" && <p role="alert">자동 처리를 중단했습니다. 오류와 상충 결과를 확인해 주세요.</p>}
       </article>)}
     </section>
+    <AdminOrderRecovery orderId={id} items={view.recoveryTargets || []} actions={view.recoveryActions || []}
+      blocked={conflicts.length > 0} now={now} onRefresh={() => setRefresh(value => value + 1)} />
     <AdminOrderTimeline orderId={id} latest={view.timeline} />
     <section className="home-panel"><h2>운영자 조치</h2>
       <p>현재 주문: {orderStatus(view.order.order.status)} · 발급: {job ? issuanceStatus(job.status) : "작업 없음"}</p>

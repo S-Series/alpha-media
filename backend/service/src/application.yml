@@ -70,6 +70,11 @@ webhook:
   lease-ms: ${WEBHOOK_LEASE_MS:30000}
   retry-base-ms: ${WEBHOOK_RETRY_BASE_MS:1000}
 
+recovery:
+  worker-delay-ms: ${RECOVERY_WORKER_DELAY_MS:500}
+  lease-ms: ${RECOVERY_LEASE_MS:30000}
+  retry-base-ms: ${RECOVERY_RETRY_BASE_MS:1000}
+
 issuance:
   mock-enabled: ${MOCK_SUPPLIER_ENABLED:false}
   base-url: ${SUPPLIER_BASE_URL:http://127.0.0.1:${server.port}/internal/mock-supplier}

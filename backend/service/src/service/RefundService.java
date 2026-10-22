@@ -22,6 +22,15 @@ public class RefundService {
         Order order=orders.lock(claim.refund().orderId());
         Refund current=refunds.lock(claim.refund().id());
         if (!refunds.owns(current.id(),claim.token())) return;
+        apply(order,current,result);
+    }
+    @Transactional(noRollbackFor=OrderConflicts.ConflictException.class)
+    public void reconcile(Refund refund,MockPgService.Cancellation result) {
+        Order order=orders.lock(refund.orderId());
+        Refund current=refunds.lock(refund.id());
+        apply(order,current,result);
+    }
+    private void apply(Order order,Refund current,MockPgService.Cancellation result) {
         if (result==null || result.id()==null || !current.paymentId().equals(result.paymentId())
                 || !current.id().equals(result.idempotencyKey()) || current.amount()!=result.amount()
                 || current.amount()!=result.cancelledTotal() || !"REFUND_PROCESSING".equals(order.status())) {

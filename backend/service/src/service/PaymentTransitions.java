@@ -37,11 +37,14 @@ public class PaymentTransitions {
 
     @Transactional
     public boolean mayApprove(PaymentRepository.Claim claim) {
-        orders.lock(claim.payment().orderId());
-        payments.lock(claim.payment().id());
+        var order=orders.lock(claim.payment().orderId());
+        var payment=payments.lock(claim.payment().id());
         if (!payments.ownsLease(claim.payment().id(),claim.token())) return false;
         if (conflicts.blocked(claim.payment().orderId())) {
             uncertain(claim,true,"ORDER_RESULT_CONFLICT"); return false;
+        }
+        if (payment.executionRound()>1 && !order.expiresAt().isAfter(java.time.Instant.now())) {
+            uncertain(claim,true,"ORDER_PAYMENT_DEADLINE_PASSED"); return false;
         }
         return true;
     }

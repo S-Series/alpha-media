@@ -49,6 +49,7 @@ public class ProfileTrackingService {
         if (signal==null || !signal.valid()) throw new OrderService.OrderException(400,"INVALID_PROFILE_SIGNAL","프로필 신호 형식이 올바르지 않습니다.");
         try { orders.lock(signal.orderId()); }
         catch (java.util.NoSuchElementException e) { throw new OrderService.OrderException(404,"ORDER_NOT_FOUND","프로필 신호의 주문이 없습니다."); }
+        conflicts.requireClear(signal.orderId());
         var found=jdbc.queryForList("SELECT * FROM sim_profiles WHERE issuance_id=? FOR UPDATE",signal.requestId());
         if (found.isEmpty()) throw new OrderService.OrderException(404,"SIM_NOT_FOUND","발급된 SIM을 확인할 수 없습니다.");
         var row=found.getFirst(); UUID id=(UUID)row.get("id");

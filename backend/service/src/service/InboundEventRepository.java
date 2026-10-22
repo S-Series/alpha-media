@@ -15,7 +15,8 @@ public class InboundEventRepository {
     private static final RowMapper<Event> MAPPER = (r,i) -> new Event(r.getObject("id",UUID.class),
         r.getString("source"),r.getObject("event_id",UUID.class),r.getObject("target_id",UUID.class),
         r.getObject("order_id",UUID.class),r.getBytes("body"),r.getString("payload_hash"),
-        r.getString("status"),r.getInt("attempt_count"),r.getObject("lease_token",UUID.class));
+        r.getString("status"),r.getInt("attempt_count"),r.getObject("lease_token",UUID.class),
+        r.getInt("execution_round"),r.getInt("round_attempt_count"),r.getString("last_error"),r.getString("conflicting_payload_hash"));
     private final JdbcTemplate jdbc;
 
     public InboundEventRepository(JdbcTemplate jdbc) { this.jdbc=jdbc; }
@@ -28,6 +29,9 @@ public class InboundEventRepository {
     }
     Event lock(UUID id) {
         return jdbc.query("SELECT * FROM inbound_events WHERE id=? FOR UPDATE",MAPPER,id).getFirst();
+    }
+    Optional<Event> find(UUID id) {
+        return jdbc.query("SELECT * FROM inbound_events WHERE id=?",MAPPER,id).stream().findFirst();
     }
     Event lockByKey(String source,UUID eventId) {
         return jdbc.query("SELECT * FROM inbound_events WHERE source=? AND event_id=? FOR UPDATE",MAPPER,source,eventId).getFirst();
@@ -47,13 +51,14 @@ public class InboundEventRepository {
         // Reserve the attempt before processing; a crash consumes the same durable budget.
         return jdbc.query("""
             WITH due AS (
-                SELECT id,attempt_count>=? AS exhausted FROM inbound_events
+                SELECT id,round_attempt_count>=? AS exhausted FROM inbound_events
                 WHERE (status IN ('PENDING','RETRY') AND next_attempt_at<=clock_timestamp())
                     OR (status='PROCESSING' AND lease_until<=clock_timestamp())
                 ORDER BY next_attempt_at,id LIMIT 1 FOR UPDATE SKIP LOCKED
             ) UPDATE inbound_events e SET status='PROCESSING',lease_token=?,
                 lease_until=clock_timestamp()+(? * INTERVAL '1 millisecond'),
                 attempt_count=e.attempt_count + CASE WHEN due.exhausted THEN 0 ELSE 1 END
+                ,round_attempt_count=e.round_attempt_count + CASE WHEN due.exhausted THEN 0 ELSE 1 END
                 FROM due WHERE e.id=due.id RETURNING e.*,due.exhausted
             """,(r,i) -> new Claim(MAPPER.mapRow(r,i),r.getObject("lease_token",UUID.class),r.getBoolean("exhausted")),
             MAX_ATTEMPTS,UUID.randomUUID(),leaseMs).stream().findFirst();
@@ -72,27 +77,29 @@ public class InboundEventRepository {
     }
     void failed(Claim claim,boolean permanent,String code,int errorStatus,long delayMs) {
         jdbc.update("""
-            UPDATE inbound_events SET status=CASE WHEN ? OR attempt_count>=? THEN 'REVIEW_REQUIRED' ELSE 'RETRY' END,
-                last_error=?,error_status=?,next_attempt_at=CASE WHEN ? OR attempt_count>=? THEN NULL
+            UPDATE inbound_events SET status=CASE WHEN ? OR round_attempt_count>=? THEN 'REVIEW_REQUIRED' ELSE 'RETRY' END,
+                last_error=?,error_status=?,next_attempt_at=CASE WHEN ? OR round_attempt_count>=? THEN NULL
                     ELSE clock_timestamp()+(? * INTERVAL '1 millisecond') END,
                 lease_token=NULL,lease_until=NULL WHERE id=? AND status='PROCESSING' AND lease_token=?
             """,permanent,MAX_ATTEMPTS,code,errorStatus,permanent,MAX_ATTEMPTS,delayMs,claim.event().id(),claim.token());
     }
     List<View> forOrder(UUID orderId) {
         return jdbc.query("""
-            SELECT id,source,event_id,status,attempt_count,receive_count,received_at,last_received_at,
+            SELECT id,source,event_id,status,attempt_count,execution_round,round_attempt_count,receive_count,received_at,last_received_at,
                 processed_at,next_attempt_at,last_error,error_status
             FROM inbound_events WHERE order_id=? ORDER BY received_at DESC,id LIMIT 100
             """,(r,i) -> new View(r.getObject("id",UUID.class),r.getString("source"),r.getObject("event_id",UUID.class),
                 r.getString("status"),r.getInt("attempt_count"),r.getInt("receive_count"),r.getTimestamp("received_at").toInstant(),
                 r.getTimestamp("last_received_at").toInstant(),instant(r.getTimestamp("processed_at")),
-                instant(r.getTimestamp("next_attempt_at")),r.getString("last_error"),r.getObject("error_status",Integer.class)),orderId);
+                instant(r.getTimestamp("next_attempt_at")),r.getString("last_error"),r.getObject("error_status",Integer.class),
+                r.getInt("execution_round"),r.getInt("round_attempt_count")),orderId);
     }
     private static Instant instant(Timestamp value) { return value==null?null:value.toInstant(); }
 
     record Event(UUID id,String source,UUID eventId,UUID targetId,UUID orderId,byte[] body,String payloadHash,
-        String status,int attemptCount,UUID leaseToken) {}
+        String status,int attemptCount,UUID leaseToken,int executionRound,int roundAttemptCount,String lastError,String conflictingPayloadHash) {}
     record Claim(Event event,UUID token,boolean exhausted) {}
     public record View(UUID id,String source,UUID eventId,String status,int attemptCount,int receiveCount,
-        Instant receivedAt,Instant lastReceivedAt,Instant processedAt,Instant nextAttemptAt,String lastError,Integer errorStatus) {}
+        Instant receivedAt,Instant lastReceivedAt,Instant processedAt,Instant nextAttemptAt,String lastError,Integer errorStatus,
+        int executionRound,int roundAttemptCount) {}
 }

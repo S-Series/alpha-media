@@ -118,6 +118,7 @@ function startService(extra = {}) {
     ISSUANCE_WORKER_DELAY_MS: "100", SUPPLIER_COMPLETION_DELAY_MS: "200",
     PAYMENT_WORKER_DELAY_MS: "100", WEBHOOK_WORKER_DELAY_MS: "50", WEBHOOK_LEASE_MS: "3000",
     WEBHOOK_RETRY_BASE_MS: "100", WEBHOOK_INBOX_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
+    RECOVERY_WORKER_DELAY_MS: "100", RECOVERY_LEASE_MS: "1200", RECOVERY_RETRY_BASE_MS: "100",
     ...accountHashes, ...extra });
 }
 
@@ -2281,4 +2282,437 @@ test("scenario generator cannot create data when either mock provider is disable
     assert.equal(sql("SELECT count(*) FROM orders"), count);
   }
   await restart();
+});
+
+function recoveryRow(id) {
+  const value = sql(`SELECT row_to_json(a) FROM recovery_actions a WHERE id='${id}'`);
+  return value ? JSON.parse(value) : null;
+}
+
+async function recoveryDetail(orderId) {
+  const response = await admin.request(`/api/admin/orders/${orderId}`);
+  assert.equal(response.status, 200); return response.json();
+}
+
+async function recoveryTarget(orderId, kind, id) {
+  const detail = await recoveryDetail(orderId);
+  const target = detail.recoveryTargets.find(target => target.kind === kind && (!id || target.id === id));
+  assert.ok(target, `missing ${kind} recovery target for ${orderId}`); return target;
+}
+
+function recoveryRequest(target, overrides = {}) {
+  return { target: target.kind, targetId: target.id, expectedVersion: target.version,
+    reason: "운영자 확인 후 같은 외부 요청번호로 복구", ...overrides };
+}
+
+async function recoveryAction(orderId, path, body, key = randomUUID(), client = admin) {
+  return adminAction(orderId, path, body, key, client);
+}
+
+async function recoveryPoster(orderId, path, body, client = admin) {
+  // Create a session's new CSRF token once before racing the actual operator mutations.
+  const csrf = await client.csrf();
+  return (key = randomUUID()) => client.request(`/api/admin/orders/${orderId}/${path}`, { method: "POST",
+    headers: { ...csrf, "Idempotency-Key": key }, body });
+}
+
+async function reconcile(orderId, target, client = admin) {
+  const response = await recoveryAction(orderId, "reconciliations", recoveryRequest(target), randomUUID(), client);
+  assert.equal(response.status, 202);
+  const { action } = await response.json(); assert.ok(action.id);
+  await until(() => ["SUCCEEDED", "REVIEW_REQUIRED", "STALE"].includes(recoveryRow(action.id)?.status));
+  return recoveryRow(action.id);
+}
+
+async function resumeRecovery(orderId, target, evidence, key = randomUUID(), client = admin) {
+  return recoveryAction(orderId, "recoveries", recoveryRequest(target, { evidenceId: evidence.id }), key, client);
+}
+
+async function reviewPayment(approved = false, extra = {}) {
+  await restart({ ...inboxOnly, ...extra });
+  const order = await newOrder(), response = await alice.pay(order.id);
+  assert.equal(response.status, 202); const attempt = await response.json();
+  // Automatic exhaustion is covered above; isolate operator recovery from background claim races.
+  sql(`UPDATE payment_attempts SET status='REVIEW_REQUIRED',attempt_count=6,round_attempt_count=6,
+    last_error='RETRY_LIMIT_REACHED',lease_token=NULL,lease_until=NULL WHERE id='${attempt.id}'`);
+  if (approved) {
+    const result = await pg("/payments/approve", { paymentId: attempt.id, orderId: order.id,
+      amount: order.amount, currency: "KRW", scenario: "APPROVE", webhookCopies: 0, webhookDelayMs: 0 });
+    assert.equal(result.status, 200);
+  }
+  return { order, attempt, target: await recoveryTarget(order.id, "PAYMENT", attempt.id) };
+}
+
+test("operator recovery requires administrator, CSRF, a reason, a current target and explicit evidence", { timeout: 45000 }, async () => {
+  const { order, target } = await reviewPayment();
+  const body = recoveryRequest(target), path = `/api/admin/orders/${order.id}/reconciliations`;
+  assert.equal((await recoveryAction(order.id, "reconciliations", body, randomUUID(), new Client())).status, 401);
+  assert.equal((await recoveryAction(order.id, "reconciliations", body, randomUUID(), alice)).status, 403);
+  assert.equal((await admin.request(path, { method: "POST", headers: { "Idempotency-Key": randomUUID() }, body })).status, 403);
+  assert.equal((await recoveryAction(order.id, "reconciliations", { ...body, reason: " " })).status, 400);
+  assert.equal((await recoveryAction(order.id, "reconciliations", { ...body, expectedVersion: "bad" })).status, 400);
+  assert.equal((await recoveryAction(order.id, "recoveries", body)).status, 400);
+  const other = await newOrder();
+  const crossOrder = await recoveryAction(other.id, "reconciliations", body);
+  assert.ok([404, 409].includes(crossOrder.status));
+  assert.equal(sql(`SELECT count(*) FROM recovery_actions WHERE order_id='${order.id}'`), "0");
+  await restart();
+});
+
+test("operator recovery twenty identical queries survive restart and apply a PG approval once without reapproving", { timeout: 60000 }, async () => {
+  const proxy = await providerProxy("mock-pg");
+  try {
+    const { order, attempt, target } = await reviewPayment(true, { MOCK_PG_BASE_URL: proxy.url, RECOVERY_WORKER_DELAY_MS: "60000" });
+    const key = randomUUID(), body = recoveryRequest(target);
+    const post = await recoveryPoster(order.id, "reconciliations", body);
+    const responses = await Promise.all(Array.from({ length: 20 }, () => post(key)));
+    assert.equal(responses.filter(response => response.status === 202).length, 1);
+    assert.equal(responses.filter(response => response.status === 200).length, 19);
+    const results = await Promise.all(responses.map(response => response.json()));
+    const actionId = results[0].action.id;
+    assert.equal(new Set(results.map(result => result.action.id)).size, 1);
+    assert.equal(recoveryRow(actionId).status, "QUEUED");
+    assert.equal(proxy.forId(attempt.id).length, 0);
+    const changed = await recoveryAction(order.id, "reconciliations", { ...body, reason: "다른 조치 사유" }, key);
+    assert.equal(changed.status, 409); assert.equal((await changed.json()).code, "RECOVERY_KEY_CONFLICT");
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url });
+    await until(() => recoveryRow(actionId).status === "SUCCEEDED");
+    const action = recoveryRow(actionId);
+    assert.equal(action.outcome, "APPLIED"); assert.equal(action.attempt_count, 1);
+    assert.equal(orderState(order.id), "PAID");
+    assert.ok(proxy.forId(attempt.id).every(call => call.method === "GET"));
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    const replay = await recoveryAction(order.id, "reconciliations", body, key);
+    assert.equal(replay.status, 200); assert.equal((await replay.json()).action.id, actionId);
+    const detail = await recoveryDetail(order.id);
+    assert.ok(detail.recoveryActions.some(item => item.id === actionId && item.reason === body.reason));
+    assert.ok(sql(`SELECT actor FROM order_history WHERE target_id='${actionId}' LIMIT 1`).includes("admin"));
+    sql(`UPDATE recovery_actions SET reason='rewritten' WHERE id='${actionId}'`, true, true);
+    sql(`DELETE FROM recovery_actions WHERE id='${actionId}'`, true, true);
+    sql(`UPDATE recovery_action_events SET status='STALE' WHERE action_id='${actionId}'`, true, true);
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("operator recovery different keys from two operators accept only one active query", { timeout: 45000 }, async () => {
+  const { order, target } = await reviewPayment(false, { RECOVERY_WORKER_DELAY_MS: "60000" });
+  const second = await member("admin2"), body = recoveryRequest(target);
+  const posts = await Promise.all([admin, second].map(client => recoveryPoster(order.id, "reconciliations", body, client)));
+  const responses = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+    posts[index % 2]()));
+  assert.equal(responses.filter(response => response.status === 202).length, 1);
+  assert.equal(responses.filter(response => response.status === 409).length, 19);
+  for (const response of responses.filter(response => response.status === 409)) {
+    assert.ok(["RECOVERY_IN_PROGRESS", "STALE_RECOVERY_TARGET"].includes((await response.json()).code));
+  }
+  assert.equal(sql(`SELECT count(*) FROM recovery_actions WHERE order_id='${order.id}'`), "1");
+  const accepted = await responses.find(response => response.status === 202).json();
+  await restart(inboxOnly);
+  await until(() => recoveryRow(accepted.action.id).status === "SUCCEEDED");
+  assert.equal(recoveryRow(accepted.action.id).outcome, "RESUME_ALLOWED");
+  assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_payments WHERE payment_id='${target.id}'`), "0");
+  await restart();
+});
+
+test("operator recovery query DB failures roll back business writes and preserve a three-attempt budget across restart", { timeout: 60000 }, async () => {
+  const proxy = await providerProxy("mock-pg"); let restore;
+  try {
+    const { order, attempt, target } = await reviewPayment(true, { MOCK_PG_BASE_URL: proxy.url, RECOVERY_RETRY_BASE_MS: "1500" });
+    restore = rejectTransitions("payment_attempts", order.id, ["APPROVED"]);
+    const response = await recoveryAction(order.id, "reconciliations", recoveryRequest(target));
+    assert.equal(response.status, 202); const { action } = await response.json();
+    await until(() => recoveryRow(action.id).status === "RETRY");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    const priorCount = recoveryRow(action.id).attempt_count;
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url, RECOVERY_RETRY_BASE_MS: "100" });
+    await until(() => recoveryRow(action.id).status === "REVIEW_REQUIRED");
+    assert.equal(recoveryRow(action.id).attempt_count, 3); assert.ok(priorCount >= 1);
+    const calls = proxy.forId(attempt.id).length;
+    assert.equal(calls, 3); assert.ok(proxy.forId(attempt.id).every(call => call.method === "GET"));
+    restore(); restore = null;
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url }); await delay(500);
+    assert.equal(recoveryRow(action.id).attempt_count, 3); assert.equal(proxy.forId(attempt.id).length, calls);
+    const recovered = await reconcile(order.id, await recoveryTarget(order.id, "PAYMENT"));
+    assert.equal(recovered.outcome, "APPLIED"); assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+  } finally { if (restore) restore(); await restart(); await proxy.close(); }
+});
+
+test("operator recovery provider outages exhaust queries without resuming or resetting the payment budget", { timeout: 45000 }, async () => {
+  const proxy = await providerProxy("mock-pg"); proxy.intercept = () => ({ status: 503 });
+  try {
+    const { order, attempt, target } = await reviewPayment(false, { MOCK_PG_BASE_URL: proxy.url });
+    const action = await reconcile(order.id, target);
+    assert.equal(action.status, "REVIEW_REQUIRED"); assert.equal(action.attempt_count, 3);
+    assert.equal(proxy.forId(attempt.id).length, 3);
+    assert.ok(proxy.forId(attempt.id).every(call => call.method === "GET"));
+    assert.equal(sql(`SELECT attempt_count||':'||round_attempt_count||':'||execution_round FROM payment_attempts WHERE id='${attempt.id}'`), "6:6:1");
+    assert.equal((await resumeRecovery(order.id, await recoveryTarget(order.id, "PAYMENT"), action)).status, 409);
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "0");
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("operator recovery concurrent resume reuses the payment ID and opens exactly one bounded execution round", { timeout: 60000 }, async () => {
+  const { order, attempt, target } = await reviewPayment();
+  const evidence = await reconcile(order.id, target);
+  assert.equal(evidence.outcome, "RESUME_ALLOWED");
+  const current = await recoveryTarget(order.id, "PAYMENT"), key = randomUUID();
+  const post = await recoveryPoster(order.id, "recoveries", recoveryRequest(current, { evidenceId: evidence.id }));
+  const responses = await Promise.all(Array.from({ length: 20 }, () => post(key)));
+  assert.equal(responses.filter(response => response.status === 202).length, 1);
+  assert.equal(responses.filter(response => response.status === 200).length, 19);
+  const results = await Promise.all(responses.map(response => response.json()));
+  assert.equal(new Set(results.map(result => result.action.id)).size, 1);
+  const action = recoveryRow(results[0].action.id);
+  assert.equal(action.from_round, 1); assert.equal(action.to_round, 2);
+  assert.equal(sql(`SELECT attempt_count||':'||round_attempt_count||':'||execution_round FROM payment_attempts WHERE id='${attempt.id}'`), "6:0:2");
+  assert.equal(sql(`SELECT count(*) FROM payment_attempts WHERE order_id='${order.id}'`), "1");
+  await restart({ ISSUANCE_WORKER_DELAY_MS: "60000" }); await settled(order, attempt);
+  assert.equal(sql(`SELECT attempt_count||':'||round_attempt_count||':'||execution_round FROM payment_attempts WHERE id='${attempt.id}'`), "7:1:2");
+  assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+  await restart();
+});
+
+test("operator recovery stale and expired evidence cannot resume a payment and missing evidence cannot create an action", { timeout: 45000 }, async () => {
+  const { order, target } = await reviewPayment();
+  const evidence = await reconcile(order.id, target);
+  sql(`UPDATE payment_attempts SET last_error='NEW_OPERATOR_OBSERVATION' WHERE id='${target.id}'`);
+  const stale = await resumeRecovery(order.id, target, evidence);
+  assert.equal(stale.status, 409); assert.equal((await stale.json()).code, "STALE_RECOVERY_TARGET");
+  const current = await recoveryTarget(order.id, "PAYMENT"), fresh = await reconcile(order.id, current);
+  sql(`UPDATE recovery_actions SET checked_at=clock_timestamp()-INTERVAL '61 seconds' WHERE id='${fresh.id}'`);
+  const expired = await resumeRecovery(order.id, await recoveryTarget(order.id, "PAYMENT"), fresh);
+  assert.equal(expired.status, 409); assert.equal((await expired.json()).code, "RECOVERY_EVIDENCE_EXPIRED");
+  assert.equal((await recoveryAction(order.id, "recoveries", recoveryRequest(current))).status, 400);
+  assert.equal(sql(`SELECT count(*) FROM recovery_actions WHERE order_id='${order.id}' AND kind='RESUME'`), "0");
+  assert.equal(sql(`SELECT execution_round FROM payment_attempts WHERE id='${target.id}'`), "1");
+  await restart();
+});
+
+test("operator recovery cannot start a new PG approval after the order payment deadline", { timeout: 45000 }, async () => {
+  const { order, attempt } = await reviewPayment(); expire(order.id);
+  const target = await recoveryTarget(order.id, "PAYMENT"), evidence = await reconcile(order.id, target);
+  assert.equal(evidence.outcome, "BLOCKED");
+  assert.equal((await resumeRecovery(order.id, await recoveryTarget(order.id, "PAYMENT"), evidence)).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "0");
+  assert.equal(sql(`SELECT execution_round FROM payment_attempts WHERE id='${attempt.id}'`), "1");
+  await restart();
+});
+
+test("operator recovery a queued query becomes stale when the target changes before its worker starts", { timeout: 45000 }, async () => {
+  const proxy = await providerProxy("mock-pg");
+  try {
+    const { order, attempt, target } = await reviewPayment(true, { MOCK_PG_BASE_URL: proxy.url, RECOVERY_WORKER_DELAY_MS: "60000" });
+    const response = await recoveryAction(order.id, "reconciliations", recoveryRequest(target));
+    assert.equal(response.status, 202); const { action } = await response.json();
+    sql(`UPDATE payment_attempts SET last_error='NEW_OPERATOR_OBSERVATION' WHERE id='${attempt.id}'`);
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url });
+    await until(() => recoveryRow(action.id).status === "STALE");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    assert.ok(proxy.forId(attempt.id).every(call => call.method === "GET"));
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("operator recovery refund resumes preserve one refund ID and stop after three rounds of three attempts", { timeout: 60000 }, async () => {
+  await restart();
+  const { order, attempt, job } = await failedOrder();
+  assert.equal((await adminAction(order.id, "refunds", refundRequest(job, "UNAVAILABLE"))).status, 202);
+  await until(() => refundRow(order.id)?.status === "REVIEW_REQUIRED");
+  const refundId = refundRow(order.id).id;
+  for (let round = 1; round <= 3; round++) {
+    const row = refundRow(order.id);
+    assert.equal(row.id, refundId); assert.equal(row.execution_round, round);
+    assert.equal(row.attempt_count, round * 3); assert.equal(row.round_attempt_count, 3);
+    const target = await recoveryTarget(order.id, "REFUND", refundId), evidence = await reconcile(order.id, target);
+    assert.equal(evidence.outcome, "RESUME_ALLOWED");
+    const response = await resumeRecovery(order.id, await recoveryTarget(order.id, "REFUND", refundId), evidence);
+    if (round === 3) {
+      assert.equal(response.status, 409); assert.equal((await response.json()).code, "RECOVERY_ROUND_LIMIT");
+    } else {
+      assert.equal(response.status, 202);
+      await until(() => refundRow(order.id)?.status === "REVIEW_REQUIRED");
+    }
+  }
+  await restart(); assert.equal(refundRow(order.id).attempt_count, 9);
+  assert.equal(sql(`SELECT count(*) FROM refunds WHERE order_id='${order.id}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM recovery_actions WHERE order_id='${order.id}' AND kind='RESUME'`), "2");
+});
+
+test("operator recovery supplier lookup and resume keep the same issuance request and lifetime submission count", { timeout: 60000 }, async () => {
+  await restart({ ISSUANCE_WORKER_DELAY_MS: "60000" });
+  const { order, job } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+  sql(`UPDATE issuance_jobs SET status='REVIEW_REQUIRED',check_count=6,consecutive_failures=6,submission_count=6,
+    round_submission_count=6,last_error='SUPPLIER_RETRY_LIMIT_REACHED',
+    lease_token=NULL,lease_until=NULL WHERE id='${job.id}'`);
+  const target = await recoveryTarget(order.id, "ISSUANCE", job.id), evidence = await reconcile(order.id, target);
+  assert.equal(evidence.outcome, "RESUME_ALLOWED");
+  assert.equal((await resumeRecovery(order.id, await recoveryTarget(order.id, "ISSUANCE", job.id), evidence)).status, 202);
+  let resumed = issuanceRow(order.id);
+  assert.equal(resumed.id, job.id); assert.equal(resumed.execution_round, 2);
+  assert.equal(resumed.submission_count, 6); assert.equal(resumed.round_submission_count, 0);
+  await restart(); await until(() => issuanceRow(order.id).status === "ISSUED");
+  resumed = issuanceRow(order.id);
+  assert.equal(resumed.id, job.id); assert.equal(resumed.submission_count, 7);
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM mock_supplier_orders WHERE request_id='${job.id}'`), "1");
+});
+
+test("operator recovery inbox replay retains encrypted evidence and stops at six attempts in each of three rounds", { timeout: 60000 }, async () => {
+  await restart(inboxOnly); const { order, attempt, result } = await pendingWebhookPayment(); let restore;
+  try {
+    restore = rejectTransitions("payment_attempts", order.id, ["APPROVED"]);
+    const response = await notify(result); assert.equal(response.status, 202);
+    const receipt = await response.json();
+    await until(() => inboundRow(receipt.id).status === "REVIEW_REQUIRED");
+    const original = inboundRow(receipt.id);
+    for (let round = 1; round <= 3; round++) {
+      const row = inboundRow(receipt.id);
+      assert.equal(row.attempt_count, round * 6); assert.equal(row.round_attempt_count, 6);
+      assert.equal(row.execution_round, round); assert.equal(row.body, original.body);
+      assert.equal(row.payload_hash, original.payload_hash);
+      const target = await recoveryTarget(order.id, "INBOUND", receipt.id), evidence = await reconcile(order.id, target);
+      assert.equal(evidence.outcome, "REPLAY_ALLOWED");
+      const response = await resumeRecovery(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id), evidence);
+      if (round === 3) {
+        assert.equal(response.status, 409); assert.equal((await response.json()).code, "RECOVERY_ROUND_LIMIT");
+      } else {
+        assert.equal(response.status, 202);
+        await until(() => inboundRow(receipt.id).status === "REVIEW_REQUIRED");
+      }
+    }
+    restore(); restore = null;
+    await restart(inboxOnly); await delay(500);
+    assert.equal(inboundRow(receipt.id).attempt_count, 18);
+    assert.equal(inboundRow(receipt.id).status, "REVIEW_REQUIRED");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+  } finally { if (restore) restore(); await restart(); }
+});
+
+test("operator recovery never clears conflicting evidence or applies a contradictory approval", { timeout: 45000 }, async () => {
+  const { order, attempt } = await reviewPayment(true);
+  const result = await (await pg(`/payments/${attempt.id}`)).json();
+  await webhookOutcome(notify({ ...result, eventId: randomUUID(), amount: result.amount + 1 }), 409);
+  const conflictCount = sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`);
+  assert.equal(conflictCount, "1");
+  const target = await recoveryTarget(order.id, "PAYMENT"), action = await reconcile(order.id, target);
+  assert.equal(action.outcome, "BLOCKED");
+  assert.equal((await resumeRecovery(order.id, await recoveryTarget(order.id, "PAYMENT"), action)).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), conflictCount);
+  assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+  assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+  await restart();
+});
+
+test("operator recovery two operators with different keys cannot both reopen the same execution round", { timeout: 45000 }, async () => {
+  const { order, attempt, target } = await reviewPayment();
+  const evidence = await reconcile(order.id, target), current = await recoveryTarget(order.id, "PAYMENT");
+  const second = await member("admin2");
+  const body = recoveryRequest(current, { evidenceId: evidence.id });
+  const posts = await Promise.all([admin, second].map(client => recoveryPoster(order.id, "recoveries", body, client)));
+  const responses = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+    posts[index % 2]()));
+  assert.equal(responses.filter(response => response.status === 202).length, 1);
+  assert.equal(responses.filter(response => response.status === 409).length, 19);
+  assert.equal(sql(`SELECT count(*) FROM recovery_actions WHERE order_id='${order.id}' AND kind='RESUME'`), "1");
+  assert.equal(sql(`SELECT attempt_count||':'||round_attempt_count||':'||execution_round FROM payment_attempts WHERE id='${attempt.id}'`), "6:0:2");
+  await restart(); await settled(order, attempt);
+  assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+});
+
+test("operator recovery resolves an already cancelled refund by lookup without a second cancellation", { timeout: 60000 }, async () => {
+  await restart();
+  const { order, attempt, job } = await failedOrder();
+  await restart(inboxOnly);
+  assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 202);
+  const refund = refundRow(order.id);
+  sql(`UPDATE refunds SET status='REVIEW_REQUIRED',attempt_count=3,round_attempt_count=3,
+    last_error='REFUND_RETRY_LIMIT_REACHED',lease_token=NULL,lease_until=NULL WHERE id='${refund.id}'`);
+  const cancellation = await pg(`/payments/${attempt.id}/cancel`, { amount: order.amount, scenario: "SUCCESS" }, refund.id);
+  assert.equal(cancellation.status, 200);
+  const target = await recoveryTarget(order.id, "REFUND", refund.id), evidence = await reconcile(order.id, target);
+  assert.equal(evidence.outcome, "APPLIED");
+  assert.equal(refundRow(order.id).status, "SUCCEEDED"); assert.equal(orderState(order.id), "REFUNDED");
+  assert.equal(refundRow(order.id).attempt_count, 3); assert.equal(refundRow(order.id).execution_round, 1);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM admin_action_events e JOIN admin_actions a ON a.id=e.action_id
+    WHERE a.order_id='${order.id}' AND e.status='SUCCEEDED'`), "1");
+  await restart();
+});
+
+test("operator recovery payment resumed before expiry cannot approve after its queued work crosses the deadline", { timeout: 45000 }, async () => {
+  const { order, attempt, target } = await reviewPayment();
+  const evidence = await reconcile(order.id, target);
+  assert.equal((await resumeRecovery(order.id, await recoveryTarget(order.id, "PAYMENT"), evidence)).status, 202);
+  expire(order.id);
+  await restart(); await settled(order, attempt, "REVIEW_REQUIRED");
+  assert.equal((await payment(order.id, attempt.id)).lastError, "ORDER_PAYMENT_DEADLINE_PASSED");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "0");
+  assert.equal(sql(`SELECT execution_round FROM payment_attempts WHERE id='${attempt.id}'`), "2");
+  assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+});
+
+test("operator recovery a webhook can complete while provider lookup is in flight and makes the old query stale", { timeout: 45000 }, async () => {
+  const proxy = await providerProxy("mock-pg"); let release;
+  try {
+    const { order, attempt, target } = await reviewPayment(true, { MOCK_PG_BASE_URL: proxy.url,
+      PG_HTTP_TIMEOUT_MS: "5000", PAYMENT_LEASE_MS: "12000", RECOVERY_LEASE_MS: "12000" });
+    let entered = false;
+    const barrier = new Promise(resolve => { release = resolve; });
+    proxy.intercept = async call => {
+      if (call.method === "GET" && call.path.endsWith(`/payments/${attempt.id}`)) {
+        entered = true; await barrier;
+      }
+      return null;
+    };
+    const response = await recoveryAction(order.id, "reconciliations", recoveryRequest(target));
+    assert.equal(response.status, 202); const { action } = await response.json();
+    await until(() => entered);
+    const result = await (await pg(`/payments/${attempt.id}`)).json();
+    await webhookOutcome(notify(result));
+    assert.equal(orderState(order.id), "PAID");
+    release();
+    await until(() => recoveryRow(action.id).status === "STALE");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+  } finally { release?.(); await restart(); await proxy.close(); }
+});
+
+test("operator recovery completion and error-recording DB failures cannot reset the lookup budget after restart", { timeout: 60000 }, async () => {
+  const proxy = await providerProxy("mock-pg"); let restore;
+  try {
+    const { order, attempt, target } = await reviewPayment(true, { MOCK_PG_BASE_URL: proxy.url });
+    sql(`CREATE FUNCTION reject_recovery_for_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.order_id='${order.id}' AND NEW.status IN ('SUCCEEDED','RETRY','REVIEW_REQUIRED','STALE')
+        THEN RAISE EXCEPTION 'simulated recovery recording failure'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER reject_recovery_for_test BEFORE UPDATE ON recovery_actions
+        FOR EACH ROW EXECUTE FUNCTION reject_recovery_for_test();`);
+    restore = () => sql("DROP TRIGGER reject_recovery_for_test ON recovery_actions; DROP FUNCTION reject_recovery_for_test();");
+    const response = await recoveryAction(order.id, "reconciliations", recoveryRequest(target));
+    assert.equal(response.status, 202); const { action } = await response.json();
+    await until(() => proxy.forId(attempt.id).length === 1); await delay(250);
+    assert.equal(recoveryRow(action.id).status, "PROCESSING");
+    await restart({ ...inboxOnly, MOCK_PG_BASE_URL: proxy.url });
+    await until(() => recoveryRow(action.id).attempt_count === 3);
+    await delay(1500);
+    const calls = proxy.forId(attempt.id).length;
+    assert.ok(calls > 0 && calls <= 3);
+    assert.equal(recoveryRow(action.id).status, "PROCESSING");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+    restore(); restore = null;
+    await until(() => recoveryRow(action.id).status === "REVIEW_REQUIRED");
+    assert.equal(recoveryRow(action.id).attempt_count, 3);
+    await delay(1500); assert.equal(proxy.forId(attempt.id).length, calls);
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+  } finally { if (restore) restore(); await restart(); await proxy.close(); }
 });

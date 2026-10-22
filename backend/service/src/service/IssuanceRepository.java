@@ -96,7 +96,7 @@ public class IssuanceRepository {
         if (accepted) jdbc.update("UPDATE issuance_jobs SET next_check_at=LEAST(next_check_at,waiting_since+INTERVAL '2 minutes') WHERE id=?",id);
     }
     boolean reserveSubmission(UUID id) {
-        return jdbc.update("UPDATE issuance_jobs SET submission_count=submission_count+1 WHERE id=? AND submission_count<6",id)==1;
+        return jdbc.update("UPDATE issuance_jobs SET submission_count=submission_count+1,round_submission_count=round_submission_count+1 WHERE id=? AND round_submission_count<6",id)==1;
     }
     boolean supplierReferenceUsedByAnother(SupplierResult result) {
         return Boolean.TRUE.equals(jdbc.queryForObject("""

@@ -36,7 +36,7 @@ public class InboundEventWorker {
         }
     }
     private void failed(InboundEventRepository.Claim claim,boolean permanent,String code,int status) {
-        long base=Math.min(30000L,retryBaseMs*(1L<<Math.min(5,Math.max(0,claim.event().attemptCount()-1))));
+        long base=Math.min(30000L,retryBaseMs*(1L<<Math.min(5,Math.max(0,claim.event().roundAttemptCount()-1))));
         try { events.failed(claim,permanent,code,status,base+ThreadLocalRandom.current().nextLong(base/5+1)); }
         catch (RuntimeException unavailable) {
             LOG.warn("Webhook {} will recover after lease expiry ({})",claim.event().id(),unavailable.getClass().getSimpleName());

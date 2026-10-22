@@ -490,7 +490,7 @@ flowchart TD
 
 - 결제 6회·환불 3회의 실행 예산을 호출 전에 DB에 예약한다. DB 결과 반영과 오류 기록이 모두 실패해도 lease 복구 시 저장된 예산부터 검사한다. 소진된 회차는 외부 호출 없이 확인 필요 상태로 전환한다.
 - 발급은 정상 대기와 연속 실패를 구분한다. 정상 응답을 저장하면 연속 실패 횟수를 초기화하며, 최초 접수 확인부터 2분이 지나거나 연속 실패 6회면 자동 확인을 중단한다. 정상 조회와 별도로 공급사 접수 호출도 최대 6회다. 기본 조회 간격은 5초다.
-- 누적 확인 횟수와 실행 회차를 보존한다. 현재는 최초 회차만 있으며 새 실행 회차를 여는 운영자 복구 API는 3단계 대상이다. 서버 재시작만으로 예산을 초기화하지 않는다.
+- 누적 확인 횟수와 실행 회차를 보존한다. 새 실행 회차는 아래 3단계 운영자 복구 API로만 열며 서버 재시작만으로 예산을 초기화하지 않는다.
 - 인증된 외부 결과의 식별자·금액·최종 상태·이벤트 내용 충돌은 `order_conflicts`와 감사 이력에 저장한다. 실제 결제·발급 ID에 연결된 주문을 격리하고 새 결제·재발급·환불·활성화 정보 제공을 차단한다. 외부 조회 후 승인·취소를 보내기 직전에도 충돌을 다시 확인한다. 다만 마지막 DB 검사와 외부 HTTP 호출은 원자적이지 않으므로 그 사이에 발생한 충돌이나 이미 전송된 요청을 소급 취소할 수는 없다. 이런 경우에도 충돌 주문의 내부 결과 반영은 차단한다.
 - 동일 충돌의 반복 통지는 같은 사건으로 합친다. 운영자 상세와 확인 필요 목록에 나타나며 일반 앱 DB 계정은 충돌 기록을 수정·삭제할 수 없다. 이후 정상 통지가 오더라도 격리를 자동 해제하지 않는다.
 - 1단계는 운영자 재조회·재개 기능을 포함하지 않는다. 충돌 격리 해제는 외부 근거를 검증하는 후속 복구 단계에서 구현한다.
@@ -503,16 +503,30 @@ flowchart TD
 - 수신 상태는 `PENDING → PROCESSING → PROCESSED`다. 업무 반영 오류는 `RETRY`, 영구적인 업무 충돌·재처리 한도 소진은 `REVIEW_REQUIRED`다. 수신함 워커는 이미 받은 결과만 처리하며 PG 승인·취소나 공급사 발급을 새로 요청하지 않는다.
 - 업무 상태·기존 이벤트·후속 작업·수신 처리 완료 표시는 같은 트랜잭션으로 커밋한다. 완료 표시가 실패해도 업무 변경 전체를 롤백한다. 충돌 기록도 수신 보류와 함께 저장한다. 일반 오류의 재시도 표시는 실패한 처리 트랜잭션 밖에서 별도로 저장한다.
 - 워커는 기본 500ms 간격, 선점 유효 시간 30초, 최초 시도 포함 최대 6회다. 선점할 때 시도 횟수를 먼저 저장하므로 처리 중 강제 종료나 오류 기록 실패도 예산에 포함된다. 지연은 `min(30초, 1초 × 2^(시도 횟수 - 1))`에 최대 20% 임의 지연을 더한다. 서버 재시작·중복 수신은 예산을 초기화하지 않는다. 아직 생성되지 않은 업무·프로필의 `404`도 같은 수신 기록으로 제한된 재처리를 한다.
-- 운영자 주문 상세에 수신 상태·수신 횟수·처리 시도·오류·시각을 표시한다. 수신 당시 대상 업무가 없으면 주문에 임의 연결하지 않고 수신함에 남긴다. 미연결 수신의 별도 운영 목록, 수동 재개·충돌 해제·키 교체 절차는 후속 복구 단계다.
+- 운영자 주문 상세에 수신 상태·수신 횟수·처리 시도·오류·시각을 표시한다. 수신 당시 대상 업무가 없으면 주문에 임의 연결하지 않고 수신함에 남긴다. 연결된 수신의 수동 재개는 아래 3단계에서 제공한다. 미연결 수신의 별도 운영 목록, 충돌 해제·키 교체 절차는 후속 작업이다.
 - `WEBHOOK_INBOX_ENCRYPTION_KEY`는 별도로 생성한 32바이트 Base64 키이며 모의 PG 또는 공급사를 활성화할 때 필수다. 서명 키와 별개로 보관하고 재시작·재배포 때 유지한다. 활성화된 환경에서 키가 누락되거나 형식이 잘못되면 서버 기동을 거절한다. 다른 유효한 키로 교체해 기존 원문을 복호화할 수 없으면 해당 수신은 `INBOUND_PAYLOAD_UNREADABLE`로 보류한다. 이번 작업에서는 배포 환경변수나 원격 DB를 변경하지 않는다.
+
+### 3단계 구현: 운영자 재조회와 안전한 재개
+
+- 운영자 주문 상세에서 결제·현재 발급·환불·연결된 웹훅의 확인 필요 건을 선택한다. `POST /api/admin/orders/{id}/reconciliations`는 대상 종류·ID·화면 버전·사유·요청 키를 검사하고 조회 작업을 먼저 저장한다. 외부 HTTP 조회는 DB 트랜잭션 밖에서 수행하며 승인·취소·발급 요청을 보내지 않는다.
+- 같은 키·같은 내용은 최초 조치번호·실행자를 반환하고 같은 키·다른 내용은 `409`다. 다른 키로 같은 화면 버전을 동시에 제출해도 한 건만 접수한다. 조회 접수 자체가 복구 버전을 소비하며, 외부 조회 중 콜백 등으로 대상이 바뀌면 `STALE`로 종료한다. 오래된 결과로 현재 상태를 덮어쓰지 않는다.
+- 조회 워커는 조치당 최초 포함 최대 3회, 기본 500ms 주기·30초 lease·1초 지수 지연을 사용한다. 시도 횟수는 HTTP 전에 저장하며 오류 기록 실패·서버 재시작에도 예산을 유지한다. 업무 결과 반영과 조회 완료는 같은 트랜잭션이다. DB 반영 실패 시 모두 롤백하고 같은 거래를 다시 조회한다.
+- PG 승인·거절, 공급사 발급 성공·실패, PG 취소 완료가 확인되면 기존 도메인 검증을 거쳐 누락된 상태를 반영한다. 거래 번호·금액·통화·제공 상태가 맞지 않거나 기존 충돌이 있으면 `BLOCKED`로 남긴다. 조회 성공은 충돌 해제를 의미하지 않는다.
+- `POST /api/admin/orders/{id}/recoveries`는 성공한 조회 조치번호·현재 버전·사유·요청 키가 필요하다. 조회 완료 후 60초 이내이며 확인 필요 상태가 유지될 때만 같은 업무 번호로 다음 실행 회차를 접수한다. 조회를 다시 요청하면 이전 조회 근거는 무효다. 만료된 주문에서 새 PG 승인을 만들지 않으며, 재개 후 실제 승인 직전에도 기한을 검사한다. 이미 승인된 거래의 결과 반영은 기한 경과 후에도 가능하다.
+- 미발견 결과로 재개하는 계약은 현재 모의 사업자의 일관된 ID 조회와 같은 ID의 멱등 실행을 전제로 한다. 실사업자 조회의 `404`를 최종 미실행 증거로 일반화하면 안 된다. 발급은 현재 작업·결제 완료·프로필 없음·환불 없음, 환불은 발급 실패 확정·프로필 없음·기존 환불 예약 유지 조건을 다시 검사한다.
+- 저장된 웹훅은 일시 DB 오류·의존 대상 미생성·자동 한도 소진에 한해 재처리를 허용한다. 복호화 가능한 원문과 최신 외부 조회 결과의 정규화 해시가 일치해야 한다. 내용 충돌·영구적인 검증 실패는 재개하지 않는다. 원문·해시·이벤트 ID를 바꾸지 않는다.
+- 최초 회차 포함 최대 3개 실행 회차다. 결제는 회차당 6회, 환불은 3회, 웹훅은 6회다. 발급은 회차당 접수 6회·연속 확인 실패 6회·정상 대기 2분을 유지한다. 누적 횟수는 보존하고 회차 예산만 갱신한다. 마지막 회차 소진 후에도 읽기 전용 재조회로 확인된 최종 결과는 반영할 수 있지만 추가 실행 회차는 열지 않는다.
+- `recovery_actions`는 최초 실행자·사유·이전 상태 스냅샷·조회 근거 참조를 보존한다. `recovery_action_events`와 통합 주문 이력에는 각 시도·오류·결과가 추가되며 앱 계정으로 과거 이력을 수정·삭제할 수 없다. 화면에는 외부 상태·처리번호·근거 해시·시각만 노출하고 공급사 활성화 코드는 저장하거나 표시하지 않는다.
+- 이 단계는 기존 충돌의 강제 해제, 미연결 수신의 주문 연결 복원, 주기적 대사·알림을 포함하지 않는다. 계속 불명확한 거래는 확인 필요 상태와 기존 예약을 유지한다. 배포 설정·원격 DB는 변경하지 않는다.
 
 구현 참고:
 
 - [주문·기한 검사](../backend/service/src/service/OrderRepository.java), [결제 접수](../backend/service/src/service/PaymentService.java), [결제 워커](../backend/service/src/service/PaymentWorker.java), [결제 결과 반영](../backend/service/src/service/PaymentTransitions.java).
 - [PG 클라이언트](../backend/service/src/service/PgClient.java), [PG 웹훅](../backend/service/src/service/PgWebhookController.java), [결제 제약](../backend/database/migration/V4__payments_and_mock_pg.sql).
 - [웹훅 수신함](../backend/service/src/service/InboundEventService.java), [원자적 반영](../backend/service/src/service/InboundEventProcessor.java), [재처리 워커](../backend/service/src/service/InboundEventWorker.java), [수신함 스키마](../backend/database/migration/V12__durable_webhook_inbox.sql).
+- [운영자 복구 API](../backend/service/src/service/RecoveryController.java), [조회·재개 검증](../backend/service/src/service/RecoveryService.java), [복구 조회 워커](../backend/service/src/service/RecoveryWorker.java), [복구 이력 스키마](../backend/database/migration/V13__operator_recovery.sql).
 - [발급 워커](../backend/service/src/service/IssuanceWorker.java), [발급 반영](../backend/service/src/service/IssuanceService.java), [공급사 콜백](../backend/service/src/service/SupplierWebhookController.java).
 - [운영자 조치](../backend/service/src/service/AdminActionService.java), [환불 워커](../backend/service/src/service/RefundWorker.java), [환불 반영](../backend/service/src/service/RefundService.java).
 - [설치 반영](../backend/service/src/service/ProfileTrackingService.java), [SIM 생명주기](sim-lifecycle.md), [데이터 계약](data-contract.md), [기존 통합 테스트](../tests/orders.integration.test.mjs).
 
-위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계의 재시도·충돌 검증은 통합 테스트의 `retry policy`, `conflict policy`, 2단계의 수신·재처리는 `webhook inbox` 시나리오에 포함한다.
+위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계는 통합 테스트의 `retry policy`, `conflict policy`, 2단계는 `webhook inbox`, 3단계는 `operator recovery` 시나리오로 검증한다.
