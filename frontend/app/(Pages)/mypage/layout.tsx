@@ -12,5 +12,6 @@ async function Authenticated({ children }: { children: ReactNode }) {
     if (result.status === 401) redirect("/login");
     return <p role="alert">로그인 상태를 확인하지 못했습니다. 잠시 후 다시 접속해 주세요.</p>;
   }
+  if (result.data.role === "ADMIN") redirect("/admin/orders");
   return children;
 }

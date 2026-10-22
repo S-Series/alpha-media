@@ -10,7 +10,6 @@ export default async function MyPage() {
       <h1>마이페이지</h1>
       <p>{result.data.displayName}님, 로그인되어 있습니다.</p>
       <p>아이디: {result.data.username}</p>
-      {result.data.role === "ADMIN" && <Link href="/admin/orders">운영자 주문 관리</Link>}
       <LogoutButton />
       <nav aria-label="마이페이지 메뉴">
         <ul>
