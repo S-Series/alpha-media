@@ -2,7 +2,7 @@ import "server-only";
 import { cookies } from "next/headers";
 import type { Order, OrderPage } from "./orders";
 
-async function request<T>(path: string): Promise<{ ok: true; data: T } | { ok: false; status: number }> {
+export async function request<T>(path: string): Promise<{ ok: true; data: T } | { ok: false; status: number }> {
   const session = (await cookies()).get("ALPHA_SESSION");
   if (!session) return { ok: false, status: 401 };
   try {

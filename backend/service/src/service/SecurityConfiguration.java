@@ -34,10 +34,10 @@ public class SecurityConfiguration {
 
     @Bean
     UserDetailsService userDetailsService(MemberRepository members) {
-        return email -> {
-            var member = members.findByEmail(email)
+        return username -> {
+            var member = members.findByUsername(username)
                     .orElseThrow(() -> new UsernameNotFoundException("Invalid credentials"));
-            return User.withUsername(member.email()).password(member.passwordHash()).roles(member.role()).build();
+            return User.withUsername(member.username()).password(member.passwordHash()).roles(member.role()).build();
         };
     }
 
@@ -58,10 +58,11 @@ public class SecurityConfiguration {
                         .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(HttpMethod.GET, "/health").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/plans", "/api/plans/**", "/api/auth/csrf").permitAll()
-                        .requestMatchers(HttpMethod.POST, "/api/auth/signup", "/api/auth/login").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
                         .requestMatchers(HttpMethod.POST, "/webhooks/pg").permitAll()
                         .requestMatchers("/internal/mock-pg/**").permitAll()
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                        .requestMatchers(HttpMethod.POST, "/api/orders", "/api/orders/*/payment-attempts").hasRole("USER")
                         .requestMatchers("/api/me", "/api/auth/logout", "/api/orders/**", "/api/sims/**").authenticated()
                         .anyRequest().denyAll())
                 .exceptionHandling(errors -> errors
@@ -73,15 +74,15 @@ public class SecurityConfiguration {
                 .formLogin(form -> form
                         .loginPage("/login")
                         .loginProcessingUrl("/api/auth/login")
-                        .usernameParameter("email")
+                        .usernameParameter("username")
                         .successHandler((request, response, authentication) -> {
                             response.setContentType("application/json");
                             response.setCharacterEncoding("UTF-8");
-                            var member = members.findByEmail(authentication.getName()).orElseThrow();
+                            var member = members.findByUsername(authentication.getName()).orElseThrow();
                             mapper.writeValue(response.getOutputStream(), member.view());
                         })
                         .failureHandler((request, response, exception) -> ApiError.write(response, mapper,
-                                401, "INVALID_CREDENTIALS", "이메일 또는 비밀번호가 올바르지 않습니다.")))
+                                401, "INVALID_CREDENTIALS", "아이디 또는 비밀번호가 올바르지 않습니다.")))
                 .logout(logout -> logout
                         .logoutUrl("/api/auth/logout")
                         .deleteCookies("ALPHA_SESSION")

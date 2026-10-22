@@ -1,6 +1,6 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHmac, pbkdf2Sync, randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
@@ -13,8 +13,14 @@ import { setTimeout as delay } from "node:timers/promises";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const secret = randomBytes(32).toString("hex");
 const children = [];
-let directory, dbPort, servicePort, gatewayPort, serviceProcess, base, alice, bob, first, firstKey;
+let directory, dbPort, servicePort, gatewayPort, serviceProcess, base, alice, bob, admin, first, firstKey;
 const future = "2099-01-01";
+const password = "LocalOrderTest!2026Aa";
+const accountHashes = Object.fromEntries(["CUSTOMER1", "CUSTOMER2", "ADMIN"].map(name => {
+  const salt = randomBytes(16);
+  return [`${name}_PASSWORD_HASH`, "{pbkdf2-sha256-600k}" + Buffer.concat([
+    salt, pbkdf2Sync(password, salt, 600000, 32, "sha256")]).toString("hex")];
+}));
 
 function command(executable, args, options = {}) {
   const result = spawnSync(executable, args, { encoding: "utf8", windowsHide: true, ...options });
@@ -77,7 +83,7 @@ function startService(extra = {}) {
     MOCK_PG_BASE_URL: `http://127.0.0.1:${servicePort}/internal/mock-pg`,
     PG_WEBHOOK_URL: `http://127.0.0.1:${gatewayPort}/webhooks/pg`,
     PG_HTTP_TIMEOUT_MS: "500", PAYMENT_LEASE_MS: "3000", PAYMENT_RETRY_BASE_MS: "500",
-    PAYMENT_WORKER_DELAY_MS: "100", ...extra });
+    PAYMENT_WORKER_DELAY_MS: "100", ...accountHashes, ...extra });
 }
 
 class Client {
@@ -113,14 +119,11 @@ class Client {
 
 async function member(name) {
   const client = new Client();
-  const email = `${name}@orders.example.test`, password = "LocalOrderTest!2026Aa";
-  let r = await client.request("/api/auth/signup", { method: "POST", headers: await client.csrf(),
-    body: { email, displayName: name, password } });
-  assert.equal(r.status, 201); client.memberId = (await r.json()).id;
-  r = await client.request("/api/auth/login", { method: "POST",
+  const username = { alice: "customer1", bob: "customer2", admin: "admin" }[name];
+  const r = await client.request("/api/auth/login", { method: "POST",
     headers: { ...await client.csrf(), "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ email, password }).toString() });
-  assert.equal(r.status, 200); return client;
+    body: new URLSearchParams({ username, password }).toString() });
+  assert.equal(r.status, 200); client.memberId = (await r.json()).id; return client;
 }
 
 before(async () => {
@@ -140,7 +143,7 @@ before(async () => {
   await startService().then(value => { serviceProcess = value; });
   await startJava("gateway", { PORT: String(gatewayPort), SERVICE_BASE_URL: `http://127.0.0.1:${servicePort}` });
   base = `http://127.0.0.1:${gatewayPort}`;
-  alice = await member("alice"); bob = await member("bob");
+  alice = await member("alice"); bob = await member("bob"); admin = await member("admin");
 }, { timeout: 60000 });
 
 after(async () => {
@@ -159,6 +162,25 @@ after(async () => {
     assert.ok(actual.startsWith(parent + sep) && actual.slice(parent.length + 1).startsWith("order-tests-"));
     await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
+});
+
+test("fixed customer accounts and admin authenticate without signup; DB starts with no orders", async () => {
+  assert.equal(sql("SELECT string_agg(username,',' ORDER BY username) FROM members"), "admin,customer1,customer2");
+  assert.equal(sql("SELECT count(*) FROM members WHERE role='ADMIN'"), "1");
+  assert.equal(sql("SELECT count(*) FROM orders"), "0");
+  assert.equal(sql("SELECT count(*) FROM payment_attempts"), "0");
+  assert.equal(sql("SELECT count(*) FROM plans"), "3");
+  const me = await (await alice.request("/api/me")).json();
+  assert.equal(me.username, "customer1"); assert.equal(me.role, "USER");
+  assert.equal(me.passwordHash, undefined); assert.equal(me.password, undefined);
+  assert.equal((await (await admin.request("/api/me")).json()).role, "ADMIN");
+  assert.equal((await alice.request("/api/auth/signup", { method: "POST", headers: await alice.csrf(),
+    body: { username: "extra", password } })).status, 403);
+  const bad = new Client();
+  assert.equal((await bad.request("/api/auth/login", { method: "POST",
+    headers: { ...await bad.csrf(), "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ username: "customer1", password: "incorrect" }).toString() })).status, 401);
+  sql("INSERT INTO members(id,username,display_name,password_hash) VALUES(gen_random_uuid(),'extra','추가고객','fake')", true, true);
 });
 
 test("unauthenticated orders and Service bypass are blocked", async () => {
@@ -214,6 +236,25 @@ test("another member cannot read the order or override ownership with headers", 
   assert.deepEqual((await (await bob.request("/api/orders")).json()).items, []);
   const r = await bob.create(firstKey); assert.equal(r.status, 201);
   assert.notEqual((await r.json()).id, first.id);
+});
+
+test("admin reads real orders for both customers while customers cannot access admin APIs", async () => {
+  assert.equal((await alice.request("/api/admin/orders")).status, 403);
+  assert.equal((await new Client().request("/api/admin/orders")).status, 401);
+  const response = await admin.request("/api/admin/orders?size=100"); assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.ok(result.items.some(item => item.customerUsername === "customer1" && item.order.id === first.id));
+  assert.ok(result.items.some(item => item.customerUsername === "customer2"));
+  assert.equal(result.items.length, Number(sql("SELECT count(*) FROM orders")));
+  const detail = await admin.request(`/api/admin/orders/${first.id}`); assert.equal(detail.status, 200);
+  assert.equal((await detail.json()).order.order.id, first.id);
+  assert.equal((await admin.create()).status, 403);
+  assert.equal((await admin.pay(first.id)).status, 403);
+  for (const query of ["status=invalid", "size=101", "page=-1", "from=2099-02-02&to=2000-01-01"]) {
+    assert.equal((await admin.request(`/api/admin/orders?${query}`)).status, 400);
+  }
+  const filtered = await (await admin.request("/api/admin/orders?status=PENDING_PAYMENT&simType=ESIM&from=2000-01-01&to=2099-12-31&size=100")).json();
+  assert.equal(filtered.items.length, result.items.length);
 });
 
 test("invalid dates, missing products, USIM and malformed keys are rejected", async () => {

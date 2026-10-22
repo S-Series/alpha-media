@@ -1,6 +1,6 @@
 export type Member = {
   id: string;
-  email: string;
+  username: string;
   displayName: string;
   role: "USER" | "ADMIN";
   createdAt: string;
@@ -33,14 +33,9 @@ export class ApiRequestError extends Error {
   }
 }
 
-export async function signup(email: string, displayName: string, password: string) {
-  const response = await post("/api/auth/signup", JSON.stringify({ email, displayName, password }), "application/json");
-  return (await response.json()) as Member;
-}
-
-export async function login(email: string, password: string) {
+export async function login(username: string, password: string) {
   // Spring Security의 기본 로그인 필터는 폼 인코딩을 받는다. 비밀번호는 URL에 넣지 않는다.
-  const body = new URLSearchParams({ email, password }).toString();
+  const body = new URLSearchParams({ username, password }).toString();
   const response = await post("/api/auth/login", body, "application/x-www-form-urlencoded");
   return (await response.json()) as Member;
 }

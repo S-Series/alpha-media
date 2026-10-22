@@ -24,6 +24,10 @@ spring:
     url: ${DB_MIGRATION_URL:${DB_URL:jdbc:postgresql://127.0.0.1:5432/alpha_media}}
     user: ${DB_MIGRATION_USERNAME:alpha_media_owner}
     password: ${DB_MIGRATION_PASSWORD}
+    placeholders:
+      customer1PasswordHash: ${CUSTOMER1_PASSWORD_HASH}
+      customer2PasswordHash: ${CUSTOMER2_PASSWORD_HASH}
+      adminPasswordHash: ${ADMIN_PASSWORD_HASH}
   session:
     timeout: 30m
     jdbc:

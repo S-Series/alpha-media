@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { money } from "@/lib/preview-data";
+import { money } from "@/lib/format";
 import type { Plan } from "@/lib/plans";
 
 export default function PlanList({

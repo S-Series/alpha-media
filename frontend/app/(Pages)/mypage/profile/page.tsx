@@ -11,8 +11,8 @@ export default async function ProfilePage() {
       <dl>
         <dt>이름</dt>
         <dd>{member.displayName}</dd>
-        <dt>이메일</dt>
-        <dd>{member.email}</dd>
+        <dt>아이디</dt>
+        <dd>{member.username}</dd>
       </dl>
     </>
   );

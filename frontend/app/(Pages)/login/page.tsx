@@ -1,4 +1,3 @@
-import Link from "next/link";
 import { Suspense } from "react";
 import AuthForm from "@/components/screens/auth-form";
 
@@ -7,7 +6,7 @@ export default function LoginPage(props: PageProps<"/login">) {
     <>
       <h1>로그인</h1>
       <Suspense fallback={<p>로그인 화면 준비 중…</p>}><LoginForm {...props} /></Suspense>
-      <Link href="/signup">회원가입</Link>
+      <p>미리 구성한 고객 또는 운영자 계정으로 로그인해 주세요. 회원가입은 제공하지 않습니다.</p>
     </>
   );
 }
@@ -23,5 +22,5 @@ async function LoginForm({ searchParams }: PageProps<"/login">) {
       }
     } catch { /* 잘못된 복귀 주소는 기본 마이페이지로 이동한다. */ }
   }
-  return <AuthForm mode="login" nextPath={nextPath} />;
+  return <AuthForm nextPath={nextPath} />;
 }

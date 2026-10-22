@@ -3,7 +3,7 @@ import { Suspense } from "react";
 import { redirect } from "next/navigation";
 import { getOrders } from "@/lib/orders-server";
 import { orderStatus } from "@/lib/orders";
-import { kst, money, queryText } from "@/lib/preview-data";
+import { kst, money, queryText } from "@/lib/format";
 
 export default function OrdersPage(props: PageProps<"/mypage/orders">) {
   return <><h1>주문 내역</h1><Suspense fallback={<p>주문 조회 중…</p>}><Orders {...props} /></Suspense></>;

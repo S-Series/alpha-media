@@ -61,7 +61,7 @@ public class OrderController {
 
     private UUID memberId(Authentication authentication) {
         // 요청 본문이나 X-User-Id가 아닌, 로그인 세션의 회원으로만 주문을 연결한다.
-        return members.findByEmail(authentication.getName()).orElseThrow(
+        return members.findByUsername(authentication.getName()).orElseThrow(
                 () -> new OrderException(401, "UNAUTHENTICATED", "로그인이 필요합니다.")).id();
     }
 

@@ -4,7 +4,7 @@ import { notFound, redirect } from "next/navigation";
 import OrderForm from "@/components/screens/order-form";
 import { getCurrentMember } from "@/lib/auth-server";
 import { getPlan } from "@/lib/plans";
-import { money, queryText } from "@/lib/preview-data";
+import { money, queryText } from "@/lib/format";
 
 export default function CheckoutPage(props: PageProps<"/checkout">) {
   return <><h1>주문 확인</h1><Suspense fallback={<p>주문 조건 확인 중…</p>}><Checkout {...props} /></Suspense></>;
@@ -30,6 +30,7 @@ async function Checkout({ searchParams }: PageProps<"/checkout">) {
     const next = `/checkout?${new URLSearchParams({ planId, travelStartDate })}`;
     redirect(`/login?${new URLSearchParams({ next })}`);
   }
+  if (member.data.role !== "USER") return <p>주문하려면 고객 계정으로 로그인해 주세요. <Link href="/admin/orders">운영자 주문 관리</Link></p>;
   const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul" }).format(new Date());
   return (
     <>

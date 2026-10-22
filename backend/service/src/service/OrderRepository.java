@@ -26,6 +26,9 @@ public class OrderRepository {
 
     private final JdbcTemplate jdbc;
 
+    private static final String ADMIN_SELECT = "SELECT o.*, m.username AS customer_username FROM ("
+            + SELECT + ") o JOIN members m ON m.id=o.member_id";
+
     public OrderRepository(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
     }
@@ -69,6 +72,30 @@ public class OrderRepository {
         return jdbc.query(SELECT + " WHERE member_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
                 MAPPER, memberId, size + 1, (long) page * size);
     }
+
+    List<AdminOrder> findAllForAdmin(int page, int size, String status, String simType,
+            LocalDate from, LocalDate to, boolean needsReview) {
+        var zone = java.time.ZoneId.of("Asia/Seoul");
+        var start = from == null ? null : java.sql.Timestamp.from(from.atStartOfDay(zone).toInstant());
+        var end = to == null ? null : java.sql.Timestamp.from(to.plusDays(1).atStartOfDay(zone).toInstant());
+        return jdbc.query(ADMIN_SELECT + """
+                 WHERE (?::varchar IS NULL OR o.effective_status=?)
+                    AND (?::varchar IS NULL OR o.sim_type=?)
+                    AND (?::timestamptz IS NULL OR o.created_at>=?)
+                    AND (?::timestamptz IS NULL OR o.created_at<?)
+                    AND (NOT ? OR EXISTS (SELECT 1 FROM payment_attempts p WHERE p.order_id=o.id
+                        AND p.status IN ('UNKNOWN','REVIEW_REQUIRED')))
+                 ORDER BY o.created_at DESC, o.id DESC LIMIT ? OFFSET ?
+                """, (r, i) -> new AdminOrder(MAPPER.mapRow(r, i), r.getString("customer_username")),
+                status, status, simType, simType, start, start, end, end, needsReview, size + 1, (long) page * size);
+    }
+
+    Optional<AdminOrder> findForAdmin(UUID id) {
+        return jdbc.query(ADMIN_SELECT + " WHERE o.id=?", (r, i) ->
+                new AdminOrder(MAPPER.mapRow(r, i), r.getString("customer_username")), id).stream().findFirst();
+    }
+
+    public record AdminOrder(Order order, String customerUsername) {}
 
     public boolean isPast(LocalDate travelStartDate) {
         return Boolean.TRUE.equals(jdbc.queryForObject(

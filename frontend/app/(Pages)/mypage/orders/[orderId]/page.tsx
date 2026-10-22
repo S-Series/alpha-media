@@ -3,7 +3,7 @@ import { Suspense } from "react";
 import { notFound, redirect } from "next/navigation";
 import { getOrder } from "@/lib/orders-server";
 import { orderStatus } from "@/lib/orders";
-import { kst, money } from "@/lib/preview-data";
+import { kst, money } from "@/lib/format";
 import PaymentPanel from "@/components/screens/payment-panel";
 
 export default function OrderDetailPage(props: PageProps<"/mypage/orders/[orderId]">) {

@@ -48,7 +48,7 @@ public class PaymentController {
         return ResponseEntity.ok().header("Cache-Control", "no-store").body(payments.detail(memberId(auth), orderId, paymentId));
     }
 
-    private UUID memberId(Authentication auth) { return members.findByEmail(auth.getName()).orElseThrow().id(); }
+    private UUID memberId(Authentication auth) { return members.findByUsername(auth.getName()).orElseThrow().id(); }
 
     public record Request(@NotNull PaymentAttempt.Scenario scenario, @NotNull @Min(0) @Max(20) Integer webhookCopies,
             @NotNull @Min(0) @Max(60000) Integer webhookDelayMs) {}

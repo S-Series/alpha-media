@@ -2,7 +2,7 @@ import Link from "next/link";
 import { Suspense } from "react";
 import PlanList from "@/components/screens/plan-list";
 import { getPlans } from "@/lib/plans";
-import { queryText } from "@/lib/preview-data";
+import { queryText } from "@/lib/format";
 
 export default function PlansPage(props: PageProps<"/plans">) {
   return (

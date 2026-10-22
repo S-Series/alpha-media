@@ -1,12 +1,11 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { login, signup } from "@/lib/auth";
+import { login } from "@/lib/auth";
 
-export default function AuthForm({ mode, nextPath = "/mypage" }: { mode: "login" | "signup"; nextPath?: string }) {
+export default function AuthForm({ nextPath = "/mypage" }: { nextPath?: string }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
-  const [registered, setRegistered] = useState(false);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -15,16 +14,11 @@ export default function AuthForm({ mode, nextPath = "/mypage" }: { mode: "login"
     setPending(true);
     setError("");
     try {
-      const email = String(values.get("email") || "");
+      const username = String(values.get("username") || "");
       const password = String(values.get("password") || "");
-      if (mode === "signup") {
-        await signup(email, String(values.get("displayName") || ""), password);
-        setRegistered(true);
-      } else {
-        await login(email, password);
-        // 프록시가 바꾼 세션 쿠키를 다시 읽고 이전 비로그인 화면 캐시를 버린다.
-        window.location.replace(nextPath);
-      }
+      const member = await login(username, password);
+      // 새 세션 쿠키를 읽고 운영자는 전체 주문 화면으로 이동한다.
+      window.location.replace(member.role === "ADMIN" ? "/admin/orders" : nextPath);
     } catch (error) {
       setError(error instanceof Error ? error.message : "서버에 연결하지 못했습니다.");
     } finally {
@@ -32,28 +26,18 @@ export default function AuthForm({ mode, nextPath = "/mypage" }: { mode: "login"
     }
   }
 
-  if (registered) return <p role="status">회원가입이 완료됐습니다. 아래 로그인 링크로 이동해 주세요.</p>;
-
   return (
     <form onSubmit={submit} className="screen-form home-panel">
       <label>
-        이메일
-        <input name="email" type="email" autoComplete="username" maxLength={254} required />
+        아이디
+        <input name="username" autoComplete="username" maxLength={32} autoCapitalize="none" required />
       </label>
-      {mode === "signup" && (
-        <label>
-          이름
-          <input name="displayName" autoComplete="name" minLength={2} maxLength={60} required />
-        </label>
-      )}
       <label>
         비밀번호
-        <input name="password" type="password" autoComplete={mode === "signup" ? "new-password" : "current-password"}
-          minLength={mode === "signup" ? 12 : 1} maxLength={128} required />
+        <input name="password" type="password" autoComplete="current-password" maxLength={128} required />
       </label>
-      {mode === "signup" && <p>비밀번호는 12~128자로 입력해 주세요.</p>}
       {error && <p role="alert">{error}</p>}
-      <button type="submit" disabled={pending}>{pending ? "처리 중…" : mode === "signup" ? "회원가입" : "로그인"}</button>
+      <button type="submit" disabled={pending}>{pending ? "처리 중…" : "로그인"}</button>
     </form>
   );
 }

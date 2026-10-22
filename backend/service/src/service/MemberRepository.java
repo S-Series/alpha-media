@@ -12,7 +12,7 @@ import org.springframework.stereotype.Repository;
 public class MemberRepository {
 
     private static final RowMapper<Member> MAPPER = (row, index) -> new Member(
-            row.getObject("id", UUID.class), row.getString("email"), row.getString("display_name"),
+            row.getObject("id", UUID.class), row.getString("username"), row.getString("display_name"),
             row.getString("password_hash"), row.getString("role"), row.getTimestamp("created_at").toInstant());
 
     private final JdbcTemplate jdbc;
@@ -21,20 +21,12 @@ public class MemberRepository {
         this.jdbc = jdbc;
     }
 
-    public Optional<Member> findByEmail(String email) {
-        return jdbc.query("SELECT * FROM members WHERE email = ?", MAPPER, normalizeEmail(email))
+    public Optional<Member> findByUsername(String username) {
+        return jdbc.query("SELECT * FROM members WHERE username = ?", MAPPER, normalizeUsername(username))
                 .stream().findFirst();
     }
 
-    public Member create(String email, String displayName, String passwordHash) {
-        // 역할은 DB 기본값 USER를 사용한다. 클라이언트가 역할을 지정할 수 없다.
-        return jdbc.queryForObject("""
-                INSERT INTO members (id, email, display_name, password_hash)
-                VALUES (?, ?, ?, ?) RETURNING *
-                """, MAPPER, UUID.randomUUID(), normalizeEmail(email), displayName, passwordHash);
-    }
-
-    public static String normalizeEmail(String email) {
-        return email.trim().toLowerCase(Locale.ROOT);
+    public static String normalizeUsername(String username) {
+        return username.trim().toLowerCase(Locale.ROOT);
     }
 }
