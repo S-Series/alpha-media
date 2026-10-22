@@ -32,7 +32,8 @@ async function LoginForm({ searchParams }: PageProps<"/login">) {
           <tbody>
             <tr><th scope="row">고객 1</th><td><code>customer1</code></td><td><code>OBCYp7bAqeeMdrQK!A1</code></td></tr>
             <tr><th scope="row">고객 2</th><td><code>customer2</code></td><td><code>kjVqVaC7THLnkxEb!A1</code></td></tr>
-            <tr><th scope="row">운영자</th><td><code>admin</code></td><td><code>DYAN1d5W2asJlgjm!A1</code></td></tr>
+            <tr><th scope="row">운영자 1</th><td><code>admin</code></td><td><code>DYAN1d5W2asJlgjm!A1</code></td></tr>
+            <tr><th scope="row">운영자 2</th><td><code>admin2</code></td><td><code>zZVOTefARQw_3C0b!A2</code></td></tr>
           </tbody>
         </table>
       </div>

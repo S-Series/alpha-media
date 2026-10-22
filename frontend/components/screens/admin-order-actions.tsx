@@ -9,6 +9,7 @@ import { orderStatus } from "@/lib/orders";
 import { kst, money } from "@/lib/format";
 import OrderSummary from "./order-summary";
 import AdminOrderTimeline from "./admin-order-timeline";
+import AdminConcurrencyDemo from "./admin-concurrency-demo";
 
 type Draft = { key: string; path: string; body: string };
 const states: Record<string, string> = { REQUESTED: "환불 접수", QUEUED: "발급 재시도 접수", UNKNOWN: "PG 취소 결과 확인 중",
@@ -138,6 +139,7 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
       {draft && <p>요청 키: <code>{draft.key}</code> · 재전송은 사유·시연 조건까지 처음 요청 그대로 보냅니다.</p>}
       {message && <p role="status">{message}</p>}{error && <p role="alert">{error}</p>}
     </section>
+    <AdminConcurrencyDemo orderId={id} issuanceId={job?.id} eligible={!!canAct} />
     <section className="home-panel"><h2>환불 처리</h2>
       {view.refund ? <>
         <p>{states[view.refund.status] || view.refund.status} · {money(view.refund.amount)} KRW</p>

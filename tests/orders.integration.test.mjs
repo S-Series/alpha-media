@@ -1218,3 +1218,148 @@ test("admin console history rolls back with state changes and cannot be edited b
     assert.equal(sql("SELECT count(*) FROM orders"), orders);
   } finally { sql("DROP TRIGGER fail_history_for_test ON order_history; DROP FUNCTION fail_history_for_test();"); }
 });
+
+const demoRequest = (job, mode = "REFUND_REFUND", keyMode = "SEPARATE") => ({
+  issuanceId: job.id, mode, keyMode, reason: "두 운영자가 실제 세션으로 동시에 조치 시연",
+});
+async function demoCall(orderId, id, action, client = admin) {
+  return adminAction(orderId, `concurrency-demos/${id}/${action}`, undefined, randomUUID(), client);
+}
+async function demoView(orderId, id, client = admin) {
+  const response = await client.request(`/api/admin/orders/${orderId}/concurrency-demos/${id}`);
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
+test("admin concurrency requires two distinct authenticated operators, CSRF and a current failed issuance", async () => {
+  const { order, job } = await failedOrder(), request = demoRequest(job), key = randomUUID();
+  const path = `/api/admin/orders/${order.id}/concurrency-demos`;
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, key, new Client())).status, 401);
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, key, alice)).status, 403);
+  assert.equal((await admin.request(path, { method: "POST", body: request, headers: { "Idempotency-Key": key } })).status, 403);
+  for (const invalid of [{ ...request, mode: "FAKE" }, { ...request, reason: " " },
+    { ...request, reason: "a".repeat(301) }, { ...request, keyMode: null }, demoRequest(job, "REFUND_RETRY", "SHARED")]) {
+    assert.equal((await adminAction(order.id, "concurrency-demos", invalid)).status, 400);
+  }
+  assert.equal((await adminAction(order.id, "concurrency-demos", { ...request, issuanceId: randomUUID() })).status, 409);
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, "invalid-key")).status, 400);
+  const response = await adminAction(order.id, "concurrency-demos", { ...request, actor: "admin2" }, key);
+  assert.equal(response.status, 200); const demo = await response.json();
+  assert.equal(demo.phase, "WAITING"); assert.equal(demo.participants.length, 1);
+  assert.equal(demo.participants[0].username, "admin");
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, key)).status, 200);
+  assert.equal((await adminAction(order.id, "concurrency-demos", { ...request, reason: "변경" }, key)).status, 409);
+  const second = await member("admin2");
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, key, second)).status, 409);
+  assert.equal((await demoCall(order.id, demo.id, "start", second)).status, 403);
+  assert.equal((await demoCall(order.id, demo.id, "start")).status, 409);
+  assert.equal((await demoCall(order.id, demo.id, "join")).status, 200);
+  assert.equal((await demoView(order.id, demo.id)).participants.length, 1);
+  assert.equal((await demoCall(order.id, demo.id, "join", bob)).status, 403);
+  assert.equal((await alice.request(`${path}/${demo.id}`)).status, 403);
+  assert.equal((await admin.request(`${path}/${randomUUID()}`)).status, 404);
+  assert.equal((await admin.request(`/api/admin/orders/${randomUUID()}/concurrency-demos/${demo.id}`)).status, 404);
+  assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${order.id}'`), "0");
+  assert.equal(refundRow(order.id), null); assert.equal(issuanceRow(order.id).id, job.id);
+});
+
+for (const [mode, keyMode] of [["REFUND_REFUND", "SEPARATE"], ["RETRY_RETRY", "SEPARATE"],
+  ["REFUND_RETRY", "SEPARATE"], ["REFUND_REFUND", "SHARED"], ["RETRY_RETRY", "SHARED"]]) {
+  test(`admin concurrency ${mode} ${keyMode} runs exactly one real action and external effect`, async () => {
+    const second = await member("admin2"), { order, job } = await failedOrder(), key = randomUUID();
+    const request = demoRequest(job, mode, keyMode);
+    const response = await adminAction(order.id, "concurrency-demos", request, key);
+    assert.equal(response.status, 200); const demo = await response.json();
+    assert.equal(demo.id, key); assert.equal(demo.stats.actionCount, 0);
+    assert.equal((await demoCall(order.id, demo.id, "join", second)).status, 200);
+    const ready = await demoView(order.id, demo.id, second);
+    assert.equal(ready.phase, "READY"); assert.equal(ready.participating, true);
+    assert.deepEqual(ready.participants.map(p => p.username), ["admin", "admin2"]);
+    assert.equal(new Set(ready.participants.map(p => p.key)).size, keyMode === "SHARED" ? 1 : 2);
+    // Both authenticated operators can press start; this must not dispatch a second batch.
+    const starts = await Promise.all([demoCall(order.id, demo.id, "start"), demoCall(order.id, demo.id, "start", second)]);
+    assert.ok(starts.every(r => r.status === 200));
+    let done;
+    await until(async () => {
+      done = await demoView(order.id, demo.id);
+      return ["PASSED", "INVARIANT_FAILED", "REVIEW_REQUIRED", "BLOCKED"].includes(done.phase);
+    });
+    assert.equal(done.phase, "PASSED", JSON.stringify(done));
+    assert.deepEqual(done.participants.map(p => p.result.status).sort(), keyMode === "SHARED" ? [200, 202] : [202, 409]);
+    const winner = done.participants.find(p => p.result.status === 202);
+    assert.ok(done.participants.every(p => p.result.startedAt && p.result.finishedAt));
+    assert.ok(Math.abs(Date.parse(done.participants[0].result.startedAt) - Date.parse(done.participants[1].result.startedAt)) < 1000);
+    assert.equal(done.stats.actionCount, 1);
+    assert.equal(done.stats.refundCount + done.stats.retryCount, 1);
+    assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${order.id}'`), "1");
+    const detail = await (await admin.request(`/api/admin/orders/${order.id}`)).json();
+    assert.equal(detail.actions[0].actor, winner.username);
+    assert.equal(detail.actions[0].reason, request.reason);
+    assert.equal(detail.actions[0].id, winner.result.actionId);
+    assert.ok(detail.timeline.items.some(e => e.actor === `ADMIN:${winner.username}` && e.reason === request.reason));
+    if (keyMode === "SHARED") {
+      assert.equal(new Set(done.participants.map(p => p.result.actionId)).size, 1);
+      assert.ok(done.participants.every(p => p.result.appliedBy === winner.username));
+    }
+    if (winner.operation === "REFUND") {
+      assert.equal(orderState(order.id), "REFUNDED");
+      assert.equal(done.stats.pgCancellations, 1); assert.equal(done.stats.cancelledAmount, order.amount);
+      assert.equal(done.stats.profileCount, 0); assert.equal(done.stats.retryCount, 0);
+      assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id IN (SELECT id FROM payment_attempts WHERE order_id='${order.id}')`), "1");
+    } else {
+      assert.equal(done.stats.supplierOrders, 1); assert.equal(done.stats.supplierIssues, 1);
+      assert.equal(done.stats.profileCount, 1); assert.equal(done.stats.pgCancellations, 0);
+      assert.equal(refundRow(order.id), null);
+      assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "2");
+      assert.equal(sql(`SELECT sum(issue_executions) FROM mock_supplier_orders WHERE request_id='${issuanceRow(order.id).id}'`), "1");
+    }
+    assert.equal((await demoCall(order.id, demo.id, "join", second)).status, 200);
+    assert.equal((await demoCall(order.id, demo.id, "start")).status, 200);
+    assert.equal((await adminAction(order.id, "concurrency-demos", request, key)).status, 200);
+    assert.deepEqual((await demoView(order.id, demo.id)).stats, done.stats);
+    console.log(`concurrency proof ${mode}/${keyMode}: statuses=${done.participants.map(p => p.result.status).join(",")} action=1 pg=${done.stats.pgCancellations} supplier=${done.stats.supplierIssues} SIM=${done.stats.profileCount}`);
+  });
+}
+
+test("admin concurrency stale prepared round is blocked after an external operator action", async () => {
+  const second = await member("admin2"), { order, job } = await failedOrder();
+  const demo = await (await adminAction(order.id, "concurrency-demos", demoRequest(job))).json();
+  await demoCall(order.id, demo.id, "join", second);
+  assert.equal((await adminAction(order.id, "refunds", refundRequest(job), randomUUID(), second)).status, 202);
+  assert.equal((await demoCall(order.id, demo.id, "start")).status, 200);
+  let done;
+  await until(async () => { done = await demoView(order.id, demo.id); return done.phase === "BLOCKED"; });
+  assert.deepEqual(done.participants.map(p => p.result.status), [409, 409]);
+  assert.equal(done.stats.actionCount, 0);
+  await until(() => refundRow(order.id)?.status === "SUCCEEDED");
+  assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${order.id}'`), "1");
+});
+
+test("admin concurrency ordinary two-session HTTP actions also serialize without the demo coordinator", async () => {
+  const second = await member("admin2");
+  for (const types of [["refunds", "refunds"], ["issuance-retries", "issuance-retries"], ["refunds", "issuance-retries"]]) {
+    const { order, job } = await failedOrder();
+    const results = await Promise.all(types.map((type, i) => adminAction(order.id, type,
+      type === "refunds" ? refundRequest(job) : retryRequest(job), randomUUID(), i === 0 ? admin : second)));
+    assert.deepEqual(results.map(r => r.status).sort(), [202, 409]);
+    await until(() => orderState(order.id) === "REFUNDED" || issuanceRow(order.id).status === "ISSUED");
+    assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${order.id}'`), "1");
+    assert.ok(!(refundRow(order.id) && sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`) !== "0"));
+  }
+});
+
+test("admin concurrency restart loses only coordination metadata; accepted action and idempotency survive", async () => {
+  const second = await member("admin2"), { order, job } = await failedOrder();
+  const demo = await (await adminAction(order.id, "concurrency-demos", demoRequest(job))).json();
+  await demoCall(order.id, demo.id, "join", second);
+  await demoCall(order.id, demo.id, "start");
+  let done;
+  await until(async () => { done = await demoView(order.id, demo.id); return done.phase === "PASSED"; });
+  const winner = done.participants.find(p => p.result.status === 202);
+  await restart();
+  assert.equal((await admin.request(`/api/admin/orders/${order.id}/concurrency-demos/${demo.id}`)).status, 404);
+  assert.equal((await adminAction(order.id, "refunds", { ...refundRequest(job), reason: demo.request.reason }, winner.key)).status, 200);
+  assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${order.id}'`), "1");
+  assert.equal(refundRow(order.id).status, "SUCCEEDED");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE idempotency_key='${refundRow(order.id).id}'`), "1");
+});
