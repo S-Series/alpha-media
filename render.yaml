@@ -58,7 +58,7 @@ services:
           name: alpha-media-service
           envVarKey: RENDER_EXTERNAL_URL
       - key: FRONTEND_ORIGINS
-        value: http://localhost:3000,http://127.0.0.1:3000
+        value: http://localhost:3000,http://127.0.0.1:3000,https://localhost:3000,https://127.0.0.1:3000,https://alpha-media-mauve.vercel.app
       - key: SERVICE_CONNECT_TIMEOUT
         value: 10s
       - key: SERVICE_READ_TIMEOUT

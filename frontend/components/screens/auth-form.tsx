@@ -1,11 +1,9 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { useRouter } from "next/navigation";
 import { login, signup } from "@/lib/auth";
 
 export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
-  const router = useRouter();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [registered, setRegistered] = useState(false);
@@ -24,8 +22,8 @@ export default function AuthForm({ mode }: { mode: "login" | "signup" }) {
         setRegistered(true);
       } else {
         await login(email, password);
-        router.replace("/mypage");
-        router.refresh();
+        // 프록시가 바꾼 세션 쿠키를 다시 읽고 이전 비로그인 화면 캐시를 버린다.
+        window.location.replace("/mypage");
       }
     } catch (error) {
       setError(error instanceof Error ? error.message : "서버에 연결하지 못했습니다.");

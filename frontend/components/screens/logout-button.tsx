@@ -1,11 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { logout } from "@/lib/auth";
 
 export default function LogoutButton() {
-  const router = useRouter();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
 
@@ -14,8 +12,8 @@ export default function LogoutButton() {
     setError("");
     try {
       await logout();
-      router.replace("/login");
-      router.refresh();
+      // 이전 로그인 화면을 재사용하지 않고 삭제된 세션을 기준으로 새로 조회한다.
+      window.location.replace("/login");
     } catch {
       setError("로그아웃하지 못했습니다. 다시 시도해 주세요.");
       setPending(false);

@@ -1,16 +1,16 @@
-# Render 무료 서버와 Neon PostgreSQL
+# Vercel 프론트엔드·Render 서버·Neon PostgreSQL
 
 ## 배포 구성
 
 ```text
-브라우저 → Next.js /api rewrite → Render Gateway → Render Service → Neon PostgreSQL
+브라우저 → Vercel Next.js /api rewrite → Render Gateway → Render Service → Neon PostgreSQL
                                  공개 HTTPS        공개 HTTPS      pooled JDBC
                                                     └────────────→ direct JDBC (Flyway)
 ```
 
 Gateway와 Service는 Render Singapore의 무료 Web Service로 각각 배포한다. 무료 Web Service는 사설 요청을 받을 수 없으므로 두 서버 사이도 공개 HTTPS 주소를 사용한다. Service는 `X-Gateway-Token`을 검사하고, Gateway는 외부에서 들어온 해당 헤더를 제거한 뒤 서버의 공유 키로 교체한다. 사용자 세션·CSRF·관리자 권한 검사는 별도로 유지한다.
 
-프론트엔드는 현재 로컬에서 실행한다. 프론트엔드의 호스팅은 이번 구성에 포함하지 않았다. Render는 GitHub `S-Series/alpha-media`의 `main`에 연결해 커밋을 자동 배포한다.
+프론트엔드는 Vercel Hobby의 `alpha-media` 프로젝트에서 배포한다. 공개 주소는 `https://alpha-media-mauve.vercel.app`이다. Vercel과 Render는 GitHub `S-Series/alpha-media`의 `main`에 연결해 커밋을 자동 배포한다.
 
 실제 생성한 무료 서비스 주소는 Gateway `https://alpha-media-gateway.onrender.com`, Service `https://alpha-media-service.onrender.com`이다. Neon 접속 정보와 동일한 내부 키를 Render 비밀 환경변수로 등록하고 다시 읽어 값이 일치하는지 확인했다. 실제 값은 이 문서나 Git에 넣지 않는다.
 
@@ -108,7 +108,7 @@ Blueprint를 사용하는 경우 공유 환경 그룹 `alpha-media-internal`이 
 | `JAVA_TOOL_OPTIONS` | 힙에 컨테이너 메모리의 50%, CPU 수 1, 스택 512KB |
 | 포트 | Render의 `PORT`를 Spring이 읽음 |
 
-Service의 `SESSION_COOKIE_SECURE=true`는 HTTPS 배포용이다. 로컬 프론트엔드에서 원격 Gateway를 사용할 때는 브라우저도 `https://localhost`로 실행해야 Secure 세션 쿠키를 일관되게 사용할 수 있다. 실제 프론트엔드 배포도 HTTPS로 구성한다.
+Service의 `SESSION_COOKIE_SECURE=true`는 HTTPS 배포용이다. Vercel의 HTTPS 주소에서 로그인하면 같은 출처의 `/api/**` 프록시를 통해 Secure 세션 쿠키를 사용한다. 로컬 프론트엔드에서 원격 Gateway를 사용할 때도 HTTPS 개발 서버를 사용하면 브라우저별 localhost 예외에 의존하지 않는다.
 
 ```dotenv
 # frontend/.env.local, 값은 실제 배포된 Gateway 주소로 바꾼다.
@@ -118,11 +118,26 @@ GATEWAY_REQUEST_TIMEOUT_MS=150000
 
 프론트엔드는 이 값을 바꾼 뒤 다시 빌드한다. Next.js rewrite가 같은 출처의 `/api/**`를 Gateway로 전달한다. `GATEWAY_REQUEST_TIMEOUT_MS`는 서버 조회와 rewrite 프록시의 대기 시간에 사용한다. 이 값은 사용하는 프론트엔드 호스팅의 최대 요청 시간도 넘지 않아야 한다.
 
-`FRONTEND_ORIGINS`에는 localhost와 127.0.0.1의 HTTP·HTTPS 개발 출처를 등록했다. 프론트엔드가 Gateway를 브라우저에서 직접 호출하는 경우 실제 HTTPS 출처도 추가한다. 현재처럼 Next.js rewrite를 거치는 서버 간 호출에는 브라우저 CORS가 적용되지 않는다.
+`FRONTEND_ORIGINS`에는 localhost와 127.0.0.1의 HTTP·HTTPS 개발 출처와 Vercel의 정확한 운영 주소를 등록했다. 같은 출처의 Next.js rewrite를 사용해도 POST 요청의 `Origin` 헤더는 Gateway에 전달될 수 있으므로 Gateway의 CORS 필터에서 운영 출처를 허용해야 한다. 모든 `vercel.app` 하위 도메인을 포괄적으로 허용하지 않는다.
 
 커밋 전에 프론트엔드의 `npm run build`와 두 Maven `package`를 검증했다. 별도 GitHub Actions 워크플로는 아직 없다. CD는 Render Git 연동으로 실행하며, 승인된 배포 파일은 `main`에 반영했다.
 
-## 5 무료 플랜의 동작 범위
+## 5 Vercel 프론트엔드
+
+Vercel 프로젝트 설정은 Root Directory `frontend`, Framework `Next.js`, Node.js `24.x`, Install Command `npm ci`, Build Command `npm run build`다. 저장소 전체가 아닌 프론트엔드 폴더를 앱 루트로 빌드한다. `frontend/vercel.json`에서 Next.js·싱가포르 `sin1`·Fluid Compute를 지정해 Render와 가까운 리전에서 서버 렌더링을 수행한다.
+
+운영 환경변수는 다음 두 개만 등록했다. DB 접속 정보와 `INTERNAL_GATEWAY_TOKEN`은 프론트엔드에 전달하지 않는다. `NEXT_PUBLIC_` 접두사도 사용하지 않는다.
+
+```dotenv
+GATEWAY_BASE_URL=https://alpha-media-gateway.onrender.com
+GATEWAY_REQUEST_TIMEOUT_MS=110000
+```
+
+외부 rewrite에 적용되는 Vercel 제한은 최대 120초이므로 앱의 대기 시간은 110초로 설정했다. Next.js의 `proxyTimeout` 설정이 호스팅 플랫폼의 제한을 늘려 주지는 않는다. 서버 렌더링에서도 같은 Gateway 주소를 사용한다. 인증은 Vercel 도메인의 HttpOnly·Secure·SameSite=Lax 쿠키로 유지한다.
+
+Vercel은 `main`을 운영 브랜치로 사용한다. 위 환경변수는 운영 환경에만 등록했으며, 별도 Preview DB·Gateway는 아직 구성하지 않았다. 첫 배포는 Git 연동으로 실행됐고, 로컬 PC의 프론트엔드 서버 없이 공개 주소로 접속한다.
+
+## 6 무료 플랜의 동작 범위
 
 Render 무료 웹 서비스는 15분 동안 요청이 없으면 중지되고 재시작에 약 1분이 걸린다. 월 750 실행 시간을 같은 워크스페이스의 무료 서비스가 공유한다. 두 서버를 30일 내내 실행하면 1,440시간이 필요하므로 항상 실행할 수 있는 구성은 아니다. 시작 중 첫 요청이 실패하면 준비된 뒤 다시 요청한다. 변경 요청을 Gateway가 자동 재시도하지 않는다.
 
@@ -132,7 +147,7 @@ Neon 무료 컴퓨트도 5분 비활성 후 절전한다. Hikari는 사용하지
 
 따라서 현재 구성은 개발 확인용이다. 향후 결제·발급·환불 워커를 붙일 때는 상시 실행 환경과 비용을 다시 정한다. 무료 한도를 넘기지 않도록 각 서비스의 사용량을 확인한다.
 
-## 6 2026-10-22 검증 결과
+## 7 2026-10-22 검증 결과
 
 Neon `production` 브랜치에서 Flyway V1·V2가 적용되고 요금제 3건이 저장됐다. 프론트엔드·Gateway·Service는 로컬에서 실행하고 DB만 실제 Neon을 사용해 검증했다.
 
@@ -169,6 +184,21 @@ PASS gzip response headers match compressed body
 PASS 22 remote checks total
 ```
 
+Vercel 공개 주소에서는 브라우저의 운영 `Origin`을 포함해 19개 HTTP 검증을 통과했다. 요금제·필터·상세·회원가입·중복 가입·로그인·세션 회전·쿠키 속성·권한 검사·로그아웃·허용하지 않은 출처 차단을 확인했다.
+
+```text
+Vercel Git deployment: Build Completed in .vercel/build-output [24s]
+PASS Vercel -> Render -> Neon returns 3 plans
+PASS signup from production Origin HTTP 201
+PASS login through Vercel HTTP 200
+PASS Vercel host Secure HttpOnly SameSite=Lax cookie
+PASS production Origin CORS preflight HTTP 200
+PASS unapproved Origin HTTP 403
+PASS 19 Vercel end-to-end checks
+```
+
+초기 브라우저 확인에서 로그인 후 이전 비로그인 경로가 재사용되는 현상이 있었다. 외부 API 프록시가 세션을 변경한 뒤에는 로그인·로그아웃 모두 전체 페이지 이동으로 클라이언트 경로 캐시를 버리고 서버가 새 쿠키를 읽게 했다.
+
 첫 원격 Gateway 요청은 압축 응답 처리 중 `HttpException`으로 502가 발생했다. HTTP 클라이언트의 자동 압축 해제를 끄고 압축 본문과 `Content-Encoding`을 함께 전달한 뒤 정상화됐다. HTTPS 인증서 검증과 공유 키 검사는 유지했다.
 
 두 상태 확인 API, Render 공식 CLI의 Blueprint 검증, SQL의 JAR 포함도 확인했다. 검증용 회원·인증 세션은 삭제했고, SQL에서 해당 회원이 0건인지 확인했다.
@@ -185,3 +215,6 @@ PASS 22 remote checks total
 - [Neon Java 연결](https://neon.com/docs/guides/java)
 - [Neon 역할과 권한](https://neon.com/docs/manage/roles)
 - [pgJDBC SSL 설정](https://jdbc.postgresql.org/documentation/ssl/)
+
+- [Vercel 모노레포 설정](https://vercel.com/docs/monorepos)
+- [Vercel 외부 프록시 제한](https://vercel.com/docs/limits)
