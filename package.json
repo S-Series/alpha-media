@@ -6,6 +6,7 @@
     "start": "npm --prefix frontend run start",
     "test:orders": "node --test --test-concurrency=1 tests/orders.integration.test.mjs",
     "test:payments": "node --test --test-concurrency=1 --test-name-pattern=payment tests/orders.integration.test.mjs",
+    "test:issuance": "node --test --test-concurrency=1 --test-name-pattern=issuance tests/orders.integration.test.mjs",
     "accounts:configure": "node backend/database/configure-accounts.mjs",
     "neon:configure": "node backend/database/configure-neon.mjs"
   },

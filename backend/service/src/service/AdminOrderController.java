@@ -18,9 +18,10 @@ import org.springframework.web.bind.annotation.RestController;
 public class AdminOrderController {
     private final OrderRepository orders;
     private final PaymentRepository payments;
+    private final IssuanceService issuances;
 
-    public AdminOrderController(OrderRepository orders, PaymentRepository payments) {
-        this.orders = orders; this.payments = payments;
+    public AdminOrderController(OrderRepository orders, PaymentRepository payments, IssuanceService issuances) {
+        this.orders = orders; this.payments = payments; this.issuances = issuances;
     }
 
     @GetMapping
@@ -44,9 +45,9 @@ public class AdminOrderController {
     ResponseEntity<Detail> detail(@PathVariable UUID orderId) {
         var order = orders.findForAdmin(orderId).orElseThrow(
                 () -> new OrderService.OrderException(404, "ORDER_NOT_FOUND", "주문을 찾을 수 없습니다."));
-        return ResponseEntity.ok().header("Cache-Control", "no-store").body(new Detail(order, payments.list(orderId)));
+        return ResponseEntity.ok().header("Cache-Control", "no-store").body(new Detail(order, payments.list(orderId), issuances.forOrder(orderId)));
     }
 
     public record Page(List<OrderRepository.AdminOrder> items, int page, int size, boolean hasNext) {}
-    public record Detail(OrderRepository.AdminOrder order, List<PaymentAttempt> payments) {}
+    public record Detail(OrderRepository.AdminOrder order, List<PaymentAttempt> payments, IssuanceService.View issuance) {}
 }

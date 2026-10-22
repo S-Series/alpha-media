@@ -51,5 +51,7 @@ public class PaymentController {
     private UUID memberId(Authentication auth) { return members.findByUsername(auth.getName()).orElseThrow().id(); }
 
     public record Request(@NotNull PaymentAttempt.Scenario scenario, @NotNull @Min(0) @Max(20) Integer webhookCopies,
-            @NotNull @Min(0) @Max(60000) Integer webhookDelayMs) {}
+            @NotNull @Min(0) @Max(60000) Integer webhookDelayMs, @Valid IssuanceSimulation issuance) {
+        IssuanceSimulation issuanceOrDefault() { return issuance == null ? IssuanceSimulation.defaults() : issuance; }
+    }
 }

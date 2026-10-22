@@ -6,7 +6,19 @@ export default function LoginPage(props: PageProps<"/login">) {
     <>
       <h1>로그인</h1>
       <Suspense fallback={<p>로그인 화면 준비 중…</p>}><LoginForm {...props} /></Suspense>
-      <p>미리 구성한 고객 또는 운영자 계정으로 로그인해 주세요. 회원가입은 제공하지 않습니다.</p>
+      <section className="home-panel" aria-labelledby="login-accounts-heading">
+        <h2 id="login-accounts-heading">체험용 로그인 계정</h2>
+        <div className="table-scroll">
+          <table style={{ minWidth: 0 }}>
+            <thead><tr><th scope="col">구분</th><th scope="col">아이디</th><th scope="col">비밀번호</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">고객 1</th><td><code>customer1</code></td><td><code>OBCYp7bAqeeMdrQK!A1</code></td></tr>
+              <tr><th scope="row">고객 2</th><td><code>customer2</code></td><td><code>kjVqVaC7THLnkxEb!A1</code></td></tr>
+              <tr><th scope="row">운영자</th><td><code>admin</code></td><td><code>DYAN1d5W2asJlgjm!A1</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </>
   );
 }

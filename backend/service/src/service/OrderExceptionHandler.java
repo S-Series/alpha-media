@@ -11,7 +11,8 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 import service.OrderService.OrderException;
 
 @RestControllerAdvice(assignableTypes = { OrderController.class, PaymentController.class,
-        PgWebhookController.class, MockPgController.class, AdminOrderController.class })
+        PgWebhookController.class, MockPgController.class, AdminOrderController.class, IssuanceController.class,
+        SupplierWebhookController.class, MockSupplierController.class })
 public class OrderExceptionHandler {
 
     @ExceptionHandler(OrderException.class)

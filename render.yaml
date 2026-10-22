@@ -37,6 +37,22 @@ services:
         value: "true"
       - key: SESSION_CLEANUP_CRON
         value: "0 0 * * * *"
+      - key: MOCK_PG_ENABLED
+        value: "true"
+      - key: MOCK_PG_API_KEY
+        sync: false
+      - key: PG_WEBHOOK_SECRET
+        sync: false
+      - key: PG_WEBHOOK_URL
+        value: https://alpha-media-gateway.onrender.com/webhooks/pg
+      - key: MOCK_SUPPLIER_ENABLED
+        value: "true"
+      - key: SUPPLIER_API_KEY
+        sync: false
+      - key: SUPPLIER_WEBHOOK_SECRET
+        sync: false
+      - key: SUPPLIER_WEBHOOK_URL
+        value: https://alpha-media-gateway.onrender.com/webhooks/supplier
 
   - type: web
     name: alpha-media-gateway

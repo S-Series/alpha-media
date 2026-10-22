@@ -62,3 +62,15 @@ payment:
   lease-ms: ${PAYMENT_LEASE_MS:30000}
   retry-base-ms: ${PAYMENT_RETRY_BASE_MS:1000}
   worker-delay-ms: ${PAYMENT_WORKER_DELAY_MS:500}
+
+issuance:
+  mock-enabled: ${MOCK_SUPPLIER_ENABLED:false}
+  base-url: ${SUPPLIER_BASE_URL:http://127.0.0.1:${server.port}/internal/mock-supplier}
+  webhook-url: ${SUPPLIER_WEBHOOK_URL:http://127.0.0.1:8080/webhooks/supplier}
+  api-key: ${SUPPLIER_API_KEY:}
+  webhook-secret: ${SUPPLIER_WEBHOOK_SECRET:}
+  http-timeout-ms: ${SUPPLIER_HTTP_TIMEOUT_MS:2000}
+  lease-ms: ${ISSUANCE_LEASE_MS:30000}
+  poll-ms: ${ISSUANCE_POLL_MS:5000}
+  worker-delay-ms: ${ISSUANCE_WORKER_DELAY_MS:500}
+  completion-delay-ms: ${SUPPLIER_COMPLETION_DELAY_MS:1000}

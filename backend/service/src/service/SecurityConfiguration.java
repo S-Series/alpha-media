@@ -9,7 +9,6 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
-import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
@@ -50,20 +49,22 @@ public class SecurityConfiguration {
             http.addFilterBefore(new GatewayAccessFilter(internalToken, mapper), SecurityContextHolderFilter.class);
         }
         http
-                .httpBasic(AbstractHttpConfigurer::disable)
-                .requestCache(AbstractHttpConfigurer::disable)
+                .httpBasic(basic -> basic.disable())
+                .requestCache(cache -> cache.disable())
                 // 외부 통지는 세션 대신 본문 HMAC, 내부 모의 PG는 별도 API 키로 인증한다.
-                .csrf(csrf -> csrf.ignoringRequestMatchers("/webhooks/pg", "/internal/mock-pg/**"))
+                .csrf(csrf -> csrf.ignoringRequestMatchers("/webhooks/pg", "/webhooks/supplier", "/internal/mock-pg/**", "/internal/mock-supplier/**"))
                 .authorizeHttpRequests(auth -> auth
                         .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(HttpMethod.GET, "/health").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/plans", "/api/plans/**", "/api/auth/csrf").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
                         .requestMatchers(HttpMethod.POST, "/webhooks/pg").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/webhooks/supplier").permitAll()
                         .requestMatchers("/internal/mock-pg/**").permitAll()
+                        .requestMatchers("/internal/mock-supplier/**").permitAll()
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
                         .requestMatchers(HttpMethod.POST, "/api/orders", "/api/orders/*/payment-attempts").hasRole("USER")
-                        .requestMatchers("/api/me", "/api/auth/logout", "/api/orders/**", "/api/sims/**").authenticated()
+                        .requestMatchers("/api/me", "/api/auth/logout", "/api/orders/**", "/api/sims", "/api/sims/**").authenticated()
                         .anyRequest().denyAll())
                 .exceptionHandling(errors -> errors
                         .authenticationEntryPoint((request, response, exception) -> ApiError.write(

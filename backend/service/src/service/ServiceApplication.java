@@ -7,7 +7,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 
 @SpringBootApplication
 @EnableScheduling
-@EnableConfigurationProperties(PaymentSettings.class)
+@EnableConfigurationProperties({ PaymentSettings.class, IssuanceSettings.class })
 public class ServiceApplication {
 
     public static void main(String[] args) {

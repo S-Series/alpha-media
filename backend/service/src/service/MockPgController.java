@@ -16,7 +16,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
-@RequestMapping("/internal/mock-pg")
+@RequestMapping("/internal/mock-pg/payments")
 @ConditionalOnProperty(name = "payment.mock-enabled", havingValue = "true")
 public class MockPgController {
     private final MockPgService pg;
@@ -24,7 +24,7 @@ public class MockPgController {
 
     public MockPgController(MockPgService pg, PaymentSettings settings) { this.pg = pg; this.settings = settings; }
 
-    @PostMapping("/payments/approve")
+    @PostMapping("/approve")
     PgResult approve(@RequestHeader(value = "Authorization", required = false) String auth,
             @Valid @RequestBody MockPgService.Approval request) throws InterruptedException {
         authorize(auth);
@@ -34,17 +34,17 @@ public class MockPgController {
         return reply.result();
     }
 
-    @GetMapping("/payments/{id}")
+    @GetMapping("/{id}")
     PgResult lookup(@RequestHeader(value = "Authorization", required = false) String auth, @PathVariable UUID id) {
         authorize(auth); return pg.lookup(id);
     }
 
-    @GetMapping("/payments/{id}/stats")
+    @GetMapping("/{id}/stats")
     MockPgService.Stats stats(@RequestHeader(value = "Authorization", required = false) String auth, @PathVariable UUID id) {
         authorize(auth); return pg.stats(id);
     }
 
-    @PostMapping("/payments/{id}/cancel")
+    @PostMapping("/{id}/cancel")
     MockPgService.Cancellation cancel(@RequestHeader(value = "Authorization", required = false) String auth,
             @PathVariable UUID id, @RequestHeader("Idempotency-Key") UUID key, @Valid @RequestBody Cancel request) {
         authorize(auth); return pg.cancel(id, key, request.amount());

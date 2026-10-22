@@ -5,6 +5,7 @@ import { getOrder } from "@/lib/orders-server";
 import { orderStatus } from "@/lib/orders";
 import { kst, money } from "@/lib/format";
 import PaymentPanel from "@/components/screens/payment-panel";
+import IssuancePanel from "@/components/screens/issuance-panel";
 
 export default function OrderDetailPage(props: PageProps<"/mypage/orders/[orderId]">) {
   return <><h1>주문 상세</h1><Suspense fallback={<p>주문 조회 중…</p>}><OrderDetail {...props} /></Suspense></>;
@@ -37,6 +38,7 @@ async function OrderDetail({ params }: PageProps<"/mypage/orders/[orderId]">) {
         <form action={`/mypage/orders/${order.id}`} method="get"><button type="submit">상태 다시 확인</button></form>
       </section>
       <PaymentPanel orderId={order.id} status={order.status} expiresAt={order.expiresAt} />
+      <IssuancePanel orderId={order.id} status={order.status} />
       <nav className="page-actions"><Link href="/mypage/orders">주문 내역</Link><Link href="/plans">요금제 선택</Link></nav>
     </>
   );

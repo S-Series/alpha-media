@@ -22,13 +22,13 @@ export async function post(path: string, body?: string, contentType?: string,
   });
   if (!response.ok) {
     const error = await response.json().catch(() => null);
-    throw new ApiRequestError(response.status, error?.message || "요청을 처리하지 못했습니다. 다시 시도해 주세요.");
+    throw new ApiRequestError(response.status, error?.message || "요청을 처리하지 못했습니다. 다시 시도해 주세요.", error?.code);
   }
   return response;
 }
 
 export class ApiRequestError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(public status: number, message: string, public code?: string) {
     super(message);
   }
 }

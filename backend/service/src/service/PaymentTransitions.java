@@ -17,9 +17,11 @@ public class PaymentTransitions {
     private final PaymentRepository payments;
     private final PaymentSettings settings;
     private final ObjectMapper mapper;
+    private final IssuanceRepository issuances;
 
-    public PaymentTransitions(OrderRepository orders, PaymentRepository payments, PaymentSettings settings, ObjectMapper mapper) {
-        this.orders = orders; this.payments = payments; this.settings = settings; this.mapper = mapper;
+    public PaymentTransitions(OrderRepository orders, PaymentRepository payments, PaymentSettings settings, ObjectMapper mapper,
+            IssuanceRepository issuances) {
+        this.orders = orders; this.payments = payments; this.settings = settings; this.mapper = mapper; this.issuances = issuances;
     }
 
     @Transactional
@@ -49,6 +51,8 @@ public class PaymentTransitions {
         if (!payments.recordEvent(result, hash(result), source) || terminal) return;
         payments.complete(payment.id(), result);
         orders.finishPayment(order.id(), "APPROVED".equals(result.status()));
+        // 결제 완료와 발급 작업을 함께 커밋해 브라우저 종료·서버 재시작에도 작업을 잃지 않는다.
+        if ("APPROVED".equals(result.status())) issuances.enqueue(payment);
     }
 
     @Transactional

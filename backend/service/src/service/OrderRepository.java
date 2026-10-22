@@ -26,8 +26,8 @@ public class OrderRepository {
 
     private final JdbcTemplate jdbc;
 
-    private static final String ADMIN_SELECT = "SELECT o.*, m.username AS customer_username FROM ("
-            + SELECT + ") o JOIN members m ON m.id=o.member_id";
+    private static final String ADMIN_SELECT = "SELECT o.*, m.username AS customer_username, j.status AS issuance_status, j.last_error AS issuance_error FROM ("
+            + SELECT + ") o JOIN members m ON m.id=o.member_id LEFT JOIN issuance_jobs j ON j.order_id=o.id";
 
     public OrderRepository(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
@@ -84,18 +84,23 @@ public class OrderRepository {
                     AND (?::timestamptz IS NULL OR o.created_at>=?)
                     AND (?::timestamptz IS NULL OR o.created_at<?)
                     AND (NOT ? OR EXISTS (SELECT 1 FROM payment_attempts p WHERE p.order_id=o.id
-                        AND p.status IN ('UNKNOWN','REVIEW_REQUIRED')))
+                        AND p.status IN ('UNKNOWN','REVIEW_REQUIRED'))
+                        OR EXISTS (SELECT 1 FROM issuance_jobs j WHERE j.order_id=o.id
+                            AND (j.status IN ('FAILED','REVIEW_REQUIRED') OR
+                                (j.status IN ('QUEUED','PROCESSING','WAITING_CALLBACK') AND j.created_at<clock_timestamp()-INTERVAL '2 minutes'))))
                  ORDER BY o.created_at DESC, o.id DESC LIMIT ? OFFSET ?
-                """, (r, i) -> new AdminOrder(MAPPER.mapRow(r, i), r.getString("customer_username")),
+                """, (r, i) -> new AdminOrder(MAPPER.mapRow(r, i), r.getString("customer_username"),
+                    r.getString("issuance_status"), r.getString("issuance_error")),
                 status, status, simType, simType, start, start, end, end, needsReview, size + 1, (long) page * size);
     }
 
     Optional<AdminOrder> findForAdmin(UUID id) {
         return jdbc.query(ADMIN_SELECT + " WHERE o.id=?", (r, i) ->
-                new AdminOrder(MAPPER.mapRow(r, i), r.getString("customer_username")), id).stream().findFirst();
+                new AdminOrder(MAPPER.mapRow(r, i), r.getString("customer_username"),
+                    r.getString("issuance_status"), r.getString("issuance_error")), id).stream().findFirst();
     }
 
-    public record AdminOrder(Order order, String customerUsername) {}
+    public record AdminOrder(Order order, String customerUsername, String issuanceStatus, String issuanceError) {}
 
     public boolean isPast(LocalDate travelStartDate) {
         return Boolean.TRUE.equals(jdbc.queryForObject(

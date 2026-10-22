@@ -83,6 +83,11 @@ function startService(extra = {}) {
     MOCK_PG_BASE_URL: `http://127.0.0.1:${servicePort}/internal/mock-pg`,
     PG_WEBHOOK_URL: `http://127.0.0.1:${gatewayPort}/webhooks/pg`,
     PG_HTTP_TIMEOUT_MS: "500", PAYMENT_LEASE_MS: "3000", PAYMENT_RETRY_BASE_MS: "500",
+    MOCK_SUPPLIER_ENABLED: "true", SUPPLIER_API_KEY: secret, SUPPLIER_WEBHOOK_SECRET: secret,
+    SUPPLIER_BASE_URL: `http://127.0.0.1:${servicePort}/internal/mock-supplier`,
+    SUPPLIER_WEBHOOK_URL: `http://127.0.0.1:${gatewayPort}/webhooks/supplier`,
+    SUPPLIER_HTTP_TIMEOUT_MS: "500", ISSUANCE_LEASE_MS: "3000", ISSUANCE_POLL_MS: "1000",
+    ISSUANCE_WORKER_DELAY_MS: "100", SUPPLIER_COMPLETION_DELAY_MS: "200",
     PAYMENT_WORKER_DELAY_MS: "100", ...accountHashes, ...extra });
 }
 
@@ -358,6 +363,9 @@ test("payment intake authenticates owner, enforces CSRF, validates inputs and ig
   assert.equal((await alice.request(path, { method: "POST", body: {} })).status, 403);
   assert.equal((await alice.pay(order.id, randomUUID(), "BAD_SCENARIO")).status, 400);
   assert.equal((await alice.pay(order.id, randomUUID(), "APPROVE", { webhookCopies: 21 })).status, 400);
+  assert.equal((await alice.pay(order.id, randomUUID(), "APPROVE", { webhookCopies: -1 })).status, 400);
+  assert.equal((await alice.pay(order.id, randomUUID(), "APPROVE", { webhookDelayMs: -1 })).status, 400);
+  assert.equal((await alice.pay(order.id, randomUUID(), "APPROVE", { webhookDelayMs: 60001 })).status, 400);
   assert.equal((await fetch(base + "/internal/mock-pg/payments/approve", { method: "POST", body: "{}" })).status, 404);
   const response = await alice.pay(order.id, randomUUID(), "APPROVE", { amount: 1, currency: "USD", memberId: bob.memberId });
   assert.equal(response.status, 202); const attempt = await response.json();
@@ -367,6 +375,36 @@ test("payment intake authenticates owner, enforces CSRF, validates inputs and ig
   await settled(order, attempt); assert.equal(orderState(order.id), "PAID");
   sql(`UPDATE payment_attempts SET amount=1 WHERE id='${attempt.id}'`, true, true);
   sql(`UPDATE payment_attempts SET order_id='${randomUUID()}' WHERE id='${attempt.id}'`, true, true);
+});
+
+test("payment simulation settings survive replay, enforce fixed parameters and drive webhook delivery", async () => {
+  for (const config of [
+    { scenario: "APPROVE", webhookCopies: 20, webhookDelayMs: 1000 },
+    { scenario: "DECLINE", webhookCopies: 1, webhookDelayMs: 0 },
+    { scenario: "RESPONSE_LOST", webhookCopies: 0, webhookDelayMs: 60000 },
+  ]) {
+    const order = await newOrder(), key = randomUUID();
+    const response = await alice.pay(order.id, key, config.scenario, config);
+    assert.equal(response.status, 202);
+    const attempt = await response.json();
+    for (const name of ["scenario", "webhookCopies", "webhookDelayMs"]) assert.equal(attempt[name], config[name]);
+    const replay = await alice.pay(order.id, key, config.scenario, config);
+    assert.equal(replay.status, 200); assert.equal((await replay.json()).id, attempt.id);
+    assert.equal((await alice.pay(order.id, key, config.scenario,
+      { ...config, webhookCopies: config.webhookCopies === 0 ? 1 : 0 })).status, 409);
+    assert.equal((await alice.pay(order.id, key, config.scenario,
+      { ...config, webhookDelayMs: config.webhookDelayMs === 0 ? 1000 : 0 })).status, 409);
+    const declined = config.scenario === "DECLINE";
+    await settled(order, attempt, declined ? "DECLINED" : "APPROVED");
+    assert.equal(orderState(order.id), declined ? "PENDING_PAYMENT" : "PAID");
+    await until(async () => (await (await pg(`/payments/${attempt.id}/stats`)).json()).webhookSent === config.webhookCopies);
+    const stats = await (await pg(`/payments/${attempt.id}/stats`)).json();
+    assert.equal(stats.approvalRequests, 1);
+    assert.equal(stats.approvalExecutions, declined ? 0 : 1);
+    assert.equal(stats.webhookFailures, 0);
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT webhook_delay_ms FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), String(config.webhookDelayMs));
+  }
 });
 
 test("payment same-key concurrency and replay create exactly one attempt and one PG approval", async () => {
@@ -563,4 +601,190 @@ test("payment mock is disabled by default and disabled mode cannot accept new at
   assert.equal((await alice.pay(order.id)).status, 503);
   assert.equal(orderState(order.id), "PENDING_PAYMENT");
   assert.equal((await pg(`/payments/${randomUUID()}`)).status, 404);
+});
+
+async function supplier(path, body) {
+  return fetch(`http://127.0.0.1:${servicePort}/internal/mock-supplier${path}`, {
+    method: body ? "POST" : "GET", headers: { "X-Gateway-Token": secret, Authorization: `Bearer ${secret}`,
+      "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function supplierNotify(result, valid = true) {
+  const body = JSON.stringify(result);
+  return fetch(base + "/webhooks/supplier", { method: "POST", body,
+    headers: { "Content-Type": "application/json", "X-Signature": valid
+      ? createHmac("sha256", secret).update(body).digest("hex") : "0".repeat(64) } });
+}
+
+function issuanceRow(orderId) {
+  const value = sql(`SELECT row_to_json(j) FROM issuance_jobs j WHERE order_id='${orderId}'`);
+  return value ? JSON.parse(value) : null;
+}
+
+async function issueOrder(simulation = { scenario: "SUCCEED", callbackCopies: 1, callbackDelayMs: 0 }) {
+  const order = await newOrder(), key = randomUUID();
+  const response = await alice.pay(order.id, key, "APPROVE", { issuance: simulation });
+  assert.equal(response.status, 202); const attempt = await response.json();
+  await settled(order, attempt);
+  assert.equal(orderState(order.id), "PAID");
+  const job = issuanceRow(order.id); assert.ok(job, "approval and issuance job must commit together");
+  return { order, attempt, job, key, simulation };
+}
+
+test("issuance settings validate bounds and freeze with the payment idempotency key", async () => {
+  await restart();
+  const order = await newOrder(), key = randomUUID();
+  for (const simulation of [
+    { scenario: "BAD", callbackCopies: 1, callbackDelayMs: 0 },
+    { scenario: "SUCCEED", callbackCopies: -1, callbackDelayMs: 0 },
+    { scenario: "SUCCEED", callbackCopies: 21, callbackDelayMs: 0 },
+    { scenario: "SUCCEED", callbackCopies: 1, callbackDelayMs: -1 },
+    { scenario: "SUCCEED", callbackCopies: 1, callbackDelayMs: 60001 },
+    { scenario: "SUCCEED", callbackCopies: null, callbackDelayMs: 0 },
+  ]) assert.equal((await alice.pay(order.id, randomUUID(), "APPROVE", { issuance: simulation })).status, 400);
+  const issuance = { scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 60000 };
+  const response = await alice.pay(order.id, key, "APPROVE", { issuance });
+  assert.equal(response.status, 202); const attempt = await response.json(); assert.deepEqual(attempt.issuance, issuance);
+  assert.equal((await alice.pay(order.id, key, "APPROVE", { issuance })).status, 200);
+  for (const changed of [{ ...issuance, scenario: "FAIL" }, { ...issuance, callbackCopies: 1 }, { ...issuance, callbackDelayMs: 0 }]) {
+    assert.equal((await alice.pay(order.id, key, "APPROVE", { issuance: changed })).status, 409);
+  }
+  await settled(order, attempt);
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+  assert.equal((await new Client().request(`/api/orders/${order.id}/issuance`)).status, 401);
+  assert.equal((await bob.request(`/api/orders/${order.id}/issuance`)).status, 404);
+  assert.equal((await fetch(base + "/internal/mock-supplier/orders/" + issuanceRow(order.id).id)).status, 404);
+  const noAuth = await fetch(`http://127.0.0.1:${servicePort}/internal/mock-supplier/orders/${issuanceRow(order.id).id}`,
+    { headers: { "X-Gateway-Token": secret } }); assert.equal(noAuth.status, 401);
+});
+
+test("issuance queued at payment approval survives browser closure and Service restart", async () => {
+  await restart({ ISSUANCE_WORKER_DELAY_MS: "60000" });
+  const { order } = await issueOrder();
+  assert.equal(issuanceRow(order.id).status, "QUEUED");
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  await restart();
+  // 이 뒤에는 고객 요청 없이 DB에 저장된 작업과 콜백만으로 발급된다.
+  await until(() => issuanceRow(order.id).status === "ISSUED");
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
+  const result = await (await alice.request(`/api/orders/${order.id}/issuance`)).json();
+  assert.equal(result.profile.installStatus, "ISSUED"); assert.match(result.profile.iccid, /^[0-9]{19,20}$/);
+  assert.match(result.profile.activationCode, /^LPA:1\$/);
+  assert.equal((await bob.request(`/api/sims/${result.profile.id}`)).status, 404);
+  assert.equal((await alice.request(`/api/sims/${result.profile.id}`)).status, 200);
+  const list = await (await alice.request("/api/sims")).json(); assert.ok(list.some(p => p.id === result.profile.id));
+});
+
+test("issuance delayed duplicate callbacks issue one profile and late acceptance cannot reverse it", async () => {
+  await restart({ ISSUANCE_POLL_MS: "60000" });
+  const { order, job } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 20, callbackDelayMs: 2000 });
+  await until(async () => (await (await supplier(`/orders/${job.id}`)).json()).status === "ISSUED");
+  assert.equal(issuanceRow(order.id).status, "WAITING_CALLBACK");
+  assert.equal((await (await supplier(`/orders/${job.id}/stats`)).json()).callbackSent, 0);
+  await until(() => issuanceRow(order.id).status === "ISSUED");
+  const result = await (await supplier(`/orders/${job.id}`)).json();
+  const copies = await Promise.all(Array.from({ length: 20 }, () => supplierNotify(result)));
+  assert.ok(copies.every(r => r.status === 200));
+  await until(async () => (await (await supplier(`/orders/${job.id}/stats`)).json()).callbackSent === 20);
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM issuance_events WHERE event_id='${result.eventId}'`), "1");
+  const stats = await (await supplier(`/orders/${job.id}/stats`)).json();
+  assert.equal(stats.issueExecutions, 1); assert.equal(stats.requestCount, 1);
+  assert.equal(stats.callbackFailures, 0);
+  const stale = { ...result, eventId: randomUUID(), status: "ACCEPTED", revision: 1, iccid: null, activationCode: null };
+  assert.equal((await supplierNotify(stale)).status, 200); assert.equal(issuanceRow(order.id).status, "ISSUED");
+  assert.equal((await supplierNotify(result, false)).status, 401);
+  assert.equal((await supplierNotify({ ...result, orderId: randomUUID() })).status, 404);
+  assert.equal((await supplierNotify({ ...result, requestId: randomUUID() })).status, 404);
+  assert.equal((await supplierNotify({ ...result, activationCode: "LPA:1$smdp.example$changed" })).status, 409);
+  assert.equal((await supplierNotify({ ...result, revision: 2.5 })).status, 400);
+  assert.equal((await supplierNotify({ ...result, eventId: randomUUID(), status: "FAILED", reason: "MOCK_ISSUANCE_FAILED",
+    iccid: null, activationCode: null })).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
+});
+
+test("issuance callback omission recovers by supplier lookup without a second issuance", async () => {
+  await restart();
+  const { order, job } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 60000 });
+  await until(() => issuanceRow(order.id).status === "ISSUED");
+  assert.equal(sql(`SELECT count(*) FROM issuance_events WHERE issuance_id='${job.id}' AND source='LOOKUP' AND status='ISSUED'`), "1");
+  const stats = await (await supplier(`/orders/${job.id}/stats`)).json();
+  assert.equal(stats.callbackSent, 0); assert.equal(stats.issueExecutions, 1); assert.equal(stats.requestCount, 1);
+});
+
+test("issuance final failure without callback stays visible to customer and admin, never fabricates a profile", async () => {
+  const { order, job } = await issueOrder({ scenario: "FAIL", callbackCopies: 0, callbackDelayMs: 0 });
+  await until(() => issuanceRow(order.id).status === "FAILED");
+  assert.equal(orderState(order.id), "PAID");
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  const view = await (await alice.request(`/api/orders/${order.id}/issuance`)).json();
+  assert.equal(view.issuance.lastError, "MOCK_ISSUANCE_FAILED"); assert.equal(view.profile, null);
+  const issues = await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json();
+  const flagged = issues.items.find(item => item.order.id === order.id);
+  assert.ok(flagged); assert.equal(flagged.issuanceStatus, "FAILED"); assert.equal(flagged.issuanceError, "MOCK_ISSUANCE_FAILED");
+  const detail = await (await admin.request(`/api/admin/orders/${order.id}`)).json();
+  assert.equal(detail.issuance.issuance.status, "FAILED");
+  const result = await (await supplier(`/orders/${job.id}`)).json();
+  const repeats = await Promise.all(Array.from({ length: 20 }, () => supplierNotify(result)));
+  assert.ok(repeats.every(r => r.status === 200));
+  assert.equal((await (await supplier(`/orders/${job.id}/stats`)).json()).issueExecutions, 0);
+});
+
+test("issuance supplier acceptance survives lost local acknowledgement and recovers using the same reference", async () => {
+  await restart({ ISSUANCE_WORKER_DELAY_MS: "60000" });
+  const { order, job, simulation } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+  const accepted = await supplier("/orders", { requestId: job.id, orderId: order.id, simulation });
+  assert.equal(accepted.status, 202); assert.equal((await accepted.json()).status, "ACCEPTED");
+  sql(`UPDATE issuance_jobs SET status='PROCESSING',check_count=1,lease_token='${randomUUID()}',
+    lease_until=clock_timestamp()-INTERVAL '1 second' WHERE id='${job.id}'`);
+  await restart(); await until(() => issuanceRow(order.id).status === "ISSUED");
+  const stats = await (await supplier(`/orders/${job.id}/stats`)).json();
+  assert.equal(stats.requestCount, 1); assert.equal(stats.issueExecutions, 1);
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "1");
+});
+
+test("issuance job insertion failure rolls back paid state and the same PG result safely recovers", async () => {
+  const order = await newOrder();
+  sql("REVOKE INSERT ON issuance_jobs FROM alpha_media_app");
+  let attempt;
+  try {
+    const response = await alice.pay(order.id); assert.equal(response.status, 202); attempt = await response.json();
+    await until(async () => (await pg(`/payments/${attempt.id}`)).status === 200);
+    await delay(300);
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+  } finally { sql("GRANT INSERT ON issuance_jobs TO alpha_media_app"); }
+  const result = await (await pg(`/payments/${attempt.id}`)).json();
+  assert.equal((await notify(result)).status, 200);
+  assert.equal(orderState(order.id), "PAID");
+  await until(() => issuanceRow(order.id)?.status === "ISSUED");
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+  assert.equal((await (await pg(`/payments/${attempt.id}/stats`)).json()).approvalExecutions, 1);
+});
+
+test("issuance supplier idempotency rejects changed settings and returns one supplier order", async () => {
+  const { order, job, simulation } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+  await until(() => issuanceRow(order.id).status === "ISSUED");
+  const body = { requestId: job.id, orderId: order.id, simulation };
+  const copies = await Promise.all(Array.from({ length: 20 }, () => supplier("/orders", body)));
+  assert.ok(copies.every(r => r.status === 202));
+  assert.equal(new Set((await Promise.all(copies.map(r => r.json()))).map(r => r.supplierOrderNo)).size, 1);
+  assert.equal((await supplier("/orders", { ...body, simulation: { ...simulation, callbackCopies: 2 } })).status, 409);
+  assert.equal((await (await supplier(`/orders/${job.id}/stats`)).json()).issueExecutions, 1);
+});
+
+test("issuance unknown supplier result stops after six checks and is visible for operator review", async () => {
+  const unused = await port();
+  await restart({ SUPPLIER_BASE_URL: `http://127.0.0.1:${unused}/unavailable`, ISSUANCE_POLL_MS: "200" });
+  const { order } = await issueOrder();
+  await until(() => issuanceRow(order.id).status === "REVIEW_REQUIRED");
+  const job = issuanceRow(order.id);
+  assert.equal(job.check_count, 6); assert.equal(job.last_error, "SUPPLIER_RETRY_LIMIT_REACHED");
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  const issues = await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json();
+  assert.ok(issues.items.some(item => item.order.id === order.id));
+  await restart();
 });

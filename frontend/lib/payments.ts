@@ -1,12 +1,22 @@
 import { post } from "./auth";
+import type { IssuanceSimulation } from "./issuance";
 
 export type PaymentScenario = "APPROVE" | "DECLINE" | "RESPONSE_LOST";
+export type PaymentSimulation = {
+  scenario: PaymentScenario;
+  webhookCopies: number;
+  webhookDelayMs: number;
+  issuance: IssuanceSimulation;
+};
 export type PaymentAttempt = {
   id: string;
   orderId: string;
   amount: number;
   currency: "KRW";
   scenario: PaymentScenario;
+  webhookCopies: number;
+  webhookDelayMs: number;
+  issuance?: IssuanceSimulation;
   status: "QUEUED" | "PROCESSING" | "UNKNOWN" | "APPROVED" | "DECLINED" | "REVIEW_REQUIRED";
   pgTransactionId: string | null;
   declineCode: string | null;
@@ -15,9 +25,9 @@ export type PaymentAttempt = {
   updatedAt: string;
 };
 
-export async function acceptPayment(orderId: string, key: string, scenario: PaymentScenario): Promise<PaymentAttempt> {
+export async function acceptPayment(orderId: string, key: string, simulation: PaymentSimulation): Promise<PaymentAttempt> {
   const response = await post(`/api/orders/${encodeURIComponent(orderId)}/payment-attempts`,
-    JSON.stringify({ scenario, webhookCopies: 2, webhookDelayMs: scenario === "RESPONSE_LOST" ? 6000 : 1000 }),
+    JSON.stringify(simulation),
     "application/json", { "Idempotency-Key": key });
   return response.json();
 }

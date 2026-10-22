@@ -15,7 +15,8 @@ public class PaymentRepository {
             r.getString("currency"), PaymentAttempt.Scenario.valueOf(r.getString("scenario")),
             r.getInt("webhook_copies"), r.getInt("webhook_delay_ms"), r.getString("status"),
             r.getString("pg_transaction_id"), r.getString("decline_code"), r.getString("last_error"),
-            r.getInt("attempt_count"), r.getTimestamp("next_attempt_at").toInstant(),
+            r.getInt("attempt_count"), new IssuanceSimulation(IssuanceSimulation.Scenario.valueOf(r.getString("supplier_scenario")),
+                r.getInt("supplier_callback_copies"), r.getInt("supplier_callback_delay_ms")), r.getTimestamp("next_attempt_at").toInstant(),
             r.getTimestamp("created_at").toInstant(), r.getTimestamp("updated_at").toInstant());
     private final JdbcTemplate jdbc;
 
@@ -39,10 +40,12 @@ public class PaymentRepository {
     PaymentAttempt insert(Order order, UUID key, PaymentController.Request request) {
         return jdbc.query("""
                 INSERT INTO payment_attempts (id, order_id, idempotency_key, amount, currency,
-                    scenario, webhook_copies, webhook_delay_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    scenario, webhook_copies, webhook_delay_ms, supplier_scenario, supplier_callback_copies,
+                    supplier_callback_delay_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING *
                 """, MAPPER, UUID.randomUUID(), order.id(), key, order.amount(), order.currency(),
-                request.scenario().name(), request.webhookCopies(), request.webhookDelayMs()).getFirst();
+                request.scenario().name(), request.webhookCopies(), request.webhookDelayMs(), request.issuanceOrDefault().scenario().name(),
+                request.issuanceOrDefault().callbackCopies(), request.issuanceOrDefault().callbackDelayMs()).getFirst();
     }
 
     Optional<Claim> claim(int leaseMs) {

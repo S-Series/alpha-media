@@ -25,7 +25,7 @@ public class PaymentService {
         if (existing.isPresent()) {
             PaymentAttempt p = existing.get();
             if (p.scenario() != request.scenario() || p.webhookCopies() != request.webhookCopies()
-                    || p.webhookDelayMs() != request.webhookDelayMs()) {
+                    || p.webhookDelayMs() != request.webhookDelayMs() || !p.issuance().equals(request.issuanceOrDefault())) {
                 throw new OrderException(409, "IDEMPOTENCY_CONFLICT", "같은 요청 키에 다른 결제 조건을 사용할 수 없습니다.");
             }
             return new Acceptance(p, true);
