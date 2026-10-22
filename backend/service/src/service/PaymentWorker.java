@@ -16,9 +16,11 @@ public class PaymentWorker {
     private final PaymentTransitions transitions;
     private final PaymentSettings settings;
     private final PgClient pg;
+    private final OrderConflicts conflicts;
 
-    public PaymentWorker(PaymentRepository payments, PaymentTransitions transitions, PaymentSettings settings, PgClient pg) {
-        this.payments = payments; this.transitions = transitions; this.settings = settings; this.pg = pg;
+    public PaymentWorker(PaymentRepository payments, PaymentTransitions transitions, PaymentSettings settings, PgClient pg,
+            OrderConflicts conflicts) {
+        this.payments = payments; this.transitions = transitions; this.settings = settings; this.pg = pg; this.conflicts = conflicts;
     }
 
     @Scheduled(fixedDelayString = "${payment.worker-delay-ms}", initialDelayString = "${payment.worker-delay-ms}")
@@ -26,29 +28,45 @@ public class PaymentWorker {
         var next = payments.claim(settings.leaseMs());
         if (next.isEmpty()) return;
         var claim = next.get();
+        // 마지막 실행 뒤 DB 반영에 실패해도 저장된 한도를 넘겨 PG를 호출하지 않는다.
+        if (claim.exhausted()) {
+            uncertain(claim, true, "RETRY_LIMIT_REACHED");
+            return;
+        }
         try {
+            if (conflicts.blocked(claim.payment().orderId())) {
+                uncertain(claim, true, "ORDER_RESULT_CONFLICT");
+                return;
+            }
             PgResult result = null;
             // 타임아웃·재시작 후에는 기존 결제의 조회부터 한다. 새 결제번호를 만들지 않는다.
             if (claim.payment().attemptCount() > 1) result = pg.lookup(claim.payment()).orElse(null);
             String source=result==null?"RESPONSE":"LOOKUP";
             if (result == null) {
-                if (claim.payment().attemptCount() > 6) {
-                    transitions.uncertain(claim, true, "RETRY_LIMIT_REACHED"); return;
-                }
+                if (!transitions.mayApprove(claim)) return;
                 result = pg.approve(claim.payment());
             }
-            if (result == null || !result.matches(claim.payment())) throw new PgClient.InvalidResult();
-            transitions.result(result, claim.token(), source);
+            if (result == null) throw new PgClient.InvalidResult();
+            transitions.resultForClaim(result, claim, source);
         } catch (IOException exception) {
-            transitions.uncertain(claim, false, "PG_RESPONSE_UNKNOWN");
+            uncertain(claim, false, "PG_RESPONSE_UNKNOWN");
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            transitions.uncertain(claim, false, "PG_INTERRUPTED");
+            uncertain(claim, false, "PG_INTERRUPTED");
         } catch (PgClient.InvalidResult | OrderService.OrderException
                 | org.springframework.dao.DataIntegrityViolationException exception) {
-            transitions.uncertain(claim, true, "PG_RESULT_REQUIRES_REVIEW");
+            uncertain(claim, true, "PG_RESULT_REQUIRES_REVIEW");
         } catch (RuntimeException exception) {
-            // DB 장애 시 lease가 만료된 뒤 재선점한다. 로그에 외부 본문·키를 남기지 않는다.
+            // 결과 반영 트랜잭션이 끝난 뒤 별도 트랜잭션으로 불명 상태를 기록한다.
+            uncertain(claim, false, "PAYMENT_RESULT_STORAGE_UNKNOWN");
+        }
+    }
+
+    private void uncertain(PaymentRepository.Claim claim, boolean review, String error) {
+        try {
+            transitions.uncertain(claim, review, error);
+        } catch (RuntimeException exception) {
+            // 이것도 저장되지 않으면 lease 만료 후 다시 한도부터 검사한다.
             LOG.warn("Payment {} will be recovered after its lease expires ({})", claim.payment().id(), exception.getClass().getSimpleName());
         }
     }

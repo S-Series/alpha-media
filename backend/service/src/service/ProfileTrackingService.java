@@ -16,11 +16,14 @@ public class ProfileTrackingService {
     private final IssuanceRepository profiles;
     private final OrderRepository orders;
     private final ObjectMapper mapper;
-    public ProfileTrackingService(JdbcTemplate jdbc,IssuanceRepository profiles,OrderRepository orders,ObjectMapper mapper) {
-        this.jdbc=jdbc; this.profiles=profiles; this.orders=orders; this.mapper=mapper;
+    private final OrderConflicts conflicts;
+    public ProfileTrackingService(JdbcTemplate jdbc,IssuanceRepository profiles,OrderRepository orders,ObjectMapper mapper,OrderConflicts conflicts) {
+        this.jdbc=jdbc; this.profiles=profiles; this.orders=orders; this.mapper=mapper; this.conflicts=conflicts;
     }
     SimProfile owned(UUID owner,UUID id) {
-        return profiles.profileForMember(owner,id).orElseThrow(()->new OrderService.OrderException(404,"SIM_NOT_FOUND","SIM을 찾을 수 없습니다."));
+        var profile=profiles.profileForMember(owner,id).orElseThrow(()->new OrderService.OrderException(404,"SIM_NOT_FOUND","SIM을 찾을 수 없습니다."));
+        conflicts.requireClear(profile.orderId());
+        return profile;
     }
     View view(UUID owner,UUID id) {
         var profile=owned(owner,id);
@@ -33,6 +36,7 @@ public class ProfileTrackingService {
     public void viewed(UUID owner,UUID id) {
         orders.historyContext(owner,"QR_VIEW",null);
         var profile=owned(owner,id); orders.lock(profile.orderId());
+        conflicts.requireClear(profile.orderId());
         var current=jdbc.query("SELECT * FROM sim_profiles WHERE id=? FOR UPDATE",IssuanceRepository.PROFILE,id).getFirst();
         if (current.qrViewedAt()!=null) return;
         String next="ISSUED".equals(current.installStatus())?"QR_VIEWED":current.installStatus();

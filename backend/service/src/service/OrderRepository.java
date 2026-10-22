@@ -50,12 +50,13 @@ public class OrderRepository {
     }
 
     Optional<Order> lock(UUID memberId, UUID orderId) {
-        return jdbc.query(SELECT + " WHERE member_id=? AND id=? FOR UPDATE", MAPPER, memberId, orderId)
+        return jdbc.query(SELECT + " WHERE member_id=? AND id=? FOR NO KEY UPDATE", MAPPER, memberId, orderId)
                 .stream().findFirst();
     }
 
     Order lock(UUID orderId) {
-        return jdbc.query(SELECT + " WHERE id=? FOR UPDATE", MAPPER, orderId).getFirst();
+        // History inserts take an FK key-share lock. Keep it compatible with job claims.
+        return jdbc.query(SELECT + " WHERE id=? FOR NO KEY UPDATE", MAPPER, orderId).getFirst();
     }
 
     boolean startPayment(UUID orderId) {
@@ -95,6 +96,7 @@ public class OrderRepository {
                     AND (NOT ? OR EXISTS (SELECT 1 FROM payment_attempts p WHERE p.order_id=o.id
                         AND p.status IN ('UNKNOWN','REVIEW_REQUIRED'))
                         OR sp.sync_error IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM order_conflicts c WHERE c.order_id=o.id)
                         OR EXISTS (SELECT 1 FROM refunds r WHERE r.order_id=o.id AND r.status='REVIEW_REQUIRED')
                         OR (o.effective_status='PAID' AND EXISTS (SELECT 1 FROM issuance_jobs j WHERE j.order_id=o.id AND j.is_current
                             AND (j.status IN ('FAILED','REVIEW_REQUIRED') OR

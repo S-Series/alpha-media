@@ -8,11 +8,13 @@ import org.springframework.stereotype.Repository;
 
 @Repository
 public class RefundRepository {
+    static final int MAX_ROUND_ATTEMPTS = 3;
     private final JdbcTemplate jdbc;
     public RefundRepository(JdbcTemplate jdbc) { this.jdbc = jdbc; }
     private static final RowMapper<Refund> MAPPER = (r,i) -> new Refund(r.getObject("id",UUID.class),
         r.getObject("order_id",UUID.class),r.getObject("payment_id",UUID.class),r.getLong("amount"),r.getString("currency"),
         Refund.Scenario.valueOf(r.getString("scenario")),r.getString("status"),r.getInt("attempt_count"),
+        r.getInt("execution_round"),r.getInt("round_attempt_count"),
         r.getObject("pg_cancellation_id",UUID.class),r.getString("last_error"),
         r.getTimestamp("created_at").toInstant(),r.getTimestamp("updated_at").toInstant());
     Optional<Refund> find(UUID orderId) {
@@ -27,13 +29,16 @@ public class RefundRepository {
     Optional<Claim> claim(int leaseMs) {
         return jdbc.query("""
             WITH due AS (
-                SELECT id FROM refunds WHERE (status IN ('REQUESTED','UNKNOWN') AND next_attempt_at<=clock_timestamp())
+                SELECT id,round_attempt_count>=? AS exhausted FROM refunds WHERE (status IN ('REQUESTED','UNKNOWN') AND next_attempt_at<=clock_timestamp())
                     OR (status='PROCESSING' AND lease_until<=clock_timestamp())
                 ORDER BY next_attempt_at,id LIMIT 1 FOR UPDATE SKIP LOCKED
-            ) UPDATE refunds SET status='PROCESSING',attempt_count=attempt_count+1,lease_token=?,
+            ) UPDATE refunds r SET status='PROCESSING',
+                attempt_count=r.attempt_count + CASE WHEN due.exhausted THEN 0 ELSE 1 END,
+                round_attempt_count=r.round_attempt_count + CASE WHEN due.exhausted THEN 0 ELSE 1 END,lease_token=?,
                 lease_until=clock_timestamp()+(? * INTERVAL '1 millisecond'),updated_at=clock_timestamp()
-                WHERE id IN (SELECT id FROM due) RETURNING *
-            """,(r,i) -> new Claim(MAPPER.mapRow(r,i),r.getObject("lease_token",UUID.class)),UUID.randomUUID(),leaseMs)
+                FROM due WHERE r.id=due.id RETURNING r.*,due.exhausted
+            """,(r,i) -> new Claim(MAPPER.mapRow(r,i),r.getObject("lease_token",UUID.class),r.getBoolean("exhausted")),
+            MAX_ROUND_ATTEMPTS,UUID.randomUUID(),leaseMs)
             .stream().findFirst();
     }
     boolean owns(UUID id, UUID token) {
@@ -45,5 +50,5 @@ public class RefundRepository {
                 next_attempt_at=clock_timestamp()+(? * INTERVAL '1 millisecond'),updated_at=clock_timestamp() WHERE id=?
             """,status,cancellationId,error,delayMs,id);
     }
-    record Claim(Refund refund, UUID token) {}
+    record Claim(Refund refund, UUID token, boolean exhausted) {}
 }

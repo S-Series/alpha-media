@@ -19,11 +19,12 @@ public class AdminActionService {
     private final ObjectMapper mapper;
     private final PaymentSettings paymentSettings;
     private final IssuanceSettings issuanceSettings;
+    private final OrderConflicts conflicts;
     public AdminActionService(OrderRepository orders, IssuanceRepository jobs, RefundRepository refunds,
             AdminActionRepository actions, JdbcTemplate jdbc, ObjectMapper mapper, PaymentSettings paymentSettings,
-            IssuanceSettings issuanceSettings) {
+            IssuanceSettings issuanceSettings, OrderConflicts conflicts) {
         this.orders=orders; this.jobs=jobs; this.refunds=refunds; this.actions=actions; this.jdbc=jdbc;
-        this.mapper=mapper; this.paymentSettings=paymentSettings; this.issuanceSettings=issuanceSettings;
+        this.mapper=mapper; this.paymentSettings=paymentSettings; this.issuanceSettings=issuanceSettings; this.conflicts=conflicts;
     }
 
     @Transactional
@@ -65,6 +66,7 @@ public class AdminActionService {
     }
 
     private Issuance eligible(Order order, UUID expectedIssuanceId) {
+        conflicts.requireClear(order.id());
         if (!"PAID".equals(order.status()) || refunds.find(order.id()).isPresent()) {
             throw new OrderException(409,"ACTION_NOT_ALLOWED","결제 완료 상태이며 환불 접수가 없는 주문만 처리할 수 있습니다.");
         }

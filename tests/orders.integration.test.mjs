@@ -357,6 +357,46 @@ async function restart(extra = {}) {
   serviceProcess = await startService(extra);
 }
 
+async function providerProxy(name) {
+  const proxy = { calls: [], intercept: null };
+  const server = createHttpServer(async (request, response) => {
+    try {
+      const chunks = []; for await (const chunk of request) chunks.push(chunk);
+      const body = Buffer.concat(chunks).toString();
+      const call = { method: request.method, path: request.url, body: body ? JSON.parse(body) : null };
+      proxy.calls.push(call);
+      const intercepted = await proxy.intercept?.(call);
+      if (intercepted) {
+        response.writeHead(intercepted.status, { "Content-Type": "application/json" });
+        response.end(JSON.stringify(intercepted.body ?? {})); return;
+      }
+      const upstream = await fetch(`http://127.0.0.1:${servicePort}${request.url}`, {
+        method: request.method, headers: { "X-Gateway-Token": secret, Authorization: `Bearer ${secret}`,
+          "Content-Type": "application/json", ...(request.headers["idempotency-key"]
+            ? { "Idempotency-Key": request.headers["idempotency-key"] } : {}) },
+        body: body || undefined, signal: AbortSignal.timeout(5000),
+      });
+      response.writeHead(upstream.status, { "Content-Type": "application/json" });
+      response.end(await upstream.text());
+    } catch { response.writeHead(503); response.end(); }
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  proxy.url = `http://127.0.0.1:${server.address().port}/internal/${name}`;
+  proxy.forId = id => proxy.calls.filter(c => c.path.includes(id) || c.body?.paymentId === id || c.body?.requestId === id);
+  proxy.close = async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); };
+  return proxy;
+}
+
+function rejectTransitions(table, orderId, statuses) {
+  // Per-order real database failures exercise transaction rollback without breaking unrelated workers.
+  sql(`CREATE FUNCTION reject_transition_for_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.order_id='${orderId}' AND NEW.status IN (${statuses.map(s => `'${s}'`).join(",")})
+      THEN RAISE EXCEPTION 'simulated database write failure'; END IF; RETURN NEW; END $$;
+    CREATE TRIGGER reject_transition_for_test BEFORE UPDATE ON ${table}
+      FOR EACH ROW EXECUTE FUNCTION reject_transition_for_test();`);
+  return () => sql(`DROP TRIGGER reject_transition_for_test ON ${table}; DROP FUNCTION reject_transition_for_test();`);
+}
+
 test("payment intake authenticates owner, enforces CSRF, validates inputs and ignores forged amount", async () => {
   const order = await newOrder(), path = `/api/orders/${order.id}/payment-attempts`;
   assert.equal((await new Client().pay(order.id)).status, 401);
@@ -493,7 +533,7 @@ test("payment signed duplicate webhook and response races apply one event and on
   assert.equal((await notify({ ...result, amount: result.amount + 0.5 })).status, 400);
   assert.equal((await notify({ ...result, amount: String(result.amount) })).status, 400);
   assert.equal((await notify({ ...result, transactionId: "changed" })).status, 409);
-  assert.equal((await notify({ ...result, orderId: randomUUID() })).status, 404);
+  assert.equal((await notify({ ...result, orderId: randomUUID() })).status, 409);
   assert.equal(orderState(order.id), "PAID");
 });
 
@@ -505,7 +545,11 @@ test("payment forged amount webhook cannot mark an unresolved order paid", async
   assert.equal((await notify({ ...result, amount: 1 })).status, 409);
   assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
   assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
-  await settled(order, attempt);
+  assert.equal((await notify(result)).status, 409);
+  await settled(order, attempt, "REVIEW_REQUIRED");
+  assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
 });
 
 test("payment PG idempotency prevents duplicate charges and supports bounded partial/full cancellation", async () => {
@@ -548,8 +592,9 @@ test("payment mismatched PG lookup requires review and cannot mark the order pai
   assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
   sql(`UPDATE mock_pg_payments SET amount=amount-1 WHERE payment_id='${attempt.id}'`);
   const corrected = await (await pg(`/payments/${attempt.id}`)).json();
-  assert.equal((await notify(corrected)).status, 200);
-  assert.equal(orderState(order.id), "PAID");
+  assert.equal((await notify(corrected)).status, 409);
+  assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
 });
 
 test("payment queued work survives restart and a decline after its deadline expires the order", { timeout: 30000 }, async () => {
@@ -595,6 +640,67 @@ test("payment retries stop at six unresolved cycles without declaring decline or
   assert.equal(sql(`SELECT count(*) FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "0");
   await restart();
 });
+
+for (const domain of ["payment", "refund"]) {
+  for (const failure of ["completion", "error recording"]) {
+    test(`retry policy ${domain} persists its budget through DB ${failure} failures and restart`, { timeout: 60000 }, async () => {
+      const proxy = await providerProxy("mock-pg"), cap = domain === "payment" ? 6 : 3;
+      const table = domain === "payment" ? "payment_attempts" : "refunds";
+      const data = domain === "payment" ? { order: await newOrder() } : await failedOrder();
+      const { order } = data;
+      const settings = { MOCK_PG_BASE_URL: proxy.url, PAYMENT_LEASE_MS: "1200" };
+      let restore;
+      try {
+        await restart(settings);
+        restore = rejectTransitions(table, order.id, failure === "completion"
+          ? [domain === "payment" ? "APPROVED" : "SUCCEEDED"] : ["UNKNOWN", "REVIEW_REQUIRED"]);
+        if (failure === "error recording") proxy.intercept = () => ({ status: 503 });
+        const response = domain === "payment" ? await alice.pay(order.id)
+          : await adminAction(order.id, "refunds", refundRequest(data.job));
+        assert.equal(response.status, 202);
+        const paymentId = domain === "payment" ? (await response.json()).id : data.attempt.id;
+        const row = () => JSON.parse(sql(`SELECT row_to_json(r) FROM ${table} r WHERE order_id='${order.id}'`));
+        await until(() => row().attempt_count >= 2);
+        const beforeRestart = row();
+        await restart(settings);
+        await until(() => row().round_attempt_count === cap);
+        if (failure === "completion") await until(() => row().status === "REVIEW_REQUIRED");
+        else {
+          // Even the error write is failing: reclaiming an expired lease must not call PG again at the cap.
+          await delay(1500);
+          assert.equal(row().status, "PROCESSING");
+        }
+        const capped = row(), calls = proxy.forId(paymentId).length;
+        // A crash may consume a reserved attempt before its HTTP request leaves the process.
+        assert.ok(calls > 0 && calls <= cap + (domain === "refund" && failure === "completion" ? 1 : 0));
+        assert.equal(capped.attempt_count, cap); assert.equal(capped.round_attempt_count, cap);
+        assert.equal(capped.execution_round, 1); assert.ok(capped.attempt_count >= beforeRestart.attempt_count);
+        assert.equal(orderState(order.id), domain === "payment" ? "PAYMENT_PROCESSING" : "REFUND_PROCESSING");
+        restore(); restore = null;
+        await restart(settings);
+        await until(() => row().status === "REVIEW_REQUIRED");
+        await delay(1500);
+        assert.equal(row().attempt_count, cap); assert.equal(row().round_attempt_count, cap);
+        assert.equal(row().execution_round, 1); assert.equal(proxy.forId(paymentId).length, calls);
+        assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), domain === "payment" ? "0" : "1");
+        if (failure === "completion") {
+          if (domain === "payment") {
+            assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${paymentId}'`), "1");
+            assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${paymentId}'`), "0");
+          } else {
+            assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${paymentId}'`), "1");
+            assert.equal(sql(`SELECT count(*) FROM admin_action_events e JOIN admin_actions a ON a.id=e.action_id
+              WHERE a.order_id='${order.id}' AND e.status='SUCCEEDED'`), "0");
+          }
+        }
+        console.log(`retry proof ${domain}/${failure}: round=1 attempts=${cap} no external calls after restart`);
+      } finally {
+        if (restore) restore();
+        await restart(); await proxy.close();
+      }
+    });
+  }
+}
 
 test("payment mock is disabled by default and disabled mode cannot accept new attempts", async () => {
   await restart({ MOCK_PG_ENABLED: "false" });
@@ -697,7 +803,7 @@ test("issuance delayed duplicate callbacks issue one profile and late acceptance
   const stale = { ...result, eventId: randomUUID(), status: "ACCEPTED", revision: 1, iccid: null, activationCode: null };
   assert.equal((await supplierNotify(stale)).status, 200); assert.equal(issuanceRow(order.id).status, "ISSUED");
   assert.equal((await supplierNotify(result, false)).status, 401);
-  assert.equal((await supplierNotify({ ...result, orderId: randomUUID() })).status, 404);
+  assert.equal((await supplierNotify({ ...result, orderId: randomUUID() })).status, 409);
   assert.equal((await supplierNotify({ ...result, requestId: randomUUID() })).status, 404);
   assert.equal((await supplierNotify({ ...result, activationCode: "LPA:1$smdp.example$changed" })).status, 409);
   assert.equal((await supplierNotify({ ...result, revision: 2.5 })).status, 400);
@@ -783,11 +889,99 @@ test("issuance unknown supplier result stops after six checks and is visible for
   const { order } = await issueOrder();
   await until(() => issuanceRow(order.id).status === "REVIEW_REQUIRED");
   const job = issuanceRow(order.id);
-  assert.equal(job.check_count, 6); assert.equal(job.last_error, "SUPPLIER_RETRY_LIMIT_REACHED");
+  assert.equal(job.check_count, 6); assert.equal(job.consecutive_failures, 6);
+  assert.equal(job.last_error, "SUPPLIER_RETRY_LIMIT_REACHED");
   assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
   const issues = await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json();
   assert.ok(issues.items.some(item => item.order.id === order.id));
   await restart();
+});
+
+test("retry policy issuance ACCEPTED polls do not consume failures and retain the two-minute deadline through restart", { timeout: 45000 }, async () => {
+  const proxy = await providerProxy("mock-supplier");
+  const settings = { SUPPLIER_BASE_URL: proxy.url, ISSUANCE_POLL_MS: "200", SUPPLIER_COMPLETION_DELAY_MS: "600000" };
+  try {
+    await restart(settings);
+    const { order, job } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+    let waiting;
+    await until(() => {
+      waiting = issuanceRow(order.id);
+      return waiting.check_count >= 8 && waiting.status === "WAITING_CALLBACK";
+    });
+    assert.equal(waiting.consecutive_failures, 0); assert.equal(waiting.submission_count, 1);
+    assert.ok(waiting.waiting_since); assert.equal(waiting.execution_round, 1);
+    proxy.intercept = call => call.path.endsWith(`/orders/${job.id}`) ? { status: 503 } : null;
+    await until(() => {
+      const failed = issuanceRow(order.id);
+      return failed.consecutive_failures >= 2 && failed.status === "WAITING_CALLBACK";
+    });
+    proxy.intercept = null;
+    await until(() => {
+      const recovered = issuanceRow(order.id);
+      return recovered.status === "WAITING_CALLBACK" && recovered.consecutive_failures === 0;
+    });
+    await restart(settings);
+    await until(() => issuanceRow(order.id).status === "WAITING_CALLBACK");
+    assert.equal(issuanceRow(order.id).waiting_since, waiting.waiting_since);
+    assert.ok(issuanceRow(order.id).check_count > waiting.check_count);
+    // Advance only the persisted deadline; there is no need to sleep for two minutes.
+    sql(`UPDATE issuance_jobs SET waiting_since=clock_timestamp()-INTERVAL '121 seconds',
+      next_check_at=clock_timestamp() WHERE id='${job.id}'`);
+    await until(() => issuanceRow(order.id).status === "REVIEW_REQUIRED");
+    assert.equal(issuanceRow(order.id).last_error, "SUPPLIER_PENDING_TOO_LONG");
+    assert.equal(issuanceRow(order.id).consecutive_failures, 0);
+    assert.equal(issuanceRow(order.id).submission_count, 1);
+    const calls = proxy.forId(job.id).length;
+    await restart(settings); await delay(1000);
+    assert.equal(proxy.forId(job.id).length, calls);
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("retry policy issuance submissions stop at six even when ACCEPTED keeps resetting communication failures", { timeout: 45000 }, async () => {
+  const proxy = await providerProxy("mock-supplier");
+  const settings = { SUPPLIER_BASE_URL: proxy.url, ISSUANCE_POLL_MS: "300", SUPPLIER_COMPLETION_DELAY_MS: "600000" };
+  try {
+    proxy.intercept = call => call.method === "GET" && /\/orders\/[^/]+$/.test(call.path) ? { status: 404 } : null;
+    await restart(settings);
+    const { order, job } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+    await until(() => Number(sql(`SELECT request_count FROM mock_supplier_orders WHERE request_id='${job.id}'`)) >= 3);
+    await restart(settings);
+    await until(() => issuanceRow(order.id).status === "REVIEW_REQUIRED");
+    const reviewed = issuanceRow(order.id);
+    assert.equal(reviewed.submission_count, 6); assert.equal(reviewed.execution_round, 1);
+    assert.equal(reviewed.last_error, "SUPPLIER_SUBMISSION_LIMIT_REACHED");
+    assert.equal(proxy.forId(job.id).filter(c => c.method === "POST").length, 6);
+    assert.equal(sql(`SELECT request_count FROM mock_supplier_orders WHERE request_id='${job.id}'`), "6");
+    const calls = proxy.forId(job.id).length;
+    await restart(settings); await delay(1000);
+    assert.equal(proxy.forId(job.id).length, calls);
+    assert.equal(issuanceRow(order.id).submission_count, 6);
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("retry policy issuance DB acknowledgement failures exhaust durable failure reservations without resubmission", { timeout: 45000 }, async () => {
+  const proxy = await providerProxy("mock-supplier");
+  const settings = { SUPPLIER_BASE_URL: proxy.url, ISSUANCE_LEASE_MS: "1200", SUPPLIER_COMPLETION_DELAY_MS: "600000" };
+  let restore;
+  try {
+    await restart({ ...settings, ISSUANCE_WORKER_DELAY_MS: "60000" });
+    const { order, job } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+    restore = rejectTransitions("issuance_jobs", order.id, ["WAITING_CALLBACK", "ISSUED", "FAILED"]);
+    await restart(settings);
+    await until(() => issuanceRow(order.id).consecutive_failures >= 2);
+    await restart(settings);
+    await until(() => issuanceRow(order.id).status === "REVIEW_REQUIRED");
+    assert.equal(issuanceRow(order.id).consecutive_failures, 6);
+    assert.equal(issuanceRow(order.id).check_count, 6); assert.equal(issuanceRow(order.id).submission_count, 1);
+    assert.equal(sql(`SELECT count(*) FROM issuance_events WHERE issuance_id='${job.id}'`), "0");
+    const calls = proxy.forId(job.id).length;
+    restore(); restore = null;
+    await restart(settings); await delay(1000);
+    assert.equal(proxy.forId(job.id).length, calls);
+    assert.equal(sql(`SELECT request_count FROM mock_supplier_orders WHERE request_id='${job.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  } finally { if (restore) restore(); await restart(); await proxy.close(); }
 });
 
 async function failedOrder() {
@@ -806,6 +1000,177 @@ async function adminAction(orderId, type, body, key = randomUUID(), client = adm
 function refundRequest(job, scenario = "SUCCESS") { return { issuanceId: job.id, reason: "발급 실패 고객 전액 환불", scenario }; }
 function retryRequest(job, scenario = "SUCCEED") {
   return { issuanceId: job.id, reason: "공급사 오류 확인 후 재발급", simulation: { scenario, callbackCopies: 3, callbackDelayMs: 100 } };
+}
+
+async function contradictoryIssuedResult(order, job) {
+  const actual = await (await supplier(`/orders/${job.id}`)).json();
+  const issued = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+  await until(() => issuanceRow(issued.order.id).status === "ISSUED");
+  const profile = await (await supplier(`/orders/${issued.job.id}`)).json();
+  return { ...actual, eventId: randomUUID(), orderId: order.id, status: "ISSUED", reason: null,
+    iccid: profile.iccid, activationCode: profile.activationCode };
+}
+
+test("conflict policy terminal supplier contradiction is durable deduplicated and blocks both administrator actions", { timeout: 45000 }, async () => {
+  const { order, job } = await failedOrder();
+  const contradiction = await contradictoryIssuedResult(order, job);
+  assert.equal((await supplierNotify(contradiction, false)).status, 401);
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "0");
+  const responses = await Promise.all(Array.from({ length: 20 }, () => supplierNotify(contradiction)));
+  assert.ok(responses.every(r => r.status === 409));
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
+  assert.equal(issuanceRow(order.id).status, "FAILED");
+  assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  for (const client of [admin, await member("admin2")]) {
+    assert.equal((await adminAction(order.id, "refunds", refundRequest(job), randomUUID(), client)).status, 409);
+    assert.equal((await adminAction(order.id, "issuance-retries", retryRequest(job), randomUUID(), client)).status, 409);
+  }
+  const detail = await (await admin.request(`/api/admin/orders/${order.id}`)).json();
+  assert.equal(detail.conflicts.length, 1);
+  assert.equal(detail.conflicts[0].target, "ISSUANCE"); assert.equal(detail.conflicts[0].targetId, job.id);
+  assert.equal(detail.conflicts[0].expectedStatus, "FAILED"); assert.equal(detail.conflicts[0].observedStatus, "ISSUED");
+  assert.ok(detail.timeline.items.some(e => e.target === "CONFLICT"));
+  await restart();
+  assert.equal((await supplierNotify(contradiction)).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
+  assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 409);
+  assert.equal((await adminAction(order.id, "issuance-retries", retryRequest(job))).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM admin_actions WHERE order_id='${order.id}'`), "0");
+  assert.equal(sql(`SELECT count(*) FROM order_history WHERE order_id='${order.id}' AND target='CONFLICT'`), "1");
+  sql(`UPDATE order_conflicts SET code='HIDDEN' WHERE order_id='${order.id}'`, true, true);
+  sql(`DELETE FROM order_conflicts WHERE order_id='${order.id}'`, true, true);
+});
+
+test("conflict policy signed contradictory payment result blocks new charges after decline and survives restart", async () => {
+  const order = await newOrder(), attempt = await (await alice.pay(order.id, randomUUID(), "DECLINE")).json();
+  await settled(order, attempt, "DECLINED");
+  const result = await (await pg(`/payments/${attempt.id}`)).json();
+  const contradiction = { ...result, eventId: randomUUID(), status: "APPROVED", declineCode: null,
+    transactionId: `contradictory_${randomUUID()}` };
+  assert.equal((await notify(contradiction, false)).status, 401);
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "0");
+  assert.equal((await notify(contradiction)).status, 409);
+  assert.equal((await notify(contradiction)).status, 409);
+  assert.equal(orderState(order.id), "PENDING_PAYMENT");
+  assert.equal((await alice.pay(order.id)).status, 409);
+  await restart();
+  assert.equal((await alice.pay(order.id)).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM payment_attempts WHERE order_id='${order.id}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+  const issues = await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json();
+  assert.ok(issues.items.some(item => item.order.id === order.id));
+});
+
+test("conflict policy mismatched callback order ID quarantines the referenced payment or issuance, not an unrelated order", async () => {
+  for (const target of ["PAYMENT", "ISSUANCE"]) {
+    const { order, job, attempt } = await failedOrder(), unrelated = await newOrder();
+    const result = target === "PAYMENT" ? await (await pg(`/payments/${attempt.id}`)).json()
+      : await (await supplier(`/orders/${job.id}`)).json();
+    const notifyResult = target === "PAYMENT" ? notify : supplierNotify;
+    assert.equal((await notifyResult({ ...result, orderId: unrelated.id })).status, 409);
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}' AND target='${target}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${unrelated.id}'`), "0");
+    assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 409);
+    assert.equal((await adminAction(order.id, "issuance-retries", retryRequest(job))).status, 409);
+    const payable = await alice.pay(unrelated.id, randomUUID(), "DECLINE");
+    assert.equal(payable.status, 202); await settled(unrelated, await payable.json(), "DECLINED");
+  }
+});
+
+test("conflict policy reused PG transaction reference quarantines an unresolved payment without issuing another SIM", async () => {
+  const original = await newOrder(), paid = await (await alice.pay(original.id)).json();
+  await settled(original, paid);
+  const approved = await (await pg(`/payments/${paid.id}`)).json();
+  await restart({ PAYMENT_WORKER_DELAY_MS: "60000" });
+  try {
+    const order = await newOrder(), queued = await (await alice.pay(order.id)).json();
+    assert.equal(queued.status, "QUEUED");
+    const collision = { ...approved, eventId: randomUUID(), orderId: order.id, paymentId: queued.id };
+    assert.equal((await notify(collision)).status, 409);
+    assert.equal((await notify(collision)).status, 409);
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}' AND code='PG_TRANSACTION_CONFLICT'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${original.id}'`), "0");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${queued.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+  } finally { await restart(); }
+});
+
+test("conflict policy reused supplier ICCID quarantines a queued issuance without inserting a duplicate profile", async () => {
+  const original = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+  await until(() => issuanceRow(original.order.id).status === "ISSUED");
+  const issued = await (await supplier(`/orders/${original.job.id}`)).json();
+  await restart({ ISSUANCE_WORKER_DELAY_MS: "60000" });
+  try {
+    const { order, job } = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+    assert.equal(issuanceRow(order.id).status, "QUEUED");
+    const collision = { ...issued, eventId: randomUUID(), orderId: order.id, requestId: job.id,
+      supplierOrderNo: `supplier_${job.id}` };
+    assert.equal((await supplierNotify(collision)).status, 409);
+    assert.equal((await supplierNotify(collision)).status, 409);
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}' AND code='SUPPLIER_REFERENCE_CONFLICT'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${original.order.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM issuance_events WHERE issuance_id='${job.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE iccid='${issued.iccid}'`), "1");
+  } finally { await restart(); }
+});
+
+test("conflict policy quarantines a queued refund before the external cancellation can execute", async () => {
+  const { order, job, attempt } = await failedOrder();
+  const contradiction = await contradictoryIssuedResult(order, job);
+  await restart({ PAYMENT_WORKER_DELAY_MS: "60000" });
+  try {
+    assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 202);
+    assert.equal(refundRow(order.id).status, "REQUESTED");
+    assert.equal((await supplierNotify(contradiction)).status, 409);
+    await restart();
+    await until(() => refundRow(order.id).status === "REVIEW_REQUIRED");
+    assert.equal(orderState(order.id), "REFUND_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM sim_profiles WHERE order_id='${order.id}'`), "0");
+  } finally { await restart(); }
+});
+
+for (const domain of ["payment", "refund"]) {
+  test(`conflict policy ${domain} rechecks quarantine after a blocked lookup before sending a provider write`, { timeout: 45000 }, async () => {
+    const data = domain === "payment" ? { order: await newOrder() } : await failedOrder();
+    const { order } = data, proxy = await providerProxy("mock-pg");
+    let paymentId = data.attempt?.id, lookupEntered = false, releaseLookup;
+    const blockedLookup = new Promise(resolve => { releaseLookup = resolve; });
+    proxy.intercept = async call => {
+      if (domain === "payment" && call.method === "POST" && call.body?.orderId === order.id) return { status: 503 };
+      if (call.method === "GET" && paymentId && call.path.includes(`/payments/${paymentId}`)) {
+        lookupEntered = true;
+        await blockedLookup;
+        return { status: 404 };
+      }
+      return null;
+    };
+    try {
+      await restart({ MOCK_PG_BASE_URL: proxy.url, PG_HTTP_TIMEOUT_MS: "5000", PAYMENT_LEASE_MS: "12000" });
+      const response = domain === "payment" ? await alice.pay(order.id)
+        : await adminAction(order.id, "refunds", refundRequest(data.job));
+      assert.equal(response.status, 202);
+      if (domain === "payment") paymentId = (await response.json()).id;
+      await until(() => lookupEntered, 10000);
+      const writesBeforeConflict = proxy.forId(paymentId).filter(c => c.method === "POST").length;
+      assert.equal(writesBeforeConflict, domain === "payment" ? 1 : 0);
+      assert.equal((await notify({ eventId: randomUUID(), paymentId, orderId: order.id, amount: 1,
+        currency: "KRW", status: "APPROVED", transactionId: `conflicting_${randomUUID()}`, declineCode: null })).status, 409);
+      assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${order.id}'`), "1");
+      releaseLookup();
+      const row = () => domain === "payment"
+        ? JSON.parse(sql(`SELECT row_to_json(p) FROM payment_attempts p WHERE id='${paymentId}'`)) : refundRow(order.id);
+      await until(() => row().status === "REVIEW_REQUIRED");
+      assert.equal(row().last_error, "ORDER_RESULT_CONFLICT");
+      assert.equal(proxy.forId(paymentId).filter(c => c.method === "POST").length, writesBeforeConflict);
+      const externalTable = domain === "payment" ? "mock_pg_payments" : "mock_pg_cancellations";
+      assert.equal(sql(`SELECT count(*) FROM ${externalTable} WHERE payment_id='${paymentId}'`), "0");
+      assert.equal(orderState(order.id), domain === "payment" ? "PAYMENT_PROCESSING" : "REFUND_PROCESSING");
+    } finally { releaseLookup(); await restart(); await proxy.close(); }
+  });
 }
 
 test("refund admin actions require administrator, CSRF, reason and a confirmed current failure", async () => {

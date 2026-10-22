@@ -91,22 +91,34 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
 
   const job = view.issuance?.issuance;
   const profile = view.issuance?.profile;
+  const conflicts = view.conflicts || [];
   const age = now === null || !view.checkedAt ? null : Math.max(0, Math.floor((now - Date.parse(view.checkedAt)) / 1000));
-  const canAct = view.order.order.status === "PAID" && job?.status === "FAILED" && !view.issuance?.profile && !view.refund;
+  const canAct = view.order.order.status === "PAID" && job?.status === "FAILED" && !view.issuance?.profile && !view.refund && conflicts.length === 0;
   return <>
     <p>서버 마지막 조회: {view.checkedAt ? kst(view.checkedAt) : "조회 시각 확인 대기"}{age !== null && ` · ${age}초 전`} · 처리 중 1.5초, 그 외 5초 간격 갱신</p>
     {pollError && <p role="alert">{pollError}</p>}
     <OrderSummary order={view.order.order} />
+    {conflicts.length > 0 && <section className="home-panel"><h2>상충 결과 확인 필요</h2>
+      <p role="alert">기존 기록과 다른 외부 결과가 발견되어 발급 재시도·환불을 차단했습니다. PG·공급사의 실제 처리 결과를 확인해야 합니다.</p>
+      {conflicts.map(conflict => <article key={conflict.id}>
+        <h3>{conflict.target} · {conflict.code}</h3>
+        <p>기존 기록: {conflict.expectedStatus} · 수신 결과: {conflict.observedStatus}<br />
+          대상 번호: {conflict.targetId}<br />수신 경로: {conflict.source} · 기록 시각: {kst(conflict.recordedAt)}</p>
+      </article>)}
+    </section>}
     <section className="home-panel"><h2>결제 시도</h2><p>최근 최대 20건을 표시합니다.</p>
       {view.payments.length === 0 ? <p>아직 결제 시도가 없습니다.</p> : view.payments.map(payment => <article key={payment.id}>
         <h3>{paymentStatus(payment.status)}</h3><p>결제번호: {payment.id}</p>
-        <p>PG 확인 {payment.attemptCount}회 · 마지막 변경 {kst(payment.updatedAt)}</p>
+        <p>누적 PG 처리·확인 시도 {payment.attemptCount}회 · 마지막 변경 {kst(payment.updatedAt)}</p>
+        {payment.executionRound !== undefined && <p>실행 회차 {payment.executionRound} · 이번 회차 시도 {payment.roundAttemptCount ?? payment.attemptCount}/6회</p>}
         {payment.lastError && <p>확인 사유: {payment.lastError}</p>}
       </article>)}
     </section>
     <section className="home-panel"><h2>발급·설치 상태</h2>
       {job ? <><p>{issuanceStatus(job.status)} · 발급 요청번호 {job.id}</p>
-        <p>공급사 접수번호: {job.supplierOrderNo || "접수 확인 중"}<br />공급사 확인 {job.checkCount}회 · 마지막 변경 {kst(job.updatedAt)}</p>
+        <p>공급사 접수번호: {job.supplierOrderNo || "접수 확인 중"}<br />누적 공급사 확인 시도 {job.checkCount}회 · 마지막 변경 {kst(job.updatedAt)}</p>
+        {job.executionRound !== undefined && <p>실행 회차 {job.executionRound} · 발급 제출 시도 {job.submissionCount ?? 0}회</p>}
+        {job.waitingSince && <p>정상 결과 대기 시작: {kst(job.waitingSince)} · 최대 2분, 5초 간격 확인</p>}
         {job.lastError && <p role="alert">조치 필요: {job.lastError}</p>}</> : <p>아직 발급 작업이 없습니다.</p>}
       {profile && <><p>ICCID: {profile.iccid} · {simStatus(profile.installStatus)}</p>
         <p>설치: {profile.installedAt ? kst(profile.installedAt) : "미확인"}<br />
@@ -133,18 +145,19 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
       <div className="page-actions">
         <button disabled={pending || !canAct || !reason.trim()} onClick={() => submit("issuance-retries")}>발급 재시도</button>
         <button disabled={pending || !canAct || !reason.trim()} onClick={() => submit("refunds")}>전액 환불 접수</button>
-        <button disabled={pending || !draft} onClick={() => draft && void send(draft, 1)}>동일 요청 다시 전송</button>
+        <button disabled={pending || !draft || conflicts.length > 0} onClick={() => draft && void send(draft, 1)}>동일 요청 다시 전송</button>
         <button disabled={pending} onClick={() => setRefresh(value => value + 1)}>조치 결과 다시 확인</button>
       </div>
       {draft && <p>요청 키: <code>{draft.key}</code> · 재전송은 사유·시연 조건까지 처음 요청 그대로 보냅니다.</p>}
       {message && <p role="status">{message}</p>}{error && <p role="alert">{error}</p>}
     </section>
-    <AdminConcurrencyDemo orderId={id} issuanceId={job?.id} eligible={!!canAct} />
+    {conflicts.length === 0 && <AdminConcurrencyDemo orderId={id} issuanceId={job?.id} eligible={!!canAct} />}
     <section className="home-panel"><h2>환불 처리</h2>
       {view.refund ? <>
         <p>{states[view.refund.status] || view.refund.status} · {money(view.refund.amount)} KRW</p>
         <p>환불번호: {view.refund.id}<br />PG 취소번호: {view.refund.pgCancellationId || "확인 중"}</p>
-        <p>PG 처리·확인 {view.refund.attemptCount}회</p>
+        <p>누적 PG 처리·확인 시도 {view.refund.attemptCount}회</p>
+        {view.refund.executionRound !== undefined && <p>실행 회차 {view.refund.executionRound} · 이번 회차 시도 {view.refund.roundAttemptCount ?? view.refund.attemptCount}/3회</p>}
         {view.refund.lastError && <p>확인 사유: {view.refund.lastError}</p>}
         {view.refund.status === "REVIEW_REQUIRED" && <p role="alert">자동 처리를 중단했습니다. 환불 완료로 간주하지 않으며 새 환불·발급을 막습니다. PG 원장 확인이 필요합니다.</p>}
       </> : <p>환불 접수 없음</p>}

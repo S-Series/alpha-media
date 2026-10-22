@@ -13,9 +13,10 @@ public class PaymentService {
     private final OrderRepository orders;
     private final PaymentRepository payments;
     private final PaymentSettings settings;
+    private final OrderConflicts conflicts;
 
-    public PaymentService(OrderRepository orders, PaymentRepository payments, PaymentSettings settings) {
-        this.orders = orders; this.payments = payments; this.settings = settings;
+    public PaymentService(OrderRepository orders, PaymentRepository payments, PaymentSettings settings, OrderConflicts conflicts) {
+        this.orders = orders; this.payments = payments; this.settings = settings; this.conflicts=conflicts;
     }
 
     @Transactional
@@ -41,6 +42,7 @@ public class PaymentService {
             }
             return new Acceptance(p, true);
         }
+        conflicts.requireClear(orderId);
         if (!settings.mockEnabled()) throw new OrderException(503, "PAYMENTS_UNAVAILABLE", "모의 결제가 활성화되지 않았습니다.");
         if (!"PENDING_PAYMENT".equals(order.status())) {
             throw new OrderException(409, "ORDER_NOT_PAYABLE", "만료·결제 확인 중·결제 완료 주문은 새 결제를 시작할 수 없습니다.");

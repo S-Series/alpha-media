@@ -16,6 +16,10 @@ export type Issuance = {
   supplierOrderNo: string | null;
   revision: number;
   checkCount: number;
+  executionRound?: number;
+  consecutiveFailures?: number;
+  submissionCount?: number;
+  waitingSince?: string | null;
   lastError: string | null;
   createdAt: string;
   updatedAt: string;

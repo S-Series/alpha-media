@@ -10,12 +10,14 @@ import org.springframework.stereotype.Repository;
 
 @Repository
 public class PaymentRepository {
+    static final int MAX_ROUND_ATTEMPTS = 6;
     static final RowMapper<PaymentAttempt> MAPPER = (r, i) -> new PaymentAttempt(
             r.getObject("id", UUID.class), r.getObject("order_id", UUID.class), r.getLong("amount"),
             r.getString("currency"), PaymentAttempt.Scenario.valueOf(r.getString("scenario")),
             r.getInt("webhook_copies"), r.getInt("webhook_delay_ms"), r.getString("status"),
             r.getString("pg_transaction_id"), r.getString("decline_code"), r.getString("last_error"),
-            r.getInt("attempt_count"), new IssuanceSimulation(IssuanceSimulation.Scenario.valueOf(r.getString("supplier_scenario")),
+            r.getInt("attempt_count"), r.getInt("execution_round"), r.getInt("round_attempt_count"),
+            new IssuanceSimulation(IssuanceSimulation.Scenario.valueOf(r.getString("supplier_scenario")),
                 r.getInt("supplier_callback_copies"), r.getInt("supplier_callback_delay_ms")), r.getTimestamp("next_attempt_at").toInstant(),
             r.getTimestamp("created_at").toInstant(), r.getTimestamp("updated_at").toInstant());
     private final JdbcTemplate jdbc;
@@ -25,6 +27,13 @@ public class PaymentRepository {
     Optional<PaymentAttempt> find(UUID orderId, UUID id) {
         return jdbc.query("SELECT * FROM payment_attempts WHERE order_id=? AND id=?", MAPPER, orderId, id)
                 .stream().findFirst();
+    }
+    Optional<PaymentAttempt> findById(UUID id) {
+        return jdbc.query("SELECT * FROM payment_attempts WHERE id=?",MAPPER,id).stream().findFirst();
+    }
+    boolean transactionUsedByAnother(String transaction, UUID id) {
+        return Boolean.TRUE.equals(jdbc.queryForObject(
+            "SELECT EXISTS(SELECT 1 FROM payment_attempts WHERE pg_transaction_id=? AND id<>?)",Boolean.class,transaction,id));
     }
 
     Optional<PaymentAttempt> findByKey(UUID orderId, UUID key) {
@@ -52,17 +61,19 @@ public class PaymentRepository {
         // 선점만 커밋한다. PG 통신 동안 DB 잠금을 보유하지 않는다.
         return jdbc.query("""
                 WITH due AS (
-                    SELECT id FROM payment_attempts
+                    SELECT id, round_attempt_count >= ? AS exhausted FROM payment_attempts
                     WHERE (status IN ('QUEUED','UNKNOWN') AND next_attempt_at <= clock_timestamp())
                        OR (status='PROCESSING' AND lease_until <= clock_timestamp())
                     ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
                 )
                 UPDATE payment_attempts p SET status='PROCESSING', lease_token=?,
                     lease_until=clock_timestamp() + (? * INTERVAL '1 millisecond'),
-                    attempt_count=attempt_count+1, updated_at=clock_timestamp()
-                WHERE p.id IN (SELECT id FROM due) RETURNING p.*
-                """, (r, i) -> new Claim(MAPPER.mapRow(r, i), r.getObject("lease_token", UUID.class)),
-                UUID.randomUUID(), leaseMs).stream().findFirst();
+                    attempt_count=p.attempt_count + CASE WHEN due.exhausted THEN 0 ELSE 1 END,
+                    round_attempt_count=p.round_attempt_count + CASE WHEN due.exhausted THEN 0 ELSE 1 END,
+                    updated_at=clock_timestamp()
+                FROM due WHERE p.id=due.id RETURNING p.*, due.exhausted
+                """, (r, i) -> new Claim(MAPPER.mapRow(r, i), r.getObject("lease_token", UUID.class), r.getBoolean("exhausted")),
+                MAX_ROUND_ATTEMPTS, UUID.randomUUID(), leaseMs).stream().findFirst();
     }
 
     PaymentAttempt lock(UUID id) {
@@ -100,5 +111,5 @@ public class PaymentRepository {
         return false;
     }
 
-    record Claim(PaymentAttempt payment, UUID token) {}
+    record Claim(PaymentAttempt payment, UUID token, boolean exhausted) {}
 }

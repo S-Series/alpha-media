@@ -486,6 +486,15 @@ flowchart TD
 
 저장소에는 eSIM 주문·결제, DB 작업 선점, 모의 PG·공급사, 콜백 검증·조회, 발급 실패 후 운영자 재발급·전액 환불, 설치 추적·감사 이력이 있다. 이는 설계의 출발점이다. 위의 전체 상태·API·영속 수신함·실행 회차·USIM·부분 환불·사용 차단·대사·감시 계약이 모두 같은 방식으로 구현됐다는 뜻은 아니다.
 
+### 1단계 구현: 재시도 한도와 결과 충돌 차단
+
+- 결제 6회·환불 3회의 실행 예산을 호출 전에 DB에 예약한다. DB 결과 반영과 오류 기록이 모두 실패해도 lease 복구 시 저장된 예산부터 검사한다. 소진된 회차는 외부 호출 없이 확인 필요 상태로 전환한다.
+- 발급은 정상 대기와 연속 실패를 구분한다. 정상 응답을 저장하면 연속 실패 횟수를 초기화하며, 최초 접수 확인부터 2분이 지나거나 연속 실패 6회면 자동 확인을 중단한다. 정상 조회와 별도로 공급사 접수 호출도 최대 6회다. 기본 조회 간격은 5초다.
+- 누적 확인 횟수와 실행 회차를 보존한다. 현재는 최초 회차만 있으며 새 실행 회차를 여는 운영자 복구 API는 3단계 대상이다. 서버 재시작만으로 예산을 초기화하지 않는다.
+- 인증된 외부 결과의 식별자·금액·최종 상태·이벤트 내용 충돌은 `order_conflicts`와 감사 이력에 저장한다. 실제 결제·발급 ID에 연결된 주문을 격리하고 새 결제·재발급·환불·활성화 정보 제공을 차단한다. 외부 조회 후 승인·취소를 보내기 직전에도 충돌을 다시 확인한다. 다만 마지막 DB 검사와 외부 HTTP 호출은 원자적이지 않으므로 그 사이에 발생한 충돌이나 이미 전송된 요청을 소급 취소할 수는 없다. 이런 경우에도 충돌 주문의 내부 결과 반영은 차단한다.
+- 동일 충돌의 반복 통지는 같은 사건으로 합친다. 운영자 상세와 확인 필요 목록에 나타나며 일반 앱 DB 계정은 충돌 기록을 수정·삭제할 수 없다. 이후 정상 통지가 오더라도 격리를 자동 해제하지 않는다.
+- 이 단계는 영속 수신함이나 운영자 재조회·재개 기능을 포함하지 않는다. 충돌 격리 해제는 외부 근거를 검증하는 후속 복구 단계에서 구현한다.
+
 구현 참고:
 
 - [주문·기한 검사](../backend/service/src/service/OrderRepository.java), [결제 접수](../backend/service/src/service/PaymentService.java), [결제 워커](../backend/service/src/service/PaymentWorker.java), [결제 결과 반영](../backend/service/src/service/PaymentTransitions.java).
@@ -494,4 +503,4 @@ flowchart TD
 - [운영자 조치](../backend/service/src/service/AdminActionService.java), [환불 워커](../backend/service/src/service/RefundWorker.java), [환불 반영](../backend/service/src/service/RefundService.java).
 - [설치 반영](../backend/service/src/service/ProfileTrackingService.java), [SIM 생명주기](sim-lifecycle.md), [데이터 계약](data-contract.md), [기존 통합 테스트](../tests/orders.integration.test.mjs).
 
-이 변경은 설계 문서 수정이다. 애플리케이션 구현과 기존 문서를 수정하지 않았으며 통합 테스트·신규 수용 시나리오는 이 문서 작성 중 실행하지 않았다.
+위 설계 수용 조건 전체의 구현·검증 완료를 의미하지 않는다. 1단계의 재시도·충돌 검증은 통합 테스트의 `retry policy`, `conflict policy` 시나리오에 포함한다.

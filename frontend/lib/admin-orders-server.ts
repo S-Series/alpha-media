@@ -10,9 +10,13 @@ export type AdminOrder = { order: Order; customerUsername: string; issuanceStatu
 export type HistoryEvent = { id: string; target: string; targetId: string; fromStatus: string | null; toStatus: string;
   actor: string; source: string; reason: string | null; recordedAt: string };
 export type HistoryPage = { items: HistoryEvent[]; nextBefore: string | null; checkedAt: string };
+export type OrderConflict = { id: string; orderId: string; target: string; targetId: string; code: string; source: string;
+  expectedStatus: string; observedStatus: string; recordedAt: string };
 type Page = { items: AdminOrder[]; page: number; size: number; hasNext: boolean; checkedAt: string };
 export type AdminOrderDetail = { order: AdminOrder; payments: PaymentAttempt[]; issuance?: IssuanceView;
-  refund?: { id: string; status: string; amount: number; attemptCount: number; lastError: string | null; pgCancellationId: string | null } | null;
+  refund?: { id: string; status: string; amount: number; attemptCount: number; executionRound?: number; roundAttemptCount?: number;
+    lastError: string | null; pgCancellationId: string | null } | null;
+  conflicts?: OrderConflict[];
   actions?: { id: string; actor: string; type: string; reason: string; issuanceId: string | null; refundId: string | null; createdAt: string }[];
   actionEvents?: { id: string; actionId: string; status: string; detail: string | null; createdAt: string }[];
   timeline: HistoryPage; checkedAt: string;

@@ -18,38 +18,72 @@ public class PaymentTransitions {
     private final PaymentSettings settings;
     private final ObjectMapper mapper;
     private final IssuanceRepository issuances;
+    private final OrderConflicts conflicts;
 
     public PaymentTransitions(OrderRepository orders, PaymentRepository payments, PaymentSettings settings, ObjectMapper mapper,
-            IssuanceRepository issuances) {
-        this.orders = orders; this.payments = payments; this.settings = settings; this.mapper = mapper; this.issuances = issuances;
+            IssuanceRepository issuances, OrderConflicts conflicts) {
+        this.orders = orders; this.payments = payments; this.settings = settings; this.mapper = mapper; this.issuances = issuances; this.conflicts=conflicts;
+    }
+
+    @Transactional(noRollbackFor=OrderConflicts.ConflictException.class)
+    public void resultForClaim(PgResult result, PaymentRepository.Claim claim, String source) {
+        orders.lock(claim.payment().orderId());
+        var current=payments.lock(claim.payment().id());
+        if (!payments.ownsLease(current.id(),claim.token())) return;
+        if (!result.matches(current)) throw conflicts.reject(current.orderId(),"PAYMENT",current.id(),"PG_RESULT_MISMATCH",
+            "PG_"+source,current.status(),result.status(),hash(result));
+        result(result,claim.token(),source);
     }
 
     @Transactional
+    public boolean mayApprove(PaymentRepository.Claim claim) {
+        orders.lock(claim.payment().orderId());
+        payments.lock(claim.payment().id());
+        if (!payments.ownsLease(claim.payment().id(),claim.token())) return false;
+        if (conflicts.blocked(claim.payment().orderId())) {
+            uncertain(claim,true,"ORDER_RESULT_CONFLICT"); return false;
+        }
+        return true;
+    }
+
+    @Transactional(noRollbackFor=OrderConflicts.ConflictException.class)
     public void result(PgResult result, UUID token, String source) {
         orders.historyContext(null,"PG_"+source,null);
         if (result == null || result.orderId() == null || result.paymentId() == null) {
             throw new OrderException(400, "INVALID_PG_RESULT", "PG 응답 형식이 올바르지 않습니다.");
         }
         // 사용자 접수와 동일하게 주문 → 결제 순서로 잠가 교착을 피한다.
-        Order order;
-        try { order = orders.lock(result.orderId()); }
-        catch (java.util.NoSuchElementException exception) {
-            throw new OrderException(404, "ORDER_NOT_FOUND", "PG 결과의 주문을 찾을 수 없습니다.");
-        }
-        payments.find(order.id(), result.paymentId()).orElseThrow(
+        var referenced=payments.findById(result.paymentId()).orElseThrow(
                 () -> new OrderException(404, "PAYMENT_NOT_FOUND", "PG 결과의 결제 시도를 찾을 수 없습니다."));
+        Order order=orders.lock(referenced.orderId());
         PaymentAttempt payment = payments.lock(result.paymentId());
         if (token != null && !payments.ownsLease(payment.id(), token)) return;
-        if (!result.matches(payment)) throw new OrderException(409, "PG_RESULT_MISMATCH", "PG 식별자·금액·통화·결과가 일치하지 않습니다.");
+        if (!result.matches(payment)) throw conflicts.reject(order.id(),"PAYMENT",payment.id(),"PG_RESULT_MISMATCH",
+            "PG_"+source,payment.status(),result.status(),hash(result));
         boolean terminal = "APPROVED".equals(payment.status()) || "DECLINED".equals(payment.status());
         if (terminal && (!payment.status().equals(result.status())
                 || !java.util.Objects.equals(payment.pgTransactionId(), result.transactionId()))) {
-            throw new OrderException(409, "PG_RESULT_CONFLICT", "이미 확정된 결제 결과와 다릅니다.");
+            throw conflicts.reject(order.id(),"PAYMENT",payment.id(),"PG_RESULT_CONFLICT",
+                "PG_"+source,payment.status(),result.status(),hash(result));
         }
         if (!terminal && !"PAYMENT_PROCESSING".equals(order.status())) {
             throw new OrderException(409, "ORDER_STATE_CONFLICT", "주문 상태를 확인해야 합니다.");
         }
-        if (!payments.recordEvent(result, hash(result), "LOOKUP".equals(source)?"RESPONSE":source) || terminal) return;
+        conflicts.requireClear(order.id());
+        if (result.transactionId()!=null) {
+            conflicts.lockExternal("PG_TRANSACTION:"+result.transactionId());
+            if (payments.transactionUsedByAnother(result.transactionId(),payment.id())) {
+                throw conflicts.reject(order.id(),"PAYMENT",payment.id(),"PG_TRANSACTION_CONFLICT",
+                    "PG_"+source,payment.status(),result.status(),hash(result));
+            }
+        }
+        boolean fresh;
+        try { fresh=payments.recordEvent(result, hash(result), "LOOKUP".equals(source)?"RESPONSE":source); }
+        catch (OrderException e) {
+            if (!"EVENT_CONFLICT".equals(e.code)) throw e;
+            throw conflicts.reject(order.id(),"PAYMENT",payment.id(),e.code,"PG_"+source,payment.status(),result.status(),hash(result));
+        }
+        if (!fresh || terminal) return;
         payments.complete(payment.id(), result);
         orders.finishPayment(order.id(), "APPROVED".equals(result.status()));
         // 결제 완료와 발급 작업을 함께 커밋해 브라우저 종료·서버 재시작에도 작업을 잃지 않는다.
@@ -62,9 +96,9 @@ public class PaymentTransitions {
         orders.lock(claim.payment().orderId());
         PaymentAttempt current = payments.lock(claim.payment().id());
         if (!payments.ownsLease(current.id(), claim.token())) return;
-        boolean review = forceReview || current.attemptCount() >= 6;
+        boolean review = forceReview || current.roundAttemptCount() >= PaymentRepository.MAX_ROUND_ATTEMPTS;
         payments.defer(current.id(), review, review && !forceReview ? "RETRY_LIMIT_REACHED" : error,
-                settings.retryDelay(current.attemptCount()));
+                settings.retryDelay(current.roundAttemptCount()));
     }
 
     private String hash(PgResult result) {

@@ -22,6 +22,8 @@ export type PaymentAttempt = {
   declineCode: string | null;
   lastError: string | null;
   attemptCount: number;
+  executionRound?: number;
+  roundAttemptCount?: number;
   updatedAt: string;
 };
 
