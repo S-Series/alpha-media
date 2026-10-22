@@ -20,6 +20,7 @@ public class PaymentService {
 
     @Transactional
     public Acceptance accept(UUID memberId, UUID orderId, UUID key, PaymentController.Request request) {
+        orders.historyContext(memberId,"PAYMENT_REQUEST",null);
         Order order = orders.lock(memberId, orderId).orElseThrow(() -> new OrderException(404, "ORDER_NOT_FOUND", "주문을 찾을 수 없습니다."));
         var existing = payments.findByKey(orderId, key);
         if (existing.isPresent()) {

@@ -1,19 +1,20 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { getCsrfToken, post } from "@/lib/auth";
 import type { AdminOrderDetail } from "@/lib/admin-orders-server";
-import { issuanceStatus } from "@/lib/issuance";
+import { issuanceStatus, simStatus } from "@/lib/issuance";
+import { paymentStatus } from "@/lib/payments";
 import { orderStatus } from "@/lib/orders";
 import { kst, money } from "@/lib/format";
+import OrderSummary from "./order-summary";
+import AdminOrderTimeline from "./admin-order-timeline";
 
 type Draft = { key: string; path: string; body: string };
 const states: Record<string, string> = { REQUESTED: "환불 접수", QUEUED: "발급 재시도 접수", UNKNOWN: "PG 취소 결과 확인 중",
   PROCESSING: "PG 취소 확인 중", SUCCEEDED: "환불 완료", REVIEW_REQUIRED: "운영자 확인 필요", ISSUED: "발급 완료", FAILED: "발급 실패" };
 
 export default function AdminOrderActions({ initial }: { initial: AdminOrderDetail }) {
-  const router = useRouter();
   const [view, setView] = useState(initial);
   const [reason, setReason] = useState("");
   const [scenario, setScenario] = useState("SUCCESS");
@@ -24,18 +25,23 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [refresh, setRefresh] = useState(0);
+  const [pollError, setPollError] = useState("");
+  const [now, setNow] = useState<number | null>(null);
   const id = initial.order.order.id;
   const storage = `admin-action:${id}`;
 
   useEffect(() => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
+    const clock = setInterval(() => setNow(Date.now()), 1000);
     async function poll() {
       try {
-        const response = await fetch(`/api/admin/orders/${id}`, { cache: "no-store", credentials: "same-origin", signal: controller.signal });
+        const response = await fetch(`/api/admin/orders/${id}`, { cache: "no-store", credentials: "same-origin",
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
         if (!response.ok) throw new Error("조치 결과를 조회하지 못했습니다.");
         const data: AdminOrderDetail = await response.json();
-        setView(data);
+        if (controller.signal.aborted) return;
+        setView(data); setPollError("");
         try {
           const saved = JSON.parse(sessionStorage.getItem(storage) || "null");
           if (saved && typeof saved.key === "string" && typeof saved.body === "string"
@@ -43,15 +49,17 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
         } catch { /* 저장할 수 없어도 같은 화면에서는 요청 키를 유지한다. */ }
         const active = ["REQUESTED", "PROCESSING", "UNKNOWN"].includes(data.refund?.status || "")
           || ["QUEUED", "PROCESSING", "WAITING_CALLBACK"].includes(data.issuance?.issuance?.status || "");
-        if (active) timer = setTimeout(poll, 1500);
-        else router.refresh();
+        timer = setTimeout(poll, active ? 1500 : 5000);
       } catch {
-        if (!controller.signal.aborted) { setError("조치 결과를 확인하지 못했습니다. 같은 요청 재전송 또는 상태 다시 확인을 사용해 주세요."); }
+        if (!controller.signal.aborted) {
+          setPollError("최신 상태를 확인하지 못했습니다. 마지막 확인 상태를 유지하며 재조회합니다.");
+          timer = setTimeout(poll, 5000);
+        }
       }
     }
     void poll();
-    return () => { controller.abort(); clearTimeout(timer); };
-  }, [id, storage, refresh, router]);
+    return () => { controller.abort(); clearTimeout(timer); clearInterval(clock); };
+  }, [id, storage, refresh]);
 
   async function send(request: Draft, count: number) {
     setPending(true); setError(""); setMessage("");
@@ -81,8 +89,33 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
   }
 
   const job = view.issuance?.issuance;
+  const profile = view.issuance?.profile;
+  const age = now === null || !view.checkedAt ? null : Math.max(0, Math.floor((now - Date.parse(view.checkedAt)) / 1000));
   const canAct = view.order.order.status === "PAID" && job?.status === "FAILED" && !view.issuance?.profile && !view.refund;
   return <>
+    <p>서버 마지막 조회: {view.checkedAt ? kst(view.checkedAt) : "조회 시각 확인 대기"}{age !== null && ` · ${age}초 전`} · 처리 중 1.5초, 그 외 5초 간격 갱신</p>
+    {pollError && <p role="alert">{pollError}</p>}
+    <OrderSummary order={view.order.order} />
+    <section className="home-panel"><h2>결제 시도</h2><p>최근 최대 20건을 표시합니다.</p>
+      {view.payments.length === 0 ? <p>아직 결제 시도가 없습니다.</p> : view.payments.map(payment => <article key={payment.id}>
+        <h3>{paymentStatus(payment.status)}</h3><p>결제번호: {payment.id}</p>
+        <p>PG 확인 {payment.attemptCount}회 · 마지막 변경 {kst(payment.updatedAt)}</p>
+        {payment.lastError && <p>확인 사유: {payment.lastError}</p>}
+      </article>)}
+    </section>
+    <section className="home-panel"><h2>발급·설치 상태</h2>
+      {job ? <><p>{issuanceStatus(job.status)} · 발급 요청번호 {job.id}</p>
+        <p>공급사 접수번호: {job.supplierOrderNo || "접수 확인 중"}<br />공급사 확인 {job.checkCount}회 · 마지막 변경 {kst(job.updatedAt)}</p>
+        {job.lastError && <p role="alert">조치 필요: {job.lastError}</p>}</> : <p>아직 발급 작업이 없습니다.</p>}
+      {profile && <><p>ICCID: {profile.iccid} · {simStatus(profile.installStatus)}</p>
+        <p>설치: {profile.installedAt ? kst(profile.installedAt) : "미확인"}<br />
+          개통: {profile.activatedAt ? kst(profile.activatedAt) : "미개통"}<br />
+          만료: {profile.expiresAt ? kst(profile.expiresAt) : "개통 후 결정"}<br />
+          공급사 마지막 확인: {profile.lastSyncedAt ? kst(profile.lastSyncedAt) : "확인 대기"}</p>
+        {profile.syncError && <p role="alert">공급사 확인 지연: {profile.syncError}. 마지막 확인 상태입니다.</p>}
+      </>}
+    </section>
+    <AdminOrderTimeline orderId={id} latest={view.timeline} />
     <section className="home-panel"><h2>운영자 조치</h2>
       <p>현재 주문: {orderStatus(view.order.order.status)} · 발급: {job ? issuanceStatus(job.status) : "작업 없음"}</p>
       <p>발급 실패가 확정되고 SIM이 없는 주문만 재시도 또는 전액 환불할 수 있습니다. 환불 접수 후 발급 재시도는 차단됩니다.</p>

@@ -26,6 +26,7 @@ public class PaymentTransitions {
 
     @Transactional
     public void result(PgResult result, UUID token, String source) {
+        orders.historyContext(null,"PG_"+source,null);
         if (result == null || result.orderId() == null || result.paymentId() == null) {
             throw new OrderException(400, "INVALID_PG_RESULT", "PG 응답 형식이 올바르지 않습니다.");
         }
@@ -48,7 +49,7 @@ public class PaymentTransitions {
         if (!terminal && !"PAYMENT_PROCESSING".equals(order.status())) {
             throw new OrderException(409, "ORDER_STATE_CONFLICT", "주문 상태를 확인해야 합니다.");
         }
-        if (!payments.recordEvent(result, hash(result), source) || terminal) return;
+        if (!payments.recordEvent(result, hash(result), "LOOKUP".equals(source)?"RESPONSE":source) || terminal) return;
         payments.complete(payment.id(), result);
         orders.finishPayment(order.id(), "APPROVED".equals(result.status()));
         // 결제 완료와 발급 작업을 함께 커밋해 브라우저 종료·서버 재시작에도 작업을 잃지 않는다.
@@ -57,6 +58,7 @@ public class PaymentTransitions {
 
     @Transactional
     public void uncertain(PaymentRepository.Claim claim, boolean forceReview, String error) {
+        orders.historyContext(null,"PG_WORKER",error);
         orders.lock(claim.payment().orderId());
         PaymentAttempt current = payments.lock(claim.payment().id());
         if (!payments.ownsLease(current.id(), claim.token())) return;

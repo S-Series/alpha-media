@@ -20,6 +20,7 @@ public class OrderService {
 
     @Transactional
     public Creation create(UUID memberId, UUID key, String planId, LocalDate travelStartDate) {
+        orders.historyContext(memberId,"ORDER_REQUEST",null);
         var existing = orders.findByKey(memberId, key);
         if (existing.isPresent()) return replay(existing.get(), planId, travelStartDate);
         if (orders.isPast(travelStartDate)) {

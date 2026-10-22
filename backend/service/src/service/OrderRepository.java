@@ -26,8 +26,14 @@ public class OrderRepository {
 
     private final JdbcTemplate jdbc;
 
-    private static final String ADMIN_SELECT = "SELECT o.*, m.username AS customer_username, j.status AS issuance_status, j.last_error AS issuance_error FROM ("
-            + SELECT + ") o JOIN members m ON m.id=o.member_id LEFT JOIN issuance_jobs j ON j.order_id=o.id AND j.is_current";
+    private static final String INSTALL_STATUS = "CASE WHEN sp.install_status='ACTIVE' AND sp.expires_at<=statement_timestamp() THEN 'EXPIRED' ELSE COALESCE(sp.install_status,'NOT_ISSUED') END";
+    private static final String ADMIN_SELECT = "SELECT o.*, m.username AS customer_username, j.status AS issuance_status, j.last_error AS issuance_error, "
+            + "COALESCE(pay.status,'NOT_STARTED') AS payment_status, " + INSTALL_STATUS + " AS install_status, sp.last_synced_at,sp.sync_error FROM ("
+            + SELECT + ") o JOIN members m ON m.id=o.member_id LEFT JOIN issuance_jobs j ON j.order_id=o.id AND j.is_current "
+            + "LEFT JOIN sim_profiles sp ON sp.order_id=o.id LEFT JOIN LATERAL (SELECT status FROM payment_attempts WHERE order_id=o.id ORDER BY created_at DESC,id DESC LIMIT 1) pay ON TRUE";
+    private static final RowMapper<AdminOrder> ADMIN_MAPPER = (r,i) -> new AdminOrder(MAPPER.mapRow(r,i),r.getString("customer_username"),
+            r.getString("issuance_status"),r.getString("issuance_error"),r.getString("payment_status"),r.getString("install_status"),
+            r.getTimestamp("last_synced_at")==null?null:r.getTimestamp("last_synced_at").toInstant(),r.getString("sync_error"));
 
     public OrderRepository(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
@@ -74,7 +80,7 @@ public class OrderRepository {
     }
 
     List<AdminOrder> findAllForAdmin(int page, int size, String status, String simType,
-            LocalDate from, LocalDate to, boolean needsReview) {
+            LocalDate from, LocalDate to, boolean needsReview, String paymentStatus, String issuanceStatus, String installStatus) {
         var zone = java.time.ZoneId.of("Asia/Seoul");
         var start = from == null ? null : java.sql.Timestamp.from(from.atStartOfDay(zone).toInstant());
         var end = to == null ? null : java.sql.Timestamp.from(to.plusDays(1).atStartOfDay(zone).toInstant());
@@ -83,25 +89,42 @@ public class OrderRepository {
                     AND (?::varchar IS NULL OR o.sim_type=?)
                     AND (?::timestamptz IS NULL OR o.created_at>=?)
                     AND (?::timestamptz IS NULL OR o.created_at<?)
+                    AND (?::varchar IS NULL OR COALESCE(pay.status,'NOT_STARTED')=?)
+                    AND (?::varchar IS NULL OR COALESCE(j.status,'NOT_STARTED')=?)
+                    AND (?::varchar IS NULL OR %s=?)
                     AND (NOT ? OR EXISTS (SELECT 1 FROM payment_attempts p WHERE p.order_id=o.id
                         AND p.status IN ('UNKNOWN','REVIEW_REQUIRED'))
+                        OR sp.sync_error IS NOT NULL
                         OR EXISTS (SELECT 1 FROM refunds r WHERE r.order_id=o.id AND r.status='REVIEW_REQUIRED')
                         OR (o.effective_status='PAID' AND EXISTS (SELECT 1 FROM issuance_jobs j WHERE j.order_id=o.id AND j.is_current
                             AND (j.status IN ('FAILED','REVIEW_REQUIRED') OR
                                 (j.status IN ('QUEUED','PROCESSING','WAITING_CALLBACK') AND j.created_at<clock_timestamp()-INTERVAL '2 minutes')))))
                  ORDER BY o.created_at DESC, o.id DESC LIMIT ? OFFSET ?
-                """, (r, i) -> new AdminOrder(MAPPER.mapRow(r, i), r.getString("customer_username"),
-                    r.getString("issuance_status"), r.getString("issuance_error")),
-                status, status, simType, simType, start, start, end, end, needsReview, size + 1, (long) page * size);
+                """.formatted(INSTALL_STATUS), ADMIN_MAPPER,
+                status, status, simType, simType, start, start, end, end,
+                paymentStatus,paymentStatus,issuanceStatus,issuanceStatus,installStatus,installStatus,needsReview,size+1,(long)page*size);
     }
 
     Optional<AdminOrder> findForAdmin(UUID id) {
-        return jdbc.query(ADMIN_SELECT + " WHERE o.id=?", (r, i) ->
-                new AdminOrder(MAPPER.mapRow(r, i), r.getString("customer_username"),
-                    r.getString("issuance_status"), r.getString("issuance_error")), id).stream().findFirst();
+        return jdbc.query(ADMIN_SELECT + " WHERE o.id=?", ADMIN_MAPPER, id).stream().findFirst();
     }
 
-    public record AdminOrder(Order order, String customerUsername, String issuanceStatus, String issuanceError) {}
+    public record AdminOrder(Order order, String customerUsername, String issuanceStatus, String issuanceError,
+        String paymentStatus,String installStatus,java.time.Instant lastSyncedAt,String syncError) {}
+
+    void historyContext(UUID actor,String source,String reason) {
+        jdbc.queryForMap("SELECT set_config('alpha.history_actor',?,true),set_config('alpha.history_source',?,true),set_config('alpha.history_reason',?,true)",
+            actor==null?"":actor.toString(),source,reason==null?"":reason);
+    }
+    List<HistoryEvent> history(UUID orderId,Long before,int size) {
+        return jdbc.query("""
+            SELECT id::text AS history_id,* FROM order_history WHERE order_id=? AND (?::bigint IS NULL OR id<?)
+            ORDER BY id DESC LIMIT ?
+            """,(r,i)->new HistoryEvent(r.getString("history_id"),r.getString("target"),r.getObject("target_id",UUID.class),
+                r.getString("from_status"),r.getString("to_status"),r.getString("actor"),r.getString("source"),r.getString("reason"),
+                r.getTimestamp("recorded_at").toInstant()),orderId,before,before,size+1);
+    }
+    public record HistoryEvent(String id,String target,UUID targetId,String fromStatus,String toStatus,String actor,String source,String reason,java.time.Instant recordedAt) {}
 
     public boolean isPast(LocalDate travelStartDate) {
         return Boolean.TRUE.equals(jdbc.queryForObject(

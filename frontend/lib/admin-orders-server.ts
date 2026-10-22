@@ -2,14 +2,20 @@ import "server-only";
 import { request } from "./orders-server";
 import type { Order } from "./orders";
 import type { PaymentAttempt } from "./payments";
-import type { Issuance, IssuanceView } from "./issuance";
+import type { Issuance, IssuanceView, SimProfile } from "./issuance";
 
-export type AdminOrder = { order: Order; customerUsername: string; issuanceStatus?: Issuance["status"] | null; issuanceError?: string | null };
-type Page = { items: AdminOrder[]; page: number; size: number; hasNext: boolean };
+export type AdminOrder = { order: Order; customerUsername: string; issuanceStatus?: Issuance["status"] | null; issuanceError?: string | null;
+  paymentStatus: PaymentAttempt["status"] | "NOT_STARTED"; installStatus: SimProfile["installStatus"] | "NOT_ISSUED";
+  lastSyncedAt: string | null; syncError: string | null };
+export type HistoryEvent = { id: string; target: string; targetId: string; fromStatus: string | null; toStatus: string;
+  actor: string; source: string; reason: string | null; recordedAt: string };
+export type HistoryPage = { items: HistoryEvent[]; nextBefore: string | null; checkedAt: string };
+type Page = { items: AdminOrder[]; page: number; size: number; hasNext: boolean; checkedAt: string };
 export type AdminOrderDetail = { order: AdminOrder; payments: PaymentAttempt[]; issuance?: IssuanceView;
   refund?: { id: string; status: string; amount: number; attemptCount: number; lastError: string | null; pgCancellationId: string | null } | null;
   actions?: { id: string; actor: string; type: string; reason: string; issuanceId: string | null; refundId: string | null; createdAt: string }[];
   actionEvents?: { id: string; actionId: string; status: string; detail: string | null; createdAt: string }[];
+  timeline: HistoryPage; checkedAt: string;
 };
 
 export function getAdminOrders(query: URLSearchParams) {

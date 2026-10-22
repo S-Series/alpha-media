@@ -17,6 +17,7 @@ public class RefundService {
     }
     @Transactional
     public void complete(RefundRepository.Claim claim,MockPgService.Cancellation result) {
+        orders.historyContext(null,"PG_CANCEL_RESULT",null);
         Order order=orders.lock(claim.refund().orderId());
         Refund current=refunds.lock(claim.refund().id());
         if (!refunds.owns(current.id(),claim.token())) return;
@@ -31,6 +32,7 @@ public class RefundService {
     }
     @Transactional
     public void uncertain(RefundRepository.Claim claim,boolean forceReview,String error) {
+        orders.historyContext(null,"REFUND_WORKER",error);
         orders.lock(claim.refund().orderId());
         Refund current=refunds.lock(claim.refund().id());
         if (!refunds.owns(current.id(),claim.token())) return;

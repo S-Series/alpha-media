@@ -32,6 +32,7 @@ public class IssuanceService {
 
     @Transactional
     public void result(SupplierResult result, UUID token, String source) {
+        orders.historyContext(null,"SUPPLIER_"+source,null);
         if (result == null || !result.valid()) throw new OrderException(400, "INVALID_SUPPLIER_RESULT", "공급사 결과 형식이 올바르지 않습니다.");
         Order order;
         try { order = orders.lock(result.orderId()); }
@@ -69,6 +70,7 @@ public class IssuanceService {
 
     @Transactional
     public void uncertain(IssuanceRepository.Claim claim, boolean review, String reason) {
+        orders.historyContext(null,"ISSUANCE_WORKER",reason);
         orders.lock(claim.issuance().orderId());
         Issuance current = jobs.lock(claim.issuance().id());
         if (!jobs.owns(current.id(), claim.token())) return;

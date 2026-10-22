@@ -28,6 +28,7 @@ public class AdminActionService {
 
     @Transactional
     public Receipt retry(UUID actor, UUID orderId, UUID key, AdminActionController.Retry request) {
+        orders.historyContext(actor,"ADMIN_RETRY",request.reason());
         Order order = lock(orderId);
         String hash = hash("ISSUANCE_RETRY",request);
         var existing = actions.find(orderId,key);
@@ -46,6 +47,7 @@ public class AdminActionService {
 
     @Transactional
     public Receipt refund(UUID actor, UUID orderId, UUID key, AdminActionController.RefundRequest request) {
+        orders.historyContext(actor,"ADMIN_REFUND",request.reason());
         Order order = lock(orderId);
         String hash = hash("REFUND",request);
         var existing = actions.find(orderId,key);

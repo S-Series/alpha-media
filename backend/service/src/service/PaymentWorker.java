@@ -30,6 +30,7 @@ public class PaymentWorker {
             PgResult result = null;
             // 타임아웃·재시작 후에는 기존 결제의 조회부터 한다. 새 결제번호를 만들지 않는다.
             if (claim.payment().attemptCount() > 1) result = pg.lookup(claim.payment()).orElse(null);
+            String source=result==null?"RESPONSE":"LOOKUP";
             if (result == null) {
                 if (claim.payment().attemptCount() > 6) {
                     transitions.uncertain(claim, true, "RETRY_LIMIT_REACHED"); return;
@@ -37,7 +38,7 @@ public class PaymentWorker {
                 result = pg.approve(claim.payment());
             }
             if (result == null || !result.matches(claim.payment())) throw new PgClient.InvalidResult();
-            transitions.result(result, claim.token(), "RESPONSE");
+            transitions.result(result, claim.token(), source);
         } catch (IOException exception) {
             transitions.uncertain(claim, false, "PG_RESPONSE_UNKNOWN");
         } catch (InterruptedException exception) {

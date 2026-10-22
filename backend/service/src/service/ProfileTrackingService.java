@@ -31,6 +31,7 @@ public class ProfileTrackingService {
     }
     @Transactional
     public void viewed(UUID owner,UUID id) {
+        orders.historyContext(owner,"QR_VIEW",null);
         var profile=owned(owner,id); orders.lock(profile.orderId());
         var current=jdbc.query("SELECT * FROM sim_profiles WHERE id=? FOR UPDATE",IssuanceRepository.PROFILE,id).getFirst();
         if (current.qrViewedAt()!=null) return;
@@ -40,6 +41,7 @@ public class ProfileTrackingService {
     }
     @Transactional
     public void apply(ProfileSignal signal,String source,UUID lease) {
+        orders.historyContext(null,"PROFILE_"+source,null);
         if (signal==null || !signal.valid()) throw new OrderService.OrderException(400,"INVALID_PROFILE_SIGNAL","프로필 신호 형식이 올바르지 않습니다.");
         try { orders.lock(signal.orderId()); }
         catch (java.util.NoSuchElementException e) { throw new OrderService.OrderException(404,"ORDER_NOT_FOUND","프로필 신호의 주문이 없습니다."); }

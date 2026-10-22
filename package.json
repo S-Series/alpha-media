@@ -9,6 +9,7 @@
     "test:issuance": "node --test --test-concurrency=1 --test-name-pattern=issuance tests/orders.integration.test.mjs",
     "test:refunds": "node --test --test-concurrency=1 --test-name-pattern=refund tests/orders.integration.test.mjs",
     "test:tracking": "node --test --test-concurrency=1 --test-name-pattern=tracking tests/orders.integration.test.mjs",
+    "test:admin": "node --test --test-concurrency=1 --test-name-pattern=\"admin console\" tests/orders.integration.test.mjs",
     "accounts:configure": "node backend/database/configure-accounts.mjs",
     "neon:configure": "node backend/database/configure-neon.mjs"
   },

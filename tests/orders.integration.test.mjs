@@ -17,7 +17,7 @@ const children = [];
 let directory, dbPort, servicePort, gatewayPort, serviceProcess, base, alice, bob, admin, first, firstKey;
 const future = "2099-01-01";
 const password = "LocalOrderTest!2026Aa";
-const accountHashes = Object.fromEntries(["CUSTOMER1", "CUSTOMER2", "ADMIN"].map(name => {
+const accountHashes = Object.fromEntries(["CUSTOMER1", "CUSTOMER2", "ADMIN", "ADMIN2"].map(name => {
   const salt = randomBytes(16);
   return [`${name}_PASSWORD_HASH`, "{pbkdf2-sha256-600k}" + Buffer.concat([
     salt, pbkdf2Sync(password, salt, 600000, 32, "sha256")]).toString("hex")];
@@ -125,7 +125,7 @@ class Client {
 
 async function member(name) {
   const client = new Client();
-  const username = { alice: "customer1", bob: "customer2", admin: "admin" }[name];
+  const username = { alice: "customer1", bob: "customer2", admin: "admin", admin2: "admin2" }[name];
   const r = await client.request("/api/auth/login", { method: "POST",
     headers: { ...await client.csrf(), "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ username, password }).toString() });
@@ -171,8 +171,8 @@ after(async () => {
 });
 
 test("fixed customer accounts and admin authenticate without signup; DB starts with no orders", async () => {
-  assert.equal(sql("SELECT string_agg(username,',' ORDER BY username) FROM members"), "admin,customer1,customer2");
-  assert.equal(sql("SELECT count(*) FROM members WHERE role='ADMIN'"), "1");
+  assert.equal(sql("SELECT string_agg(username,',' ORDER BY username) FROM members"), "admin,admin2,customer1,customer2");
+  assert.equal(sql("SELECT count(*) FROM members WHERE role='ADMIN'"), "2");
   assert.equal(sql("SELECT count(*) FROM orders"), "0");
   assert.equal(sql("SELECT count(*) FROM payment_attempts"), "0");
   assert.equal(sql("SELECT count(*) FROM plans"), "3");
@@ -1119,4 +1119,102 @@ test("tracking deleted profiles retain installation evidence and do not reopen r
   assert.equal((await trackingView(profile)).profile.installedAt, installedAt);
   assert.equal((await trackingChange(profile, { ...installedChange, state: "RELEASED" })).status, 409);
   assert.equal((await adminAction(order.id, "refunds", refundRequest(job))).status, 409);
+});
+
+test("admin console second operator can read orders and history, but customers and anonymous callers cannot", async () => {
+  const second = await member("admin2"), order = await newOrder();
+  assert.equal((await (await second.request("/api/me")).json()).role, "ADMIN");
+  for (const path of ["/api/admin/orders", `/api/admin/orders/${order.id}`, `/api/admin/orders/${order.id}/history`]) {
+    assert.equal((await second.request(path)).status, 200);
+    assert.equal((await alice.request(path)).status, 403);
+    assert.equal((await new Client().request(path)).status, 401);
+  }
+  assert.equal((await second.create()).status, 403);
+  const detail = await (await second.request(`/api/admin/orders/${order.id}`)).json();
+  assert.ok(Date.parse(detail.checkedAt));
+  assert.equal(detail.timeline.items[0].actor, "USER:customer1");
+  assert.equal(detail.timeline.items[0].source, "ORDER_REQUEST");
+});
+
+test("admin console combines payment issuance installation and KST date filters without duplicate rows", async () => {
+  const { order, profile } = await trackingProfile();
+  assert.equal((await trackingChange(profile, installedChange)).status, 200);
+  await until(async () => (await trackingView(profile)).profile.installStatus === "INSTALLED");
+  const query = "/api/admin/orders?paymentStatus=APPROVED&issuanceStatus=ISSUED&installStatus=INSTALLED&simType=ESIM&size=100";
+  let result = await (await admin.request(query)).json();
+  assert.ok(result.items.some(row => row.order.id === order.id));
+  assert.equal(new Set(result.items.map(row => row.order.id)).size, result.items.length);
+  assert.ok(result.items.every(row => row.paymentStatus === "APPROVED" && row.issuanceStatus === "ISSUED" && row.installStatus === "INSTALLED"));
+  assert.ok(result.items.find(row => row.order.id === order.id).lastSyncedAt);
+  for (const filter of ["paymentStatus=INVALID", "issuanceStatus=INVALID", "installStatus=INVALID"]) {
+    assert.equal((await admin.request("/api/admin/orders?" + filter)).status, 400);
+  }
+  sql(`UPDATE orders SET created_at='2026-05-01T15:00:00Z',expires_at='2026-05-01T15:10:00Z' WHERE id='${order.id}'`);
+  result = await (await admin.request(query + "&from=2026-05-02&to=2026-05-02")).json();
+  assert.ok(result.items.some(row => row.order.id === order.id));
+  sql(`UPDATE orders SET created_at='2026-05-01T14:59:59.999999Z',expires_at='2026-05-01T15:09:59.999999Z' WHERE id='${order.id}'`);
+  result = await (await admin.request(query + "&from=2026-05-02&to=2026-05-02")).json();
+  assert.ok(!result.items.some(row => row.order.id === order.id));
+  sql(`UPDATE sim_profiles SET sync_error='SUPPLIER_PROFILE_UNAVAILABLE',next_sync_at=clock_timestamp()+INTERVAL '1 hour' WHERE id='${profile.id}'`);
+  assert.ok((await (await admin.request("/api/admin/orders?needsReview=true&size=100")).json()).items.some(row => row.order.id === order.id));
+});
+
+test("admin console timeline captures signal sources and does not repeat an unchanged supplier state", async () => {
+  const { order, profile } = await trackingProfile();
+  assert.equal((await alice.request(`/api/sims/${profile.id}/activation-view`, { method: "POST", headers: await alice.csrf() })).status, 200);
+  const response = await trackingChange(profile, { state: "ENABLED", activatedAt: new Date().toISOString(), callbackDelayMs: 0, callbackCopies: 0 });
+  const signal = await response.json();
+  await until(async () => (await trackingView(profile)).profile.installStatus === "ACTIVE");
+  const path = `/api/admin/orders/${order.id}/history?size=100`;
+  const events = (await (await admin.request(path)).json()).items;
+  assert.ok(events.some(e => e.target === "ORDER" && e.toStatus === "PAID" && e.source.startsWith("PG_")));
+  assert.ok(events.some(e => e.target === "PAYMENT" && e.toStatus === "APPROVED"));
+  assert.ok(events.some(e => e.target === "ISSUANCE" && e.toStatus === "ISSUED" && e.source.startsWith("SUPPLIER_")));
+  assert.ok(events.some(e => e.target === "PROFILE" && e.toStatus === "QR_VIEWED" && e.actor === "USER:customer1"));
+  assert.ok(events.some(e => e.target === "PROFILE" && e.toStatus === "ACTIVE" && e.source === "PROFILE_LOOKUP" && e.actor === "SYSTEM"));
+  assert.equal((await profileNotify(signal)).status, 200);
+  assert.equal((await profileNotify(signal)).status, 200);
+  const replayed = (await (await admin.request(path)).json()).items;
+  assert.equal(replayed.filter(e => e.target === "PROFILE" && e.toStatus === "ACTIVE").length, 1);
+  assert.equal(replayed.filter(e => e.target === "ORDER" && e.toStatus === "PAID").length, 1);
+  const page1 = await (await admin.request(`/api/admin/orders/${order.id}/history?size=2`)).json();
+  const page2 = await (await admin.request(`/api/admin/orders/${order.id}/history?size=2&before=${page1.nextBefore}`)).json();
+  assert.equal(page1.items.length, 2); assert.equal(page2.items.length, 2);
+  assert.equal(new Set([...page1.items, ...page2.items].map(e => e.id)).size, 4);
+  for (const query of ["before=0", "size=0", "size=101"]) assert.equal((await admin.request(`/api/admin/orders/${order.id}/history?${query}`)).status, 400);
+  await restart();
+  assert.deepEqual((await (await admin.request(path)).json()).items, replayed);
+});
+
+test("admin console second operator refund retains actor and reason without leaking them to workers or later requests", async () => {
+  const second = await member("admin2"), { order, job } = await failedOrder();
+  const body = { ...refundRequest(job), reason: "운영자 2가 발급 실패 확인 후 환불" };
+  assert.equal((await adminAction(order.id, "refunds", body, randomUUID(), second)).status, 202);
+  await until(() => refundRow(order.id)?.status === "SUCCEEDED");
+  const detail = await (await second.request(`/api/admin/orders/${order.id}`)).json();
+  assert.equal(detail.actions[0].actor, "admin2");
+  assert.equal(detail.actions[0].reason, body.reason);
+  assert.ok(detail.timeline.items.some(e => e.target === "REFUND" && e.toStatus === "REQUESTED" && e.actor === "ADMIN:admin2" && e.reason === body.reason));
+  assert.ok(detail.timeline.items.some(e => e.target === "REFUND" && e.toStatus === "SUCCEEDED" && e.actor === "SYSTEM"));
+  const fresh = await newOrder();
+  const history = await (await second.request(`/api/admin/orders/${fresh.id}/history`)).json();
+  assert.equal(history.items[0].actor, "USER:customer1");
+  assert.equal(history.items[0].reason, null);
+});
+
+test("admin console history rolls back with state changes and cannot be edited by the application role", async () => {
+  const order = await newOrder();
+  const count = sql(`SELECT count(*) FROM order_history WHERE order_id='${order.id}'`);
+  sql(`BEGIN; UPDATE orders SET status='EXPIRED' WHERE id='${order.id}'; ROLLBACK;`);
+  assert.equal(orderState(order.id), "PENDING_PAYMENT");
+  assert.equal(sql(`SELECT count(*) FROM order_history WHERE order_id='${order.id}'`), count);
+  sql(`UPDATE order_history SET actor='ADMIN:forged' WHERE order_id='${order.id}'`, true, true);
+  sql(`DELETE FROM order_history WHERE order_id='${order.id}'`, true, true);
+  sql(`INSERT INTO order_history(order_id,target,target_id,to_status,actor,source) VALUES('${order.id}','ORDER','${order.id}','PAID','ADMIN:forged','FORGED')`, true, true);
+  sql("CREATE FUNCTION fail_history_for_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'history unavailable'; END $$; CREATE TRIGGER fail_history_for_test BEFORE INSERT ON order_history FOR EACH ROW EXECUTE FUNCTION fail_history_for_test();");
+  try {
+    const orders = sql("SELECT count(*) FROM orders");
+    assert.equal((await alice.create()).status, 500);
+    assert.equal(sql("SELECT count(*) FROM orders"), orders);
+  } finally { sql("DROP TRIGGER fail_history_for_test ON order_history; DROP FUNCTION fail_history_for_test();"); }
 });
