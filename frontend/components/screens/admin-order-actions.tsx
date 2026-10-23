@@ -11,6 +11,9 @@ import OrderSummary from "./order-summary";
 import AdminOrderTimeline from "./admin-order-timeline";
 import AdminConcurrencyDemo from "./admin-concurrency-demo";
 import AdminOrderRecovery from "./admin-order-recovery";
+import AdminRefundOutage from "./admin-refund-outage";
+import AdminPaymentStorage from "./admin-payment-storage";
+import AdminReconciliationDemo from "./admin-reconciliation-demo";
 
 type Draft = { key: string; path: string; body: string };
 const states: Record<string, string> = { WAITING_GUARD: "미사용 SIM 차단 확인 중", REQUESTED: "환불 접수", QUEUED: "발급 재시도 접수", UNKNOWN: "PG 취소 결과 확인 중",
@@ -109,10 +112,27 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
   const canRefund = conflicts.length === 0 && ["PAID", "PARTIALLY_REFUNDED", "REFUND_PROCESSING"].includes(view.order.order.status)
     && (job?.status === "FAILED" && !profile || job?.status === "ISSUED" && profile && !profile.installedAt && !profile.activatedAt)
     && Number.isSafeInteger(requested) && requested > 0 && requested <= available;
+  const retryBlocked = pending ? "조치 접수 중입니다." : conflicts.length ? "상충 결과가 있어 발급 재시도를 차단했습니다."
+    : !canAct ? "결제 완료·발급 실패이며 SIM·환불 이력이 없어야 합니다. 새 ‘발급 실패·환불 미접수’ 주문으로 시연하세요."
+    : !reason.trim() ? "조치 사유를 입력하세요." : "";
+  const refundBlocked = pending ? "조치 접수 중입니다." : !view.mockPgEnabled ? "이 서버에서 모의 PG가 비활성화되어 있습니다."
+    : conflicts.length ? "상충 결과가 있어 환불을 차단했습니다."
+    : profile && (profile.installedAt || profile.activatedAt) ? "설치·개통된 SIM은 환불할 수 없습니다."
+    : available <= 0 ? "환불 가능액이 없습니다. 이미 환불됐거나 진행 중인 환불에 금액이 예약되어 있습니다."
+    : !Number.isSafeInteger(requested) || requested <= 0 || requested > available ? `환불 금액은 1원부터 ${money(available)}원까지의 정수여야 합니다.`
+    : !canRefund ? "발급 실패가 확정되거나 미사용 SIM이 발급된 결제 완료 주문이 필요합니다."
+    : !reason.trim() ? "조치 사유를 입력하세요." : "";
   return <>
     <p>서버 마지막 조회: {view.checkedAt ? kst(view.checkedAt) : "조회 시각 확인 대기"}{age !== null && ` · ${age}초 전`} · 처리 중 1.5초, 그 외 5초 간격 갱신</p>
     {pollError && <p role="alert">{pollError}</p>}
     <OrderSummary order={view.order.order} />
+    <section className="home-panel"><h2>이 주문에서 시연하기</h2>
+      <p>시연마다 필요한 시작 상태가 다릅니다. 한 주문으로 환불·상충까지 진행했다면 우하단 ‘시나리오 데이터 생성’에서 새 주문을 만드세요.</p>
+      <p>DB 반영 실패: ‘결제 대기’ 생성 후 10분 이내, 고객이 결제하기 전에 장애를 설정합니다.</p>
+      <p>발급 재시도·동시 부분 환불·상충·대사: 각각 새 ‘발급 실패·환불 미접수’ 주문으로 시작합니다. 상충 시연 후에는 안전을 위해 환불·재발급이 차단됩니다.</p>
+      <p>PG 장애 해제: ‘환불 확인 필요’ 생성 → 장애 해제 → 외부 결과 재조회 → 60초 이내 같은 번호로 처리 재개 순서입니다.</p>
+      <p>버튼 아래 제한 사유를 확인하세요. 조치 사유가 비어 있으면 실행할 수 없습니다.</p>
+    </section>
     {conflicts.length > 0 && <section className="home-panel"><h2>상충 결과 확인 필요</h2>
       <p role="alert">기존 기록과 다른 외부 결과가 발견되어 발급 재시도·환불을 차단했습니다. PG·공급사의 실제 처리 결과를 확인해야 합니다.</p>
       {conflicts.map(conflict => <article key={conflict.id}>
@@ -156,9 +176,17 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
         {event.status === "REVIEW_REQUIRED" && <p role="alert">자동 처리를 중단했습니다. 오류와 상충 결과를 확인해 주세요.</p>}
       </article>)}
     </section>
+    {(view.mockPgEnabled || (view.mockPaymentStorageActions || []).length > 0) && <AdminPaymentStorage
+      key={`payment-storage:${id}`} orderId={id} enabled={view.mockPgEnabled}
+      canArm={view.order.order.status === "PENDING_PAYMENT" && view.payments.length === 0 && conflicts.length === 0
+        && now !== null && new Date(view.order.order.expiresAt).getTime() > now}
+      actions={view.mockPaymentStorageActions || []} payments={view.mockPaymentStoragePayments || []}
+      onRefresh={() => setRefresh(value => value + 1)} />}
     <AdminOrderRecovery orderId={id} items={view.recoveryTargets || []} actions={view.recoveryActions || []}
       blocked={conflicts.length > 0} now={now} onRefresh={() => setRefresh(value => value + 1)} />
     <AdminOrderTimeline orderId={id} latest={view.timeline} />
+    {view.mockPgEnabled && <AdminReconciliationDemo key={`reconciliation:${id}`} orderId={id}
+      eligible={canAct && (view.refunds || []).length === 0} onRefresh={() => setRefresh(value => value + 1)} />}
     <section className="home-panel"><h2>운영자 조치</h2>
       <p>현재 주문: {orderStatus(view.order.order.status)} · 발급: {job ? issuanceStatus(job.status) : "작업 없음"}</p>
       <p>발급 실패 주문 또는 미사용 SIM을 환불할 수 있습니다. 발급된 SIM은 공급사 차단 확인 후 환불하며, 부분 환불도 SIM 사용을 영구 종료합니다. 설치·개통된 SIM은 일반 환불할 수 없습니다.</p>
@@ -184,15 +212,18 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
       <label><input type="checkbox" checked={duplicate} onChange={e => setDuplicate(e.target.checked)} disabled={pending} />같은 요청을 동시에 2회 전송</label>
       </div>
       <div className="page-actions">
-        <button disabled={pending || !canAct || !reason.trim()} onClick={() => submit("issuance-retries")}>발급 재시도</button>
-        <button disabled={pending || !canRefund || !reason.trim()} onClick={() => submit("refunds")}>환불 접수</button>
+        <button disabled={!!retryBlocked} aria-describedby="retry-help" onClick={() => submit("issuance-retries")}>발급 재시도</button>
+        <button disabled={!!refundBlocked} aria-describedby="refund-help" onClick={() => submit("refunds")}>환불 접수</button>
         <button disabled={pending || !draft || conflicts.length > 0} onClick={() => draft && void send(draft, 1)}>동일 요청 다시 전송</button>
         <button disabled={pending} onClick={() => setRefresh(value => value + 1)}>조치 결과 다시 확인</button>
       </div>
+      {retryBlocked && <p id="retry-help">발급 재시도 제한: {retryBlocked}</p>}
+      {refundBlocked && <p id="refund-help">환불 접수 제한: {refundBlocked}</p>}
+      {!draft && <p>‘동일 요청 다시 전송’은 이 브라우저에서 조치를 한 번 접수한 뒤 사용할 수 있습니다.</p>}
       {draft && <p>요청 키: <code>{draft.key}</code> · 재전송은 사유·시연 조건까지 처음 요청 그대로 보냅니다.</p>}
       {message && <p role="status">{message}</p>}{error && <p role="alert">{error}</p>}
     </section>
-    {conflicts.length === 0 && <AdminConcurrencyDemo orderId={id} issuanceId={job?.id} eligible={!!canAct} />}
+    {conflicts.length === 0 && <AdminConcurrencyDemo orderId={id} issuanceId={job?.id} eligible={!!canAct} orderAmount={view.order.order.amount} />}
     <section className="home-panel"><h2>환불 처리</h2>
       {view.refundBalance && <p>승인 {money(view.refundBalance.approved)} · 확정 환불 {money(view.refundBalance.confirmed)} · 미확정 예약 {money(view.refundBalance.reserved)} · 추가 환불 가능 {money(available)} KRW</p>}
       {view.refundBalance?.overReserved && <p role="alert">외부 취소와 예약액이 승인액을 초과합니다. 추가 취소를 중단하고 원장을 확인해야 합니다.</p>}
@@ -201,6 +232,10 @@ export default function AdminOrderActions({ initial }: { initial: AdminOrderDeta
         <p>환불번호: {refund.id}<br />PG 취소번호: {refund.pgCancellationId || "없음·미확정"}<br />누적 시도 {refund.attemptCount}회 · 실행 회차 {refund.executionRound} · 이번 회차 {refund.roundAttemptCount}/3회</p>
         {refund.lastError && <p>확인 사유: {refund.lastError}</p>}
         {refund.status === "REVIEW_REQUIRED" && <p role="alert">예약액을 유지합니다. 같은 환불번호로 결과를 재조회해 주세요.</p>}
+        {view.mockPgEnabled && refund.scenario === "UNAVAILABLE" && <AdminRefundOutage
+          orderId={id} refundId={refund.id} eligible={refund.status === "REVIEW_REQUIRED" && conflicts.length === 0}
+          release={view.mockPgOutageReleases?.find(item => item.refundId === refund.id)}
+          onRefresh={() => setRefresh(value => value + 1)} />}
       </article>)}
       <h3>공급사 차단·종료·해제</h3>
       <p>금전 환불 완료와 공급사 정리 완료는 별도입니다. 불확실한 동안 차단은 자동 만료되지 않습니다.</p>

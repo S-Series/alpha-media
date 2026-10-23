@@ -11,16 +11,18 @@ import AdminMonitoring from "./admin-monitoring";
 const base = "/api/admin/reconciliation-runs";
 type Receipt = { run: ReconciliationRun; replayed: boolean };
 
-export default function AdminReconciliation() {
+export default function AdminReconciliation({ initialRange, initialIncident = "" }: {
+  initialRange?: { from: string; to: string }; initialIncident?: string;
+}) {
   const [refresh, setRefresh] = useState(0);
-  const [mode, setMode] = useState<ReconciliationRun["mode"]>("PENDING");
+  const [mode, setMode] = useState<ReconciliationRun["mode"]>(initialRange ? "LEDGER" : "PENDING");
   const [reason, setReason] = useState("");
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
+  const [from, setFrom] = useState(initialRange?.from || "");
+  const [to, setTo] = useState(initialRange?.to || "");
   const [selected, setSelected] = useState("");
   const [page, setPage] = useState(0);
   const [message, setMessage] = useState("");
-  const [incidentId, setIncidentId] = useState("");
+  const [incidentId, setIncidentId] = useState(initialIncident);
   const list = useReconciliationRead<ReconciliationRuns>(base, refresh);
   const id = selected || list.data?.items[0]?.id || "";
   const detail = useReconciliationRead<ReconciliationDetail>(id ? `${base}/${id}?page=${page}&size=50` : null, refresh, 5000);
@@ -50,7 +52,7 @@ export default function AdminReconciliation() {
       <p><strong>대사 완료는 조회 작업의 완료입니다. 운영 사건이 모두 해결되었다는 의미는 아닙니다.</strong></p>
       {list.error && <p role="alert">{list.error} 마지막으로 확인한 목록을 유지합니다.</p>}
     </section>
-    <section className="home-panel"><h2>수동 대사</h2>
+    <section className="home-panel" id="manual-reconciliation"><h2>수동 대사</h2>
       <p>누락·미해결 건 재조회는 미완료 처리와 미해결 운영 사건을 확인합니다. 원장 대사는 KST 시작일 포함, 종료일 제외입니다.</p>
       <form className="screen-form" onSubmit={event => { event.preventDefault(); void submit(); }}>
         <label>대사 방식 <select value={mode} disabled={action.blocked} onChange={event => setMode(event.target.value as ReconciliationRun["mode"])}>

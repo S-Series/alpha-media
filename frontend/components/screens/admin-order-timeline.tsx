@@ -9,7 +9,9 @@ const signals: Record<string,string> = { ORDER_REQUEST: "고객 주문", PAYMENT
   PG_LOOKUP: "PG 결과 조회", PG_WEBHOOK: "PG 웹훅", SUPPLIER_ACCEPTANCE: "공급사 접수 응답", SUPPLIER_LOOKUP: "공급사 발급 조회",
   SUPPLIER_CALLBACK: "공급사 발급 콜백", PROFILE_LOOKUP: "공급사 프로필 조회", PROFILE_CALLBACK: "공급사 프로필 콜백",
   QR_VIEW: "활성화 정보 열람", ORDER_EXPIRY: "주문 만료", SIM_EXPIRY: "SIM 만료", ADMIN_RETRY: "운영자 발급 재시도",
-  ADMIN_REFUND: "운영자 환불 접수", ADMIN_ACTION: "운영자 조치 접수", PG_CANCEL_RESULT: "PG 취소 결과", SNAPSHOT: "기존 데이터 스냅샷" };
+  ADMIN_REFUND: "운영자 환불 접수", ADMIN_ACTION: "운영자 조치 접수", PG_CANCEL_RESULT: "PG 취소 결과", SNAPSHOT: "기존 데이터 스냅샷",
+  MOCK_PG_OUTAGE_RELEASE: "모의 PG 장애 해제", MOCK_PAYMENT_STORAGE_ARM: "결제 DB 반영 장애 설정",
+  MOCK_PAYMENT_STORAGE_RELEASE: "결제 DB 반영 장애 해제", MOCK_RECONCILIATION_DEMO: "상충·대사 시연 접수" };
 
 export default function AdminOrderTimeline({ orderId, latest }: { orderId: string; latest: HistoryPage }) {
   const [saved, setSaved] = useState<HistoryPage | null>(null);

@@ -12,7 +12,7 @@ const scenarios = {
   ISSUANCE_FAILED: { label: "발급 실패·환불 미접수", detail: "결제 승인 후 발급 실패가 확정된 주문입니다. 발급 재시도·환불·두 운영자 동시 조치를 시연할 수 있습니다." },
   ISSUED: { label: "발급 완료·미설치", detail: "발급 완료된 SIM을 만듭니다. 고객 계정에서 설치·개통·만료를 시연할 수 있습니다." },
   REFUNDED: { label: "환불 완료", detail: "발급 실패 후 전액 환불까지 완료합니다. PG 취소와 조치 이력을 확인할 수 있습니다." },
-  REFUND_REVIEW_REQUIRED: { label: "환불 확인 필요", detail: "모의 PG 취소 장애로 3회 실패한 주문입니다. 새 조치 차단 시연용이며, 현재 환불 복구 기능은 없습니다." },
+  REFUND_REVIEW_REQUIRED: { label: "환불 확인 필요", detail: "모의 PG 취소 장애로 3회 실패한 주문입니다. 주문 상세에서 장애를 해제하고, 같은 환불번호로 외부 결과 재조회·처리 재개를 시연할 수 있습니다." },
 };
 type Scenario = keyof typeof scenarios;
 type Draft = { key: string; body: string };

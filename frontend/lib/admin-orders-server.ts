@@ -26,10 +26,17 @@ export type RecoveryAction = { id: string; orderId: string; actor: string; kind:
   externalStatus: string | null; externalReference: string | null; evidenceHash: string | null; resultVersion: string | null;
   createdAt: string; checkedAt: string | null; lastError: string | null };
 type Page = { items: AdminOrder[]; page: number; size: number; hasNext: boolean; checkedAt: string };
+export type MockPgOutageRelease = { id: string; refundId: string; paymentId: string; actor: string; reason: string; createdAt: string };
+export type MockPaymentStorageAction = { id: string; action: "ARM" | "RELEASE"; actor: string; reason: string; createdAt: string };
 export type AdminOrderDetail = { order: AdminOrder; payments: PaymentAttempt[]; issuance?: IssuanceView;
   refund?: { id: string; status: string; amount: number; attemptCount: number; executionRound?: number; roundAttemptCount?: number;
+    scenario: "SUCCESS" | "DECLINED" | "RESPONSE_LOST" | "UNAVAILABLE";
     lastError: string | null; pgCancellationId: string | null } | null;
   refunds: NonNullable<AdminOrderDetail["refund"]>[];
+  mockPgEnabled: boolean;
+  mockPgOutageReleases: MockPgOutageRelease[];
+  mockPaymentStorageActions: MockPaymentStorageAction[];
+  mockPaymentStoragePayments: { paymentId: string; status: "APPROVED" | "DECLINED"; approvalExecutions: number }[];
   refundBalance: { approved: number; confirmed: number; reserved: number; available: number; overReserved: boolean };
   protectionJobs: { id: string; refundId: string; phase: "HOLD" | "RELEASE" | "TERMINATE"; status: string;
     attemptCount: number; roundAttemptCount: number; executionRound: number; lastError: string | null }[];

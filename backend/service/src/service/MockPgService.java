@@ -78,7 +78,9 @@ public class MockPgService {
             if (scenario!=Refund.Scenario.DECLINED || rejected.getFirst().amount()!=amount) throw new OrderException(409,"PG_CANCEL_CONFLICT","같은 취소 키의 조건이 다릅니다.");
             return new CancelReply(rejected.getFirst(),false);
         }
-        if (scenario==Refund.Scenario.UNAVAILABLE) throw new OrderException(503,"MOCK_CANCEL_UNAVAILABLE","모의 PG 취소 장애입니다.");
+        if (scenario==Refund.Scenario.UNAVAILABLE && !Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT EXISTS(SELECT 1 FROM mock_pg_outage_releases WHERE payment_id=? AND refund_id=?)",Boolean.class,id,key)))
+            throw new OrderException(503,"MOCK_CANCEL_UNAVAILABLE","모의 PG 취소 장애입니다.");
         long total = ((Number) original.get("cancelled_amount")).longValue();
         long approved = ((Number) original.get("amount")).longValue();
         if (!"APPROVED".equals(original.get("status")) || amount <= 0 || amount > approved - total) {

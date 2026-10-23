@@ -58,8 +58,9 @@ export function useReconciliationRead<T>(path: string | null, refresh: number, i
 }
 
 type Draft = { key: string; path: string; body: string; uncertain: boolean };
-type Scope = "reconciliation-runs" | "incident-investigation";
+type Scope = "reconciliation-runs" | "incident-investigation" | `reconciliation-demo:${string}`;
 function permittedPath(scope: Scope, path: string) {
+  if (scope.startsWith("reconciliation-demo:")) return path === `/api/admin/orders/${scope.slice("reconciliation-demo:".length)}/reconciliation-demo`;
   return scope === "reconciliation-runs" ? path === "/api/admin/reconciliation-runs"
     : /^\/api\/admin\/incidents\/[0-9a-f-]{36}\/investigations$/i.test(path);
 }

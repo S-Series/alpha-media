@@ -1,5 +1,6 @@
 package service;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
@@ -10,7 +11,7 @@ import service.OrderService.OrderException;
 
 @Service
 public class AdminConcurrencyService {
-    public enum Mode { REFUND_REFUND, RETRY_RETRY, REFUND_RETRY }
+    public enum Mode { REFUND_REFUND, RETRY_RETRY, REFUND_RETRY, PARTIAL_REFUND_REFUND }
     public enum KeyMode { SEPARATE, SHARED }
     private final Map<UUID,Round> rounds=new ConcurrentHashMap<>();
     private final ExecutorService executor=Executors.newFixedThreadPool(4);
@@ -28,6 +29,10 @@ public class AdminConcurrencyService {
         enabled();
         if (request.mode()==Mode.REFUND_RETRY && request.keyMode()==KeyMode.SHARED)
             throw new OrderException(400,"INVALID_DEMO_MODE","서로 다른 조치는 각각 다른 요청 키를 사용하세요.");
+        boolean partial=request.mode()==Mode.PARTIAL_REFUND_REFUND;
+        if (partial ? request.firstAmount()==null || request.secondAmount()==null
+                : request.firstAmount()!=null || request.secondAmount()!=null)
+            throw new OrderException(400,"INVALID_DEMO_AMOUNTS","부분 환불 시연에서만 두 운영자의 환불 금액을 모두 입력하세요.");
         Round round;
         synchronized(rounds) {
             round=rounds.get(key);
@@ -45,6 +50,11 @@ public class AdminConcurrencyService {
                         AND NOT EXISTS(SELECT 1 FROM sim_profiles WHERE order_id=o.id))
                     """,Boolean.class,orderId,request.issuanceId()));
                 if (!eligible) throw new OrderException(409,"DEMO_NOT_ELIGIBLE","현재 발급 실패가 확정되고 SIM·환불이 없는 주문을 선택하세요.");
+                if (partial) {
+                    long amount=jdbc.queryForObject("SELECT amount FROM orders WHERE id=?",Long.class,orderId);
+                    if (request.firstAmount().compareTo(BigDecimal.valueOf(amount))>=0 || request.secondAmount().compareTo(BigDecimal.valueOf(amount))>=0)
+                        throw new OrderException(400,"INVALID_DEMO_AMOUNTS","각 부분 환불 금액은 주문 금액보다 작아야 합니다.");
+                }
                 round=new Round(orderId,key,actor.id(),request);
                 round.add(actor);
                 rounds.put(key,round);
@@ -93,7 +103,7 @@ public class AdminConcurrencyService {
                 throw new OrderException(403,"OPERATOR_UNAVAILABLE","운영자 권한이 변경됐습니다.");
             var request=round.request;
             var receipt="REFUND".equals(person.operation)
-                ? actions.refund(person.actorId,round.orderId,person.key,new AdminActionController.RefundRequest(request.issuanceId(),request.reason(),Refund.Scenario.SUCCESS))
+                ? actions.refund(person.actorId,round.orderId,person.key,new AdminActionController.RefundRequest(request.issuanceId(),request.reason(),Refund.Scenario.SUCCESS,person.amount,null,null))
                 : actions.retry(person.actorId,round.orderId,person.key,new AdminActionController.Retry(request.issuanceId(),request.reason(),IssuanceSimulation.defaults()));
             result=new Result(receipt.replayed()?200:202,receipt.replayed()?"REPLAYED":"ACCEPTED",
                 receipt.replayed()?"기존 조치를 반환했습니다.":"조치를 접수했습니다.",receipt.action().id(),receipt.action().actor(),receipt.replayed(),startedAt,Instant.now());
@@ -120,11 +130,14 @@ public class AdminConcurrencyService {
     private View snapshot(Round round,Member actor) {
         List<Participant> participants;boolean started;
         synchronized(round) {
-            participants=round.people.stream().map(p->new Participant(p.username,p.operation,p.key,p.result)).toList();started=round.started;
+            participants=round.people.stream().map(p->new Participant(p.username,p.operation,p.key,p.amount,p.result)).toList();started=round.started;
         }
         UUID second=participants.size()==2?participants.get(1).key():null;
         var stats=jdbc.queryForObject("""
-            WITH a AS (SELECT refund_id,issuance_id FROM admin_actions WHERE order_id=? AND idempotency_key IN (?::uuid,?::uuid))
+            WITH a AS (SELECT refund_id,issuance_id FROM admin_actions WHERE order_id=? AND idempotency_key IN (?::uuid,?::uuid)),
+                balances AS (SELECT
+                    (SELECT COALESCE(sum(l.amount),0) FROM refund_ledger l JOIN payment_attempts p ON p.id=l.payment_id WHERE p.order_id=?) AS confirmed,
+                    (SELECT COALESCE(sum(amount),0) FROM refunds WHERE order_id=? AND status NOT IN ('SUCCEEDED','FAILED')) AS reserved)
             SELECT (SELECT count(*) FROM a) AS action_count,
                 (SELECT count(*) FROM refunds WHERE id IN (SELECT refund_id FROM a)) AS refund_count,
                 (SELECT count(*) FROM issuance_jobs WHERE id IN (SELECT issuance_id FROM a)) AS retry_count,
@@ -135,16 +148,21 @@ public class AdminConcurrencyService {
                 (SELECT COALESCE(sum(issue_executions),0) FROM mock_supplier_orders WHERE request_id IN (SELECT issuance_id FROM a)) AS supplier_issues,
                 (SELECT status FROM refunds WHERE id IN (SELECT refund_id FROM a) LIMIT 1) AS refund_status,
                 (SELECT status FROM issuance_jobs WHERE id IN (SELECT issuance_id FROM a) LIMIT 1) AS issuance_status,
-                (SELECT amount FROM orders WHERE id=?) AS order_amount
+                (SELECT amount FROM orders WHERE id=?) AS order_amount,
+                (SELECT count(*) FROM refunds WHERE id IN (SELECT refund_id FROM a) AND status='SUCCEEDED') AS succeeded_refunds,
+                (SELECT count(*) FROM refunds WHERE id IN (SELECT refund_id FROM a) AND status IN ('FAILED','REVIEW_REQUIRED')) AS failed_refunds,
+                (SELECT confirmed FROM balances) AS confirmed_amount,
+                (SELECT reserved FROM balances) AS reserved_amount
             """,(r,i)->new Stats(r.getLong("action_count"),r.getLong("refund_count"),r.getLong("retry_count"),r.getLong("profile_count"),
                 r.getLong("cancellation_count"),r.getLong("cancelled_amount"),r.getLong("supplier_orders"),r.getLong("supplier_issues"),
-                r.getString("refund_status"),r.getString("issuance_status"),r.getLong("order_amount")),
-            round.orderId,participants.getFirst().key(),second,round.orderId,round.orderId);
-        String phase=phase(started,participants,stats,round.request.keyMode());
+                r.getString("refund_status"),r.getString("issuance_status"),r.getLong("order_amount"),
+                r.getLong("succeeded_refunds"),r.getLong("failed_refunds"),r.getLong("confirmed_amount"),r.getLong("reserved_amount")),
+            round.orderId,participants.getFirst().key(),second,round.orderId,round.orderId,round.orderId,round.orderId);
+        String phase=phase(started,participants,stats,round.request);
         return new View(round.id,round.orderId,round.request,round.expiresAt,phase,
             participants.stream().anyMatch(p->p.username().equals(actor.username())),participants,stats,Instant.now());
     }
-    private String phase(boolean started,List<Participant> people,Stats s,KeyMode keyMode) {
+    private String phase(boolean started,List<Participant> people,Stats s,AdminConcurrencyController.Request request) {
         if (!started) return people.size()==2?"READY":"WAITING";
         if (people.stream().anyMatch(p->p.result()==null)) return "RUNNING";
         if (people.stream().anyMatch(p->p.result().status()>=500)) return "REVIEW_REQUIRED";
@@ -152,7 +170,23 @@ public class AdminConcurrencyService {
         long accepted=people.stream().filter(p->p.result().status()==202).count();
         long replayed=people.stream().filter(p->p.result().status()==200 && p.result().replayed()).count();
         long conflicts=people.stream().filter(p->p.result().status()==409).count();
-        if (s.actionCount()!=1 || accepted!=1 || (keyMode==KeyMode.SHARED ? replayed!=1 : conflicts!=1)
+        if (request.mode()==Mode.PARTIAL_REFUND_REFUND) {
+            boolean shared=request.keyMode()==KeyMode.SHARED;
+            boolean sameAmount=request.firstAmount().compareTo(request.secondAmount())==0;
+            long expected= !shared && request.firstAmount().add(request.secondAmount()).compareTo(BigDecimal.valueOf(s.orderAmount()))<=0?2:1;
+            long expectedReplay=shared && sameAmount?1:0;
+            String conflictCode=shared?"ACTION_KEY_CONFLICT":"REFUND_BALANCE_EXCEEDED";
+            if (accepted!=expected || replayed!=expectedReplay || conflicts!=2-expected-expectedReplay
+                    || people.stream().anyMatch(p->p.result().status()==409 && !conflictCode.equals(p.result().code()))
+                    || s.actionCount()!=expected || s.refundCount()!=expected || s.retryCount()!=0 || s.profileCount()!=0
+                    || s.confirmedAmount()+s.reservedAmount()>s.orderAmount()) return "INVARIANT_FAILED";
+            if (s.failedRefunds()>0) return "REVIEW_REQUIRED";
+            if (s.succeededRefunds()!=expected) return "PROCESSING";
+            long expectedAmount=people.stream().filter(p->p.result().status()==202).mapToLong(p->p.amount().longValueExact()).sum();
+            return s.pgCancellations()==expected && s.cancelledAmount()==expectedAmount && s.confirmedAmount()==expectedAmount
+                && s.reservedAmount()==0?"PASSED":"INVARIANT_FAILED";
+        }
+        if (s.actionCount()!=1 || accepted!=1 || (request.keyMode()==KeyMode.SHARED ? replayed!=1 : conflicts!=1)
                 || s.refundCount()+s.retryCount()!=1 || (s.refundCount()>0 && s.profileCount()>0)) return "INVARIANT_FAILED";
         if ("REVIEW_REQUIRED".equals(s.refundStatus()) || Set.of("FAILED","REVIEW_REQUIRED").contains(Objects.toString(s.issuanceStatus(),""))) return "REVIEW_REQUIRED";
         if (s.refundCount()==1 && "SUCCEEDED".equals(s.refundStatus()))
@@ -171,18 +205,20 @@ public class AdminConcurrencyService {
         Round(UUID orderId,UUID id,UUID creator,AdminConcurrencyController.Request request) { this.orderId=orderId;this.id=id;this.creator=creator;this.request=request; }
         void add(Member actor) {
             String operation=request.mode()==Mode.RETRY_RETRY || (request.mode()==Mode.REFUND_RETRY && !people.isEmpty())?"ISSUANCE_RETRY":"REFUND";
-            people.add(new Person(actor.id(),actor.username(),operation,request.keyMode()==KeyMode.SHARED?sharedKey:UUID.randomUUID()));
+            BigDecimal amount=request.mode()==Mode.PARTIAL_REFUND_REFUND?(people.isEmpty()?request.firstAmount():request.secondAmount()):null;
+            people.add(new Person(actor.id(),actor.username(),operation,request.keyMode()==KeyMode.SHARED?sharedKey:UUID.randomUUID(),amount));
         }
         synchronized boolean finished() { return !started || people.stream().allMatch(p->p.result!=null); }
     }
     private static class Person {
-        final UUID actorId,key;final String username,operation;Result result;
-        Person(UUID actorId,String username,String operation,UUID key) { this.actorId=actorId;this.username=username;this.operation=operation;this.key=key; }
+        final UUID actorId,key;final String username,operation;final BigDecimal amount;Result result;
+        Person(UUID actorId,String username,String operation,UUID key,BigDecimal amount) { this.actorId=actorId;this.username=username;this.operation=operation;this.key=key;this.amount=amount; }
     }
     public record Result(int status,String code,String message,UUID actionId,String appliedBy,boolean replayed,Instant startedAt,Instant finishedAt) {}
-    public record Participant(String username,String operation,UUID key,Result result) {}
+    public record Participant(String username,String operation,UUID key,BigDecimal amount,Result result) {}
     public record Stats(long actionCount,long refundCount,long retryCount,long profileCount,long pgCancellations,long cancelledAmount,
-        long supplierOrders,long supplierIssues,String refundStatus,String issuanceStatus,long orderAmount) {}
+        long supplierOrders,long supplierIssues,String refundStatus,String issuanceStatus,long orderAmount,
+        long succeededRefunds,long failedRefunds,long confirmedAmount,long reservedAmount) {}
     public record View(UUID id,UUID orderId,AdminConcurrencyController.Request request,Instant expiresAt,String phase,
         boolean participating,List<Participant> participants,Stats stats,Instant checkedAt) {}
 }

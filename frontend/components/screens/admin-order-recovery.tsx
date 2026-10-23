@@ -38,6 +38,19 @@ export default function AdminOrderRecovery({ orderId, items, actions, blocked, n
   const resumable = matches && fresh && ["RESUME_ALLOWED", "REPLAY_ALLOWED"].includes(evidence.outcome || "")
     && target?.status === "REVIEW_REQUIRED" && target.executionRound < 3 && !blocked;
   const busy = pending || actions.some(active) || !!draft?.uncertain;
+  const canQuery = !!target && (target.status === "REVIEW_REQUIRED" || blocked);
+  const busyReason = pending ? "접수 중입니다." : draft?.uncertain ? "이전 접수 결과가 불명확합니다. ‘동일 조치 요청 다시 확인’을 먼저 누르세요."
+    : actions.some(active) ? "기존 재조회 작업이 처리 중입니다. 완료 후 다시 확인하세요." : "";
+  const queryBlocked = busyReason || (!target ? "확인 대상이 없습니다." : !canQuery ? "자동 처리 중이거나 이미 완료된 대상입니다. ‘확인 필요’ 상태의 대상을 선택하세요."
+    : !reason.trim() ? "조회·재개 사유를 입력하세요." : "");
+  const resumeBlocked = busyReason || (blocked ? "상충 기록이 있어 처리 재개를 차단했습니다."
+    : !target || target.status !== "REVIEW_REQUIRED" ? "‘확인 필요’ 상태의 대상만 처리 재개할 수 있습니다."
+    : target.executionRound >= 3 ? "최초 포함 3회차 한도에 도달했습니다. 외부 결과 재조회만 가능합니다."
+    : !evidence ? "먼저 ‘외부 결과 재조회’를 실행하세요."
+    : !matches ? "현재 상태에 맞는 조회 근거가 없습니다. 외부 결과를 다시 조회하세요."
+    : !fresh ? "조회 완료 후 60초가 지났거나 확인 시각을 읽는 중입니다. 외부 결과를 다시 조회하세요."
+    : !resumable ? "최근 조회 결과가 재개를 허용하지 않습니다. 아래 조회 결과를 확인하세요."
+    : !reason.trim() ? "조회·재개 사유를 입력하세요." : "");
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -83,7 +96,7 @@ export default function AdminOrderRecovery({ orderId, items, actions, blocked, n
   }
 
   function submit(kind: "reconciliations" | "recoveries") {
-    if (!target || !reason.trim() || busy || (kind === "recoveries" && !resumable)) return;
+    if (!target || !reason.trim() || busy || (kind === "recoveries" ? !resumable : !canQuery)) return;
     const request = { key: crypto.randomUUID(), path: `${base}/${kind}`, uncertain: true,
       body: JSON.stringify({ target: target.kind, targetId: target.id, expectedVersion: target.version, reason: reason.trim(),
         ...(kind === "recoveries" ? { evidenceId: evidence.id } : {}) }) };
@@ -109,11 +122,13 @@ export default function AdminOrderRecovery({ orderId, items, actions, blocked, n
         : `이번 회차 시도 ${target.roundAttemptCount}/${target.kind === "REFUND" ? 3 : 6}회 · 누적 ${target.attemptCount}회`}
         {target.lastError && <><br />마지막 오류: {target.lastError}</>}</p>}
       <div className="page-actions">
-        <button disabled={busy || !target || !reason.trim()} onClick={() => submit("reconciliations")}>외부 결과 재조회</button>
-        <button disabled={busy || !reason.trim() || !resumable} onClick={() => submit("recoveries")}>
+        <button disabled={!!queryBlocked} aria-describedby="recovery-query-help" onClick={() => submit("reconciliations")}>외부 결과 재조회</button>
+        <button disabled={!!resumeBlocked} aria-describedby="recovery-resume-help" onClick={() => submit("recoveries")}>
           {target?.kind === "INBOUND" ? "저장된 웹훅 재처리" : "같은 번호로 처리 재개"}
         </button>
       </div>
+      {queryBlocked && <p id="recovery-query-help">재조회 제한: {queryBlocked}</p>}
+      {resumeBlocked && <p id="recovery-resume-help">처리 재개 제한: {resumeBlocked}</p>}
       {evidence && <p>최근 조회: {states[evidence.status]}{evidence.outcome && ` · ${outcomes[evidence.outcome] || evidence.outcome}`}
         {evidence.checkedAt && <><br />확인 시각: {kst(evidence.checkedAt)}{evidenceAge !== null && ` · ${Math.floor(evidenceAge / 1000)}초 전`}</>}
         {matches && !fresh && <><br />조회 근거의 유효 시간이 지났습니다. 외부 결과를 다시 조회해 주세요.</>}

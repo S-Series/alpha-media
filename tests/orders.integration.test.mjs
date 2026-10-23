@@ -1965,6 +1965,114 @@ test("admin console history rolls back with state changes and cannot be edited b
 const demoRequest = (job, mode = "REFUND_REFUND", keyMode = "SEPARATE") => ({
   issuanceId: job.id, mode, keyMode, reason: "두 운영자가 실제 세션으로 동시에 조치 시연",
 });
+const partialDemoRequest = (job, firstAmount, secondAmount, keyMode = "SEPARATE") => ({
+  ...demoRequest(job, "PARTIAL_REFUND_REFUND", keyMode), firstAmount, secondAmount,
+});
+
+test("partial concurrency demo validates amounts, authorization and immutable preparation", async () => {
+  const { order, job } = await failedOrder(), request = partialDemoRequest(job, 7000, 8000), key = randomUUID();
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, key, alice)).status, 403);
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, key, new Client())).status, 401);
+  assert.equal((await admin.request(`/api/admin/orders/${order.id}/concurrency-demos`, {
+    method: "POST", body: request, headers: { "Idempotency-Key": key },
+  })).status, 403);
+  for (const amount of [null, 0, -1, 1.5, order.amount, order.amount + 1, 1e25]) {
+    for (const field of ["firstAmount", "secondAmount"]) {
+      assert.equal((await adminAction(order.id, "concurrency-demos", { ...request, [field]: amount })).status, 400);
+    }
+  }
+  assert.equal((await adminAction(order.id, "concurrency-demos", { ...request, mode: "REFUND_REFUND" })).status, 400);
+  const response = await adminAction(order.id, "concurrency-demos", request, key);
+  assert.equal(response.status, 200); const demo = await response.json();
+  assert.equal(demo.participants[0].amount, 7000);
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, key)).status, 200);
+  assert.equal((await adminAction(order.id, "concurrency-demos", { ...request, secondAmount: 8001 }, key)).status, 409);
+  assert.equal((await demoCall(order.id, key, "start")).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM refunds WHERE order_id='${order.id}'`), "0");
+});
+
+for (const [name, firstAmount, secondAmount, keyMode, statuses] of [
+  ["within balance", 7000, 8000, "SEPARATE", [202, 202]],
+  ["exact balance", 7000, 8900, "SEPARATE", [202, 202]],
+  ["over balance", 10000, 11000, "SEPARATE", [202, 409]],
+  ["same key and amount", 7000, 7000, "SHARED", [200, 202]],
+  ["same key different amount", 7000, 8000, "SHARED", [202, 409]],
+]) test(`partial concurrency demo ${name} verifies both receipts and actual PG amounts`, async () => {
+  const { order, job, attempt } = await failedOrder(), second = await member("admin2");
+  assert.equal(order.amount, 15900);
+  const request = partialDemoRequest(job, firstAmount, secondAmount, keyMode), key = randomUUID();
+  const response = await adminAction(order.id, "concurrency-demos", request, key);
+  assert.equal(response.status, 200); const demo = await response.json();
+  assert.equal((await demoCall(order.id, demo.id, "join", second)).status, 200);
+  const starts = await Promise.all([demoCall(order.id, demo.id, "start"), demoCall(order.id, demo.id, "start", second)]);
+  assert.ok(starts.every(r => r.status === 200));
+  let done;
+  await until(async () => {
+    done = await demoView(order.id, demo.id);
+    return ["PASSED", "INVARIANT_FAILED", "REVIEW_REQUIRED", "BLOCKED"].includes(done.phase);
+  });
+  assert.equal(done.phase, "PASSED", JSON.stringify(done));
+  assert.deepEqual(done.participants.map(p => p.result.status).sort(), statuses);
+  assert.deepEqual(done.participants.map(p => p.amount), [firstAmount, secondAmount]);
+  const accepted = done.participants.filter(p => p.result.status === 202);
+  const total = accepted.reduce((sum, p) => sum + p.amount, 0);
+  assert.equal(done.stats.actionCount, accepted.length);
+  assert.equal(done.stats.refundCount, accepted.length);
+  assert.equal(done.stats.pgCancellations, accepted.length);
+  assert.equal(done.stats.cancelledAmount, total);
+  assert.equal(done.stats.confirmedAmount, total);
+  assert.equal(done.stats.reservedAmount, 0);
+  assert.equal(orderState(order.id), total === order.amount ? "REFUNDED" : "PARTIALLY_REFUNDED");
+  const detail = await recoveryDetail(order.id);
+  assert.equal(detail.refundBalance.available, order.amount - total);
+  for (const person of accepted) {
+    const action = detail.actions.find(a => a.id === person.result.actionId);
+    assert.equal(action.actor, person.username); assert.equal(action.reason, request.reason);
+    assert.equal(refundById(action.refundId).amount, person.amount);
+    assert.ok(detail.timeline.items.some(e => e.actor === `ADMIN:${person.username}` && e.reason === request.reason));
+  }
+  const rejected = done.participants.find(p => p.result.status === 409);
+  if (rejected) assert.equal(rejected.result.code, keyMode === "SHARED" ? "ACTION_KEY_CONFLICT" : "REFUND_BALANCE_EXCEEDED");
+  if (statuses.includes(200)) assert.equal(new Set(done.participants.map(p => p.result.actionId)).size, 1);
+  assert.equal((await demoCall(order.id, demo.id, "start", second)).status, 200);
+  assert.equal((await adminAction(order.id, "concurrency-demos", request, key)).status, 200);
+  assert.deepEqual((await demoView(order.id, demo.id)).stats, done.stats);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`), String(accepted.length));
+  console.log(`partial concurrency ${name}: HTTP ${statuses.join("/")}, cancellations=${accepted.length}, confirmed=${total}, available=${order.amount-total}`);
+});
+
+test("partial concurrency demo keeps both reservations through DB completion failure and restart without duplicate cancellation", { timeout: 90000 }, async () => {
+  const { order, job, attempt } = await failedOrder(), second = await member("admin2");
+  const request = partialDemoRequest(job, 7000, 8000);
+  const demo = await (await adminAction(order.id, "concurrency-demos", request)).json();
+  await demoCall(order.id, demo.id, "join", second);
+  let pending;
+  sql(`CREATE FUNCTION partial_demo_reject_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.order_id='${order.id}'::uuid AND NEW.status='SUCCEEDED' THEN RAISE EXCEPTION 'simulated completion failure'; END IF; RETURN NEW; END $$;
+    CREATE TRIGGER partial_demo_reject_completion BEFORE UPDATE ON refunds FOR EACH ROW EXECUTE FUNCTION partial_demo_reject_completion();`);
+  try {
+    await demoCall(order.id, demo.id, "start");
+    await until(() => sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`) === "2");
+    pending = await demoView(order.id, demo.id);
+    assert.equal(pending.phase, "PROCESSING", JSON.stringify(pending));
+    assert.equal(pending.stats.reservedAmount, 15000); assert.equal(pending.stats.confirmedAmount, 0);
+    const extra = await adminAction(order.id, "refunds", { ...refundRequest(job), amount: 1000 });
+    assert.equal(extra.status, 409); assert.equal((await extra.json()).code, "REFUND_BALANCE_EXCEEDED");
+  } finally { sql("DROP TRIGGER partial_demo_reject_completion ON refunds; DROP FUNCTION partial_demo_reject_completion();"); }
+  await restart();
+  assert.equal((await admin.request(`/api/admin/orders/${order.id}/concurrency-demos/${demo.id}`)).status, 404);
+  await until(() => sql(`SELECT count(*) FROM refunds WHERE order_id='${order.id}' AND status='SUCCEEDED'`) === "2");
+  for (const person of pending.participants) {
+    const response = await adminAction(order.id, "refunds", { ...refundRequest(job), reason: request.reason, amount: person.amount }, person.key);
+    assert.equal(response.status, 200); assert.equal((await response.json()).action.id, person.result.actionId);
+  }
+  const detail = await recoveryDetail(order.id);
+  assert.equal(detail.refundBalance.confirmed, 15000); assert.equal(detail.refundBalance.reserved, 0);
+  assert.equal(detail.refundBalance.available, 900); assert.equal(detail.actions.length, 2);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${attempt.id}'`), "2");
+  assert.equal(sql(`SELECT sum(amount) FROM refund_ledger WHERE payment_id='${attempt.id}'`), "15000");
+});
+
 async function demoCall(orderId, id, action, client = admin) {
   return adminAction(orderId, `concurrency-demos/${id}/${action}`, undefined, randomUUID(), client);
 }
@@ -4123,4 +4231,515 @@ test("partial refund preserves the legacy full-refund request fingerprint for re
   await restart();
   assert.equal((await adminAction(data.order.id,"refunds",body,key)).status,200);
   assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`),"1");
+});
+
+const reconciliationDemoPath = "reconciliation-demo";
+const reconciliationDemoBody = (kind = "CONFLICTING_DECLINE", overrides = {}) => ({ kind,
+  reason: "상충 결과와 외부 원장 불일치 대응 시연", copies: kind === "CONFLICTING_DECLINE" ? 3 : 1, delayMs: 0, ...overrides });
+function reconciliationDemoRow(id) {
+  const value = sql(`SELECT row_to_json(d) FROM mock_reconciliation_demos d WHERE id='${id}'`);
+  return value ? JSON.parse(value) : null;
+}
+async function createReconciliationDemo(orderId, body = reconciliationDemoBody(), key = randomUUID()) {
+  const response = await adminAction(orderId, reconciliationDemoPath, body, key);
+  assert.equal(response.status, 201); return (await response.json()).demo;
+}
+function currentLedgerDay() { return ledgerDay(new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" })); }
+
+test("reconciliation demo requires admin CSRF valid options enabled mock and an unrefunded failed issuance", { timeout: 60000 }, async () => {
+  await restart(); const data = await failedOrder(), path = `/api/admin/orders/${data.order.id}/${reconciliationDemoPath}`, body = reconciliationDemoBody();
+  assert.equal((await new Client().request(path)).status, 401);
+  assert.equal((await alice.request(path)).status, 403);
+  assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body, randomUUID(), new Client())).status, 401);
+  assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body, randomUUID(), alice)).status, 403);
+  assert.equal((await admin.request(path, { method: "POST", body, headers: { "Idempotency-Key": randomUUID() } })).status, 403);
+  for (const invalid of [{ ...body, reason: " " }, { ...body, reason: "x".repeat(301) }, { ...body, kind: "FAKE" },
+    { ...body, copies: 0 }, { ...body, copies: 21 }, { ...body, copies: 1.5 }, { ...body, delayMs: -1 }, { ...body, delayMs: 60001 },
+    reconciliationDemoBody("EXTERNAL_CANCELLATION", { copies: 2 })])
+    assert.equal((await adminAction(data.order.id, reconciliationDemoPath, invalid)).status, 400);
+  assert.equal((await adminAction(randomUUID(), reconciliationDemoPath, body)).status, 404);
+  const pending = await newOrder();
+  assert.equal((await adminAction(pending.id, reconciliationDemoPath, body)).status, 409);
+  const issued = await issueOrder({ scenario: "SUCCEED", callbackCopies: 0, callbackDelayMs: 0 });
+  await until(() => issuanceRow(issued.order.id).status === "ISSUED");
+  assert.equal((await adminAction(issued.order.id, reconciliationDemoPath, body)).status, 409);
+  try {
+    await restart({ MOCK_PG_ENABLED: "false" });
+    assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body)).status, 503);
+    assert.equal((await admin.request(path)).status, 200);
+  } finally { await restart(); }
+  const refundId = await requestPartial(data, { scenario: "UNAVAILABLE" });
+  await until(() => refundById(refundId).status === "REVIEW_REQUIRED");
+  assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body)).status, 409);
+  assert.equal(sql(`SELECT count(*) FROM mock_reconciliation_demos WHERE order_id='${data.order.id}'`), "0");
+});
+
+test("reconciliation demo conflicting signed notifications survive restart deduplicate and keep the approval quarantined", { timeout: 90000 }, async () => {
+  await restart(); const data = await failedOrder(), key = randomUUID(), body = reconciliationDemoBody(undefined, { delayMs: 2000 });
+  await restart({ PAYMENT_WORKER_DELAY_MS: "60000" });
+  const send1 = await recoveryPoster(data.order.id, reconciliationDemoPath, body);
+  const send2 = await recoveryPoster(data.order.id, reconciliationDemoPath, body, await member("admin2"));
+  const responses = await Promise.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? send2 : send1)(key)));
+  assert.equal(responses.filter(r => r.status === 201).length, 1); assert.equal(responses.filter(r => r.status === 200).length, 19);
+  const receipts = await Promise.all(responses.map(r => r.json())), demo = receipts[0].demo;
+  assert.equal(new Set(receipts.map(r => r.demo.id)).size, 1);
+  assert.equal(reconciliationDemoRow(demo.id).attempt_count, 0);
+  assert.equal(sql(`SELECT count(*) FROM inbound_events WHERE event_id='${demo.eventId}'`), "0");
+  assert.equal((await adminAction(data.order.id, reconciliationDemoPath, { ...body, copies: 4 }, key)).status, 409);
+  assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body)).status, 200);
+  assert.equal((await adminAction(data.order.id, reconciliationDemoPath, reconciliationDemoBody("EXTERNAL_CANCELLATION"))).status, 409);
+  await restart();
+  await until(() => reconciliationDemoRow(demo.id).status === "DELIVERED");
+  const inboundId = sql(`SELECT id FROM inbound_events WHERE event_id='${demo.eventId}'`);
+  await until(() => inboundRow(inboundId).status === "REVIEW_REQUIRED");
+  assert.equal(inboundRow(inboundId).receive_count, 3);
+  assert.equal(inboundRow(inboundId).last_error, "PG_RESULT_CONFLICT");
+  assert.equal(sql(`SELECT count(*) FROM inbound_verifications WHERE inbound_id='${inboundId}'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${data.order.id}'`), "1");
+  assert.equal(sql(`SELECT status FROM payment_attempts WHERE id='${data.attempt.id}'`), "APPROVED");
+  assert.equal(sql(`SELECT status FROM mock_pg_payments WHERE payment_id='${data.attempt.id}'`), "APPROVED");
+  assert.equal(orderState(data.order.id), "PAID");
+  assert.equal((await adminAction(data.order.id, "refunds", refundRequest(data.job))).status, 409);
+  assert.equal((await adminAction(data.order.id, "issuance-retries", retryRequest(data.job))).status, 409);
+  const incident = incidentFor("PAYMENT", data.attempt.id, "ORDER_RESULT_CONFLICT"); assert.ok(incident);
+  await runReconciliation({ mode: "PENDING" }); await runReconciliation({ mode: "PENDING" });
+  assert.equal(incidentFor("PAYMENT", data.attempt.id, "ORDER_RESULT_CONFLICT").id, incident.id);
+  assert.notEqual(incidentFor("PAYMENT", data.attempt.id, "ORDER_RESULT_CONFLICT").status, "RESOLVED");
+  const view = await (await admin.request(`/api/admin/orders/${data.order.id}/${reconciliationDemoPath}`)).json();
+  assert.ok(view.incidents.some(i => i.id === incident.id)); assert.equal(view.demos[0].sentCount, 3);
+  assert.equal(sql(`SELECT count(*) FROM order_history WHERE order_id='${data.order.id}' AND source='MOCK_RECONCILIATION_DEMO'`), "1");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`), "0");
+  assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body, key)).status, 200);
+});
+
+test("reconciliation demo external cancellation is discovered once by read only ledger scans without inventing a refund", { timeout: 90000 }, async () => {
+  await restart(); const data = await failedOrder(), other = await failedOrder(), proxy = await providerProxy("mock-pg");
+  try {
+    await restart({ MOCK_PG_BASE_URL: proxy.url });
+    const body = reconciliationDemoBody("EXTERNAL_CANCELLATION"), key = randomUUID();
+    const send1 = await recoveryPoster(data.order.id, reconciliationDemoPath, body);
+    const send2 = await recoveryPoster(data.order.id, reconciliationDemoPath, body, await member("admin2"));
+    const responses = await Promise.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? send2 : send1)(key)));
+    assert.equal(responses.filter(r => r.status === 201).length, 1); assert.equal(responses.filter(r => r.status === 200).length, 19);
+    const demo = (await responses[0].json()).demo;
+    assert.equal(demo.status, "DELIVERED"); assert.ok(demo.cancellationId);
+    assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${data.attempt.id}'`), String(data.order.amount));
+    assert.equal(orderState(data.order.id), "PAID"); assert.equal(refundRow(data.order.id), null);
+    assert.equal((await recoveryDetail(data.order.id)).refundBalance.confirmed, 0);
+    await runReconciliation(currentLedgerDay());
+    assert.equal(orderState(data.order.id), "REFUNDED");
+    assert.equal((await recoveryDetail(data.order.id)).refundBalance.confirmed, data.order.amount);
+    const incident = incidentFor("PAYMENT", data.attempt.id, "EXTERNAL_CANCELLATION_UNMATCHED"); assert.ok(incident);
+    assert.notEqual(incident.status, "RESOLVED");
+    assert.equal(sql(`SELECT count(*) FROM external_cancellations WHERE id='${demo.cancellationId}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM refund_ledger WHERE payment_id='${data.attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM refunds WHERE order_id='${data.order.id}'`), "0");
+    assert.equal((await adminAction(data.order.id, "refunds", refundRequest(data.job))).status, 409);
+    await runReconciliation(currentLedgerDay());
+    assert.equal(incidentFor("PAYMENT", data.attempt.id, "EXTERNAL_CANCELLATION_UNMATCHED").id, incident.id);
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM refund_ledger WHERE payment_id='${data.attempt.id}'`), "1");
+    assert.ok(proxy.forId(data.attempt.id).length > 0); assert.ok(proxy.forId(data.attempt.id).every(c => c.method === "GET"));
+    assert.equal(orderState(other.order.id), "PAID");
+    assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${other.attempt.id}'`), "0");
+    await restart();
+    assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body, key)).status, 200);
+  } finally { await restart(); await proxy.close(); }
+});
+
+test("reconciliation demo audit failure rolls back the mock cancellation and immutable request before safe retry", { timeout: 60000 }, async () => {
+  await restart(); const data = await failedOrder(), key = randomUUID(), body = reconciliationDemoBody("EXTERNAL_CANCELLATION");
+  sql(`CREATE FUNCTION reject_demo_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.order_id='${data.order.id}' AND NEW.source='MOCK_RECONCILIATION_DEMO' THEN RAISE EXCEPTION 'audit failure'; END IF;
+    RETURN NEW; END $$; CREATE TRIGGER reject_demo_audit BEFORE INSERT ON order_history FOR EACH ROW EXECUTE FUNCTION reject_demo_audit();`);
+  try {
+    assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body, key)).status, 500);
+    assert.equal(sql(`SELECT count(*) FROM mock_reconciliation_demos WHERE order_id='${data.order.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`), "0");
+    assert.equal(sql(`SELECT cancelled_amount FROM mock_pg_payments WHERE payment_id='${data.attempt.id}'`), "0");
+  } finally { sql("DROP TRIGGER reject_demo_audit ON order_history; DROP FUNCTION reject_demo_audit();"); }
+  const demo = await createReconciliationDemo(data.order.id, body, key);
+  sql(`UPDATE mock_reconciliation_demos SET reason='changed' WHERE id='${demo.id}'`, true, true);
+  sql(`DELETE FROM mock_reconciliation_demos WHERE id='${demo.id}'`, true, true);
+  await restart();
+  assert.equal((await adminAction(data.order.id, reconciliationDemoPath, body, key)).status, 200);
+  assert.equal(sql(`SELECT count(*) FROM order_history WHERE order_id='${data.order.id}' AND source='MOCK_RECONCILIATION_DEMO'`), "1");
+});
+
+test("reconciliation demo delivery DB failure and restart preserve the six-claim budget and one conflict", { timeout: 90000 }, async () => {
+  await restart(); const data = await failedOrder();
+  const settings = { PAYMENT_LEASE_MS: "1200", PAYMENT_RETRY_BASE_MS: "100" };
+  await restart({ ...settings, PAYMENT_WORKER_DELAY_MS: "60000" });
+  const demo = await createReconciliationDemo(data.order.id, reconciliationDemoBody(undefined, { copies: 1 }));
+  sql(`CREATE FUNCTION reject_demo_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.id='${demo.id}' AND NEW.status<>'SENDING' THEN RAISE EXCEPTION 'completion write failed'; END IF;
+    RETURN NEW; END $$; CREATE TRIGGER reject_demo_completion BEFORE UPDATE ON mock_reconciliation_demos
+    FOR EACH ROW EXECUTE FUNCTION reject_demo_completion();`);
+  let restored = false;
+  const restore = () => { sql("DROP TRIGGER reject_demo_completion ON mock_reconciliation_demos; DROP FUNCTION reject_demo_completion();"); restored = true; };
+  try {
+    await restart(settings);
+    await until(() => reconciliationDemoRow(demo.id).attempt_count >= 2);
+    await until(() => Number(sql(`SELECT receive_count FROM inbound_events WHERE event_id='${demo.eventId}'`)) >= 2);
+    await restart(settings);
+    await until(() => reconciliationDemoRow(demo.id).attempt_count === 6);
+    await delay(1800);
+    assert.equal(reconciliationDemoRow(demo.id).attempt_count, 6);
+    const inboundId = sql(`SELECT id FROM inbound_events WHERE event_id='${demo.eventId}'`);
+    const received = inboundRow(inboundId).receive_count;
+    // A process may stop after reserving a claim but before sending HTTP; that still consumes budget.
+    assert.ok(received >= 2 && received <= 6);
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${data.order.id}'`), "1");
+    restore();
+    await until(() => reconciliationDemoRow(demo.id).status === "REVIEW_REQUIRED");
+    await restart(settings); await delay(500);
+    assert.equal(reconciliationDemoRow(demo.id).attempt_count, 6); assert.equal(inboundRow(inboundId).receive_count, received);
+    assert.equal(orderState(data.order.id), "PAID");
+  } finally { if (!restored) restore(); await restart(); }
+});
+
+test("reconciliation demo retries unavailable webhook delivery within its durable budget", { timeout: 60000 }, async () => {
+  await restart(); const data = await failedOrder(), proxy = await providerProxy("mock-pg");
+  proxy.intercept = () => ({ status: 503 });
+  try {
+    await restart({ PG_WEBHOOK_URL: proxy.url, PAYMENT_RETRY_BASE_MS: "1000" });
+    const demo = await createReconciliationDemo(data.order.id, reconciliationDemoBody(undefined, { copies: 1 }));
+    await until(() => reconciliationDemoRow(demo.id).attempt_count >= 2);
+    const before = reconciliationDemoRow(demo.id).attempt_count;
+    await restart();
+    await until(() => reconciliationDemoRow(demo.id).status === "DELIVERED");
+    assert.ok(reconciliationDemoRow(demo.id).attempt_count > before);
+    assert.ok(reconciliationDemoRow(demo.id).attempt_count <= 6);
+    const inboundId = sql(`SELECT id FROM inbound_events WHERE event_id='${demo.eventId}'`);
+    await until(() => inboundRow(inboundId).status === "REVIEW_REQUIRED");
+    assert.equal(sql(`SELECT count(*) FROM order_conflicts WHERE order_id='${data.order.id}'`), "1");
+  } finally { await restart(); await proxy.close(); }
+});
+
+const outagePath = refundId => `refunds/${refundId}/mock-pg-outage-release`;
+const storagePath = "mock-payment-storage";
+const storageRequest = action => ({ action, reason: "주문별 승인 DB 반영 실패와 원문 재처리 시연" });
+async function storageFaultOrder() {
+  const order = await newOrder();
+  assert.equal((await adminAction(order.id, storagePath, storageRequest("ARM"))).status, 201);
+  return order;
+}
+async function storageWebhook(order) {
+  const attempt = await (await alice.pay(order.id)).json();
+  const approved = await pg("/payments/approve", { paymentId: attempt.id, orderId: order.id,
+    amount: order.amount, currency: "KRW", scenario: "APPROVE", webhookCopies: 0, webhookDelayMs: 0 });
+  assert.equal(approved.status, 200);
+  const result = await approved.json(), response = await notify(result);
+  assert.equal(response.status, 202);
+  return { attempt, result, receipt: await response.json() };
+}
+
+test("payment storage demo restricts arming to admins and unattempted valid mock orders", { timeout: 60000 }, async () => {
+  await restart(); const order = await newOrder(), body = storageRequest("ARM");
+  assert.equal((await adminAction(order.id, storagePath, body, randomUUID(), new Client())).status, 401);
+  assert.equal((await adminAction(order.id, storagePath, body, randomUUID(), alice)).status, 403);
+  assert.equal((await admin.request(`/api/admin/orders/${order.id}/${storagePath}`, {
+    method: "POST", headers: { "Idempotency-Key": randomUUID() }, body })).status, 403);
+  for (const invalid of [{ ...body, reason: "" }, { ...body, reason: " " }, { ...body, reason: "x".repeat(301) },
+    { ...body, action: "UNKNOWN" }, { reason: body.reason }])
+    assert.equal((await adminAction(order.id, storagePath, invalid)).status, 400);
+  assert.equal((await adminAction(randomUUID(), storagePath, body)).status, 404);
+  assert.equal((await adminAction(order.id, storagePath, storageRequest("RELEASE"))).status, 409);
+  const expired = await newOrder();
+  sql(`UPDATE orders SET created_at=CURRENT_TIMESTAMP-interval '11 minutes',expires_at=CURRENT_TIMESTAMP-interval '1 minute' WHERE id='${expired.id}'`);
+  assert.equal((await adminAction(expired.id, storagePath, body)).status, 409);
+  await alice.pay(order.id); await until(() => orderState(order.id) === "PAID");
+  assert.equal((await adminAction(order.id, storagePath, body)).status, 409);
+  const declined = await newOrder(); await alice.pay(declined.id, randomUUID(), "DECLINE");
+  await until(() => sql(`SELECT status FROM payment_attempts WHERE order_id='${declined.id}'`) === "DECLINED");
+  assert.equal(orderState(declined.id), "PENDING_PAYMENT");
+  assert.equal((await adminAction(declined.id, storagePath, body)).status, 409);
+  const fresh = await newOrder();
+  try {
+    await restart({ MOCK_PG_ENABLED: "false" });
+    assert.equal((await adminAction(fresh.id, storagePath, body)).status, 503);
+  } finally { await restart(); }
+  assert.equal(sql(`SELECT count(*) FROM mock_payment_storage_actions WHERE order_id='${fresh.id}'`), "0");
+});
+
+test("payment storage demo deduplicates two operators and rolls back actions with audit failures", { timeout: 60000 }, async () => {
+  await restart(); const order = await newOrder(), admin2 = await member("admin2"), key = randomUUID();
+  const send1 = await recoveryPoster(order.id, storagePath, storageRequest("ARM"));
+  const send2 = await recoveryPoster(order.id, storagePath, storageRequest("ARM"), admin2);
+  const responses = await Promise.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? send2 : send1)(key)));
+  assert.equal(responses.filter(r => r.status === 201).length, 1);
+  assert.equal(responses.filter(r => r.status === 200).length, 19);
+  const receipts = await Promise.all(responses.map(r => r.json()));
+  assert.equal(new Set(receipts.map(r => r.action.id)).size, 1);
+  assert.equal((await adminAction(order.id, storagePath, { ...storageRequest("ARM"), reason: "changed" }, key)).status, 409);
+  assert.equal((await adminAction(order.id, storagePath, storageRequest("RELEASE"), key)).status, 409);
+  assert.equal((await adminAction(order.id, storagePath, storageRequest("ARM"))).status, 200);
+  const releaseKey = randomUUID();
+  sql(`CREATE FUNCTION reject_storage_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.order_id='${order.id}' AND NEW.source='MOCK_PAYMENT_STORAGE_RELEASE' THEN RAISE EXCEPTION 'audit failure'; END IF;
+    RETURN NEW; END $$; CREATE TRIGGER reject_storage_audit BEFORE INSERT ON order_history
+    FOR EACH ROW EXECUTE FUNCTION reject_storage_audit();`);
+  try {
+    assert.equal((await adminAction(order.id, storagePath, storageRequest("RELEASE"), releaseKey)).status, 500);
+    assert.equal((await recoveryDetail(order.id)).mockPaymentStorageActions.length, 1);
+  } finally { sql("DROP TRIGGER reject_storage_audit ON order_history; DROP FUNCTION reject_storage_audit();"); }
+  try {
+    await restart({ MOCK_PG_ENABLED: "false" });
+    const release1 = await recoveryPoster(order.id, storagePath, storageRequest("RELEASE"));
+    const release2 = await recoveryPoster(order.id, storagePath, storageRequest("RELEASE"), admin2);
+    assert.deepEqual((await Promise.all([release1(releaseKey), release2()])).map(r => r.status).sort(), [200,201]);
+    const detail = await recoveryDetail(order.id), actions = detail.mockPaymentStorageActions;
+    assert.equal(actions.length, 2); assert.equal(orderState(order.id), "PENDING_PAYMENT");
+    for (const action of actions) {
+      const rows = detail.timeline.items.filter(e => e.source === `MOCK_PAYMENT_STORAGE_${action.action}`);
+      assert.equal(rows.length, 1); assert.equal(rows[0].actor, `ADMIN:${action.actor}`); assert.equal(rows[0].reason, action.reason);
+    }
+    sql(`UPDATE mock_payment_storage_actions SET reason='changed' WHERE order_id='${order.id}'`, true, true);
+    sql(`DELETE FROM mock_payment_storage_actions WHERE order_id='${order.id}'`, true, true);
+  } finally { await restart(); }
+  assert.equal((await adminAction(order.id, storagePath, storageRequest("ARM"))).status, 200);
+  assert.equal((await recoveryDetail(order.id)).mockPaymentStorageActions.length, 2);
+});
+
+test("payment storage demo preserves PG approval and inbox through real rollback and restart then automatically recovers", { timeout: 75000 }, async () => {
+  await restart({ WEBHOOK_RETRY_BASE_MS: "1000" }); const order = await storageFaultOrder();
+  try {
+    const response = await alice.pay(order.id, randomUUID(), "APPROVE", { webhookCopies: 3 });
+    assert.equal(response.status, 202); const attempt = await response.json();
+    await until(() => sql(`SELECT count(*) FROM inbound_events WHERE order_id='${order.id}' AND status='RETRY'`) === "1");
+    const id = sql(`SELECT id FROM inbound_events WHERE order_id='${order.id}'`), original = inboundRow(id);
+    await until(() => inboundRow(id).receive_count === 3);
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "0");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "0");
+    assert.equal(sql(`SELECT status FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "APPROVED");
+    const detail = await recoveryDetail(order.id);
+    assert.deepEqual(detail.mockPaymentStoragePayments, [{ paymentId: attempt.id, status: "APPROVED", approvalExecutions: 1 }]);
+    await until(() => Number(sql(`SELECT attempt_count FROM payment_attempts WHERE id='${attempt.id}'`)) >= 2);
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    assert.equal((await alice.pay(order.id)).status, 409);
+    const other = await newOrder(); await alice.pay(other.id);
+    await until(() => orderState(other.id) === "PAID");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+    await restart({ ...inboxOnly, WEBHOOK_WORKER_DELAY_MS: "60000" });
+    const before = inboundRow(id); assert.ok(before.attempt_count >= original.attempt_count);
+    assert.equal(before.body, original.body); assert.equal(before.payload_hash, original.payload_hash);
+    assert.equal((await recoveryDetail(order.id)).mockPaymentStorageActions.length, 1);
+    assert.equal((await adminAction(order.id, storagePath, storageRequest("RELEASE"))).status, 201);
+    assert.deepEqual(inboundRow(id), before);
+    await restart(inboxOnly);
+    await until(() => inboundRow(id).status === "PROCESSED");
+    assert.equal(orderState(order.id), "PAID");
+    assert.equal(inboundRow(id).body, original.body);
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    const stats = await (await pg(`/payments/${attempt.id}/stats`)).json();
+    assert.equal(stats.approvalExecutions, 1); assert.equal(stats.approvalRequests, 1);
+  } finally { await adminAction(order.id, storagePath, storageRequest("RELEASE")); await restart(); }
+});
+
+test("payment storage demo replays the same stored event after six failures with evidence and concurrent operators", { timeout: 75000 }, async () => {
+  await restart(inboxOnly); const order = await storageFaultOrder();
+  try {
+    const { attempt, result, receipt } = await storageWebhook(order);
+    await until(() => inboundRow(receipt.id).status === "REVIEW_REQUIRED");
+    const before = inboundRow(receipt.id); assert.equal(before.attempt_count, 6);
+    const duplicates = await Promise.all(Array.from({ length: 20 }, () => notify(result)));
+    assert.ok(duplicates.every(r => r.status === 200));
+    assert.equal(inboundRow(receipt.id).attempt_count, 6); assert.equal(inboundRow(receipt.id).receive_count, 21);
+    await restart(inboxOnly);
+    assert.equal((await adminAction(order.id, storagePath, storageRequest("RELEASE"))).status, 201);
+    await delay(300); assert.equal(inboundRow(receipt.id).status, "REVIEW_REQUIRED");
+    assert.equal(inboundRow(receipt.id).attempt_count, 6);
+    const noEvidence = await resumeRecovery(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id), { id: randomUUID() });
+    assert.equal(noEvidence.status, 409); assert.equal((await noEvidence.json()).code, "RECOVERY_EVIDENCE_REQUIRED");
+    const evidence = await reconcile(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id));
+    assert.equal(evidence.outcome, "REPLAY_ALLOWED");
+    const body = recoveryRequest(await recoveryTarget(order.id, "INBOUND", receipt.id), { evidenceId: evidence.id });
+    const send1 = await recoveryPoster(order.id, "recoveries", body);
+    const send2 = await recoveryPoster(order.id, "recoveries", body, await member("admin2"));
+    assert.deepEqual((await Promise.all([send1(),send2()])).map(r => r.status).sort(), [202,409]);
+    await until(() => inboundRow(receipt.id).status === "PROCESSED");
+    const after = inboundRow(receipt.id);
+    assert.equal(after.attempt_count, 7); assert.equal(after.execution_round, 2); assert.equal(after.round_attempt_count, 1);
+    assert.equal(after.body, before.body); assert.equal(after.payload_hash, before.payload_hash); assert.equal(after.event_id, before.event_id);
+    assert.equal(orderState(order.id), "PAID");
+    assert.equal(sql(`SELECT count(*) FROM issuance_jobs WHERE order_id='${order.id}'`), "1");
+    assert.equal(sql(`SELECT count(*) FROM payment_events WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal(sql(`SELECT approval_executions FROM mock_pg_payments WHERE payment_id='${attempt.id}'`), "1");
+    assert.equal((await notify(result)).status, 200);
+    assert.equal(inboundRow(receipt.id).attempt_count, 7);
+  } finally { await adminAction(order.id, storagePath, storageRequest("RELEASE")); await restart(); }
+});
+
+test("payment storage demo release never resets the three-round replay limit", { timeout: 75000 }, async () => {
+  await restart(inboxOnly); const order = await storageFaultOrder();
+  try {
+    const { receipt } = await storageWebhook(order);
+    for (let round = 1; round <= 3; round++) {
+      await until(() => inboundRow(receipt.id).status === "REVIEW_REQUIRED");
+      assert.equal(inboundRow(receipt.id).attempt_count, round * 6);
+      if (round < 3) {
+        const evidence = await reconcile(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id));
+        assert.equal((await resumeRecovery(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id), evidence)).status, 202);
+      }
+    }
+    const before = inboundRow(receipt.id);
+    assert.equal((await adminAction(order.id, storagePath, storageRequest("RELEASE"))).status, 201);
+    assert.deepEqual(inboundRow(receipt.id), before);
+    const evidence = await reconcile(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id));
+    const response = await resumeRecovery(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id), evidence);
+    assert.equal(response.status, 409); assert.equal((await response.json()).code, "RECOVERY_ROUND_LIMIT");
+    assert.equal(inboundRow(receipt.id).attempt_count, 18);
+  } finally { await adminAction(order.id, storagePath, storageRequest("RELEASE")); await restart(); }
+});
+
+test("payment storage demo release cannot clear a conflicting webhook or authorize its replay", { timeout: 60000 }, async () => {
+  await restart(inboxOnly); const order = await storageFaultOrder();
+  try {
+    const { result, receipt } = await storageWebhook(order);
+    await until(() => inboundRow(receipt.id).status === "RETRY");
+    assert.equal((await notify({ ...result, amount: result.amount + 1 })).status, 409);
+    assert.equal((await adminAction(order.id, storagePath, storageRequest("RELEASE"))).status, 201);
+    const evidence = await reconcile(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id));
+    assert.equal(evidence.outcome, "BLOCKED");
+    assert.equal((await resumeRecovery(order.id, await recoveryTarget(order.id, "INBOUND", receipt.id), evidence)).status, 409);
+    assert.equal(inboundRow(receipt.id).last_error, "INBOUND_EVENT_CONFLICT");
+    assert.equal(orderState(order.id), "PAYMENT_PROCESSING");
+  } finally { await adminAction(order.id, storagePath, storageRequest("RELEASE")); await restart(); }
+});
+
+const outageReason = { reason: "모의 PG 장애 해제 후 같은 환불번호로 복구 시연" };
+async function outageRefund() {
+  const data = await failedOrder();
+  const refundId = await requestPartial(data, { scenario: "UNAVAILABLE" });
+  await until(() => refundById(refundId).status === "REVIEW_REQUIRED");
+  return { ...data, refundId };
+}
+
+test("mock PG outage release requires admin CSRF reason matching order and an enabled mock provider", { timeout: 60000 }, async () => {
+  await restart();
+  const data = await outageRefund(), path = outagePath(data.refundId), other = await newOrder();
+  assert.equal((await adminAction(data.order.id, path, outageReason, randomUUID(), new Client())).status, 401);
+  assert.equal((await adminAction(data.order.id, path, outageReason, randomUUID(), alice)).status, 403);
+  assert.equal((await admin.request(`/api/admin/orders/${data.order.id}/${path}`, {
+    method: "POST", headers: { "Idempotency-Key": randomUUID() }, body: outageReason })).status, 403);
+  for (const reason of ["", "   ", "x".repeat(301)])
+    assert.equal((await adminAction(data.order.id, path, { reason })).status, 400);
+  assert.equal((await adminAction(other.id, path, outageReason)).status, 404);
+  assert.equal((await adminAction(randomUUID(), path, outageReason)).status, 404);
+  assert.equal((await adminAction(data.order.id, outagePath(randomUUID()), outageReason)).status, 404);
+  try {
+    await restart({ MOCK_PG_ENABLED: "false" });
+    assert.equal((await adminAction(data.order.id, path, outageReason)).status, 503);
+    assert.equal((await recoveryDetail(data.order.id)).mockPgEnabled, false);
+  } finally { await restart(); }
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_outage_releases WHERE refund_id='${data.refundId}'`), "0");
+  const normal = await failedOrder(), success = await requestPartial(normal);
+  await until(() => refundById(success).status === "SUCCEEDED");
+  assert.equal((await adminAction(normal.order.id, outagePath(success), outageReason)).status, 409);
+});
+
+test("mock PG outage release deduplicates two operators and resumes the unchanged refund after restart exactly once", { timeout: 60000 }, async () => {
+  await restart();
+  const data = await outageRefund(), before = refundById(data.refundId), path = outagePath(data.refundId);
+  const originalAction = sql(`SELECT row_to_json(a) FROM admin_actions a WHERE refund_id='${data.refundId}'`);
+  const admin2 = await member("admin2"), key = randomUUID();
+  const send1 = await recoveryPoster(data.order.id, path, outageReason), send2 = await recoveryPoster(data.order.id, path, outageReason, admin2);
+  const responses = await Promise.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? send2 : send1)(key)));
+  assert.equal(responses.filter(r => r.status === 201).length, 1);
+  assert.equal(responses.filter(r => r.status === 200).length, 19);
+  const receipts = await Promise.all(responses.map(r => r.json()));
+  assert.equal(new Set(receipts.map(r => r.release.id)).size, 1);
+  const release = receipts[0].release;
+  assert.ok(["admin", "admin2"].includes(release.actor));
+  assert.deepEqual(refundById(data.refundId), before);
+  assert.equal((await adminAction(data.order.id, path, { reason: "다른 사유" }, key)).status, 409);
+  assert.equal((await adminAction(data.order.id, path, outageReason)).status, 200);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`), "0");
+  await restart();
+  let detail = await recoveryDetail(data.order.id);
+  assert.deepEqual(detail.mockPgOutageReleases, [release]);
+  assert.equal(detail.refundBalance.reserved, data.order.amount);
+  const evidence = await reconcile(data.order.id, await recoveryTarget(data.order.id, "REFUND", data.refundId));
+  assert.equal(evidence.outcome, "RESUME_ALLOWED");
+  const body = recoveryRequest(await recoveryTarget(data.order.id, "REFUND", data.refundId), { evidenceId: evidence.id });
+  const resume1 = await recoveryPoster(data.order.id, "recoveries", body), resume2 = await recoveryPoster(data.order.id, "recoveries", body, admin2);
+  assert.deepEqual((await Promise.all([resume1(), resume2()])).map(r => r.status).sort(), [202,409]);
+  await until(() => refundById(data.refundId).status === "SUCCEEDED");
+  const after = refundById(data.refundId);
+  assert.equal(after.id, before.id); assert.equal(after.scenario, "UNAVAILABLE"); assert.equal(after.amount, before.amount);
+  assert.equal(after.attempt_count, 4); assert.equal(after.execution_round, 2);
+  assert.equal(sql(`SELECT row_to_json(a) FROM admin_actions a WHERE refund_id='${data.refundId}'`), originalAction);
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`), "1");
+  assert.equal(sql(`SELECT scenario FROM mock_pg_cancellations WHERE idempotency_key='${data.refundId}'`), "UNAVAILABLE");
+  assert.equal((await pg(`/payments/${data.attempt.id}/cancel`, { amount: before.amount, scenario: "UNAVAILABLE" }, data.refundId)).status, 200);
+  assert.equal((await pg(`/payments/${data.attempt.id}/cancel`, { amount: before.amount, scenario: "SUCCESS" }, data.refundId)).status, 409);
+  assert.equal((await adminAction(data.order.id, path, outageReason, key)).status, 200);
+  detail = await recoveryDetail(data.order.id);
+  const history = detail.timeline.items.filter(e => e.source === "MOCK_PG_OUTAGE_RELEASE");
+  assert.equal(history.length, 1); assert.equal(history[0].actor, `ADMIN:${release.actor}`);
+  assert.equal(history[0].reason, outageReason.reason); assert.equal(history[0].targetId, data.refundId);
+});
+
+test("mock PG outage release is scoped to one refund even when another refund shares the payment", { timeout: 60000 }, async () => {
+  await restart(); const data = await failedOrder();
+  const first = await requestPartial(data, { amount: 6000, scenario: "UNAVAILABLE" });
+  const second = await requestPartial(data, { amount: 6000, scenario: "UNAVAILABLE" });
+  await until(() => [first,second].every(id => refundById(id).status === "REVIEW_REQUIRED"));
+  const send1 = await recoveryPoster(data.order.id, outagePath(first), outageReason);
+  const send2 = await recoveryPoster(data.order.id, outagePath(first), outageReason, await member("admin2"));
+  assert.deepEqual((await Promise.all([send1(),send2()])).map(r => r.status).sort(), [200,201]);
+  const storedKey = sql(`SELECT idempotency_key FROM mock_pg_outage_releases WHERE refund_id='${first}'`);
+  assert.equal((await adminAction(data.order.id, outagePath(second), outageReason, storedKey)).status, 409);
+  const evidence = await reconcile(data.order.id, await recoveryTarget(data.order.id, "REFUND", first));
+  assert.equal((await resumeRecovery(data.order.id, await recoveryTarget(data.order.id, "REFUND", first), evidence)).status, 202);
+  await until(() => refundById(first).status === "SUCCEEDED");
+  assert.equal((await pg(`/payments/${data.attempt.id}/cancel`, { amount: 6000, scenario: "UNAVAILABLE" }, second)).status, 503);
+  assert.equal(refundById(second).status, "REVIEW_REQUIRED"); assert.equal(refundById(second).attempt_count, 3);
+  const detail = await recoveryDetail(data.order.id);
+  assert.equal(detail.refundBalance.confirmed, 6000); assert.equal(detail.refundBalance.reserved, 6000);
+  assert.equal(detail.mockPgOutageReleases.length, 1);
+});
+
+test("mock PG outage release rolls back with audit failure and preserves the successful record across restart", { timeout: 60000 }, async () => {
+  await restart(); const data = await outageRefund(), before = refundById(data.refundId), key = randomUUID();
+  sql(`CREATE FUNCTION reject_outage_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.source='MOCK_PG_OUTAGE_RELEASE' THEN RAISE EXCEPTION 'simulated audit failure'; END IF; RETURN NEW; END $$;
+    CREATE TRIGGER reject_outage_audit BEFORE INSERT ON order_history FOR EACH ROW EXECUTE FUNCTION reject_outage_audit();`);
+  try {
+    assert.equal((await adminAction(data.order.id, outagePath(data.refundId), outageReason, key)).status, 500);
+    assert.equal(sql(`SELECT count(*) FROM mock_pg_outage_releases WHERE refund_id='${data.refundId}'`), "0");
+    assert.deepEqual(refundById(data.refundId), before);
+    assert.equal((await pg(`/payments/${data.attempt.id}/cancel`, { amount: before.amount, scenario: "UNAVAILABLE" }, data.refundId)).status, 503);
+  } finally { sql("DROP TRIGGER reject_outage_audit ON order_history; DROP FUNCTION reject_outage_audit();"); }
+  const accepted = await adminAction(data.order.id, outagePath(data.refundId), outageReason, key);
+  assert.equal(accepted.status, 201); const receipt = await accepted.json();
+  await restart();
+  const replay = await adminAction(data.order.id, outagePath(data.refundId), outageReason, key);
+  assert.equal(replay.status, 200); assert.deepEqual((await replay.json()).release, receipt.release);
+  sql(`UPDATE mock_pg_outage_releases SET reason='changed' WHERE refund_id='${data.refundId}'`, true, true);
+  sql(`DELETE FROM mock_pg_outage_releases WHERE refund_id='${data.refundId}'`, true, true);
+  assert.equal(sql(`SELECT count(*) FROM order_history WHERE target_id='${data.refundId}' AND source='MOCK_PG_OUTAGE_RELEASE'`), "1");
+});
+
+test("mock PG outage release cannot reset exhausted recovery rounds or authorize resume without evidence", { timeout: 75000 }, async () => {
+  await restart(); const data = await outageRefund();
+  for (let round = 1; round < 3; round++) {
+    const evidence = await reconcile(data.order.id, await recoveryTarget(data.order.id, "REFUND", data.refundId));
+    assert.equal((await resumeRecovery(data.order.id, await recoveryTarget(data.order.id, "REFUND", data.refundId), evidence)).status, 202);
+    await until(() => refundById(data.refundId).status === "REVIEW_REQUIRED");
+  }
+  const before = refundById(data.refundId); assert.equal(before.attempt_count, 9);
+  assert.equal((await adminAction(data.order.id, outagePath(data.refundId), outageReason)).status, 201);
+  assert.deepEqual(refundById(data.refundId), before);
+  const evidence = await reconcile(data.order.id, await recoveryTarget(data.order.id, "REFUND", data.refundId));
+  const resume = await resumeRecovery(data.order.id, await recoveryTarget(data.order.id, "REFUND", data.refundId), evidence);
+  assert.equal(resume.status, 409); assert.equal((await resume.json()).code, "RECOVERY_ROUND_LIMIT");
+  assert.equal(sql(`SELECT count(*) FROM mock_pg_cancellations WHERE payment_id='${data.attempt.id}'`), "0");
+  const fresh = await outageRefund();
+  assert.equal((await adminAction(fresh.order.id, outagePath(fresh.refundId), outageReason)).status, 201);
+  const target = await recoveryTarget(fresh.order.id, "REFUND", fresh.refundId);
+  const noEvidence = await resumeRecovery(fresh.order.id, target, { id: randomUUID() });
+  assert.equal(noEvidence.status, 409); assert.equal((await noEvidence.json()).code, "RECOVERY_EVIDENCE_REQUIRED");
 });

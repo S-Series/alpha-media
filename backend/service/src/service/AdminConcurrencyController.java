@@ -1,10 +1,13 @@
 package service;
 
 import java.util.UUID;
+import java.math.BigDecimal;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
@@ -37,5 +40,7 @@ public class AdminConcurrencyController {
         return ResponseEntity.ok().header("Cache-Control","no-store").body(value);
     }
     public record Request(@NotNull UUID issuanceId,@NotNull AdminConcurrencyService.Mode mode,
-            @NotNull AdminConcurrencyService.KeyMode keyMode,@NotBlank @Size(max=300) String reason) {}
+            @NotNull AdminConcurrencyService.KeyMode keyMode,@NotBlank @Size(max=300) String reason,
+            @DecimalMin("1") @Digits(integer=18,fraction=0) BigDecimal firstAmount,
+            @DecimalMin("1") @Digits(integer=18,fraction=0) BigDecimal secondAmount) {}
 }

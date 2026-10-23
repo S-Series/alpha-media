@@ -30,10 +30,14 @@ public class AdminOrderController {
     private final RecoveryTargets recoveryTargets;
     private final RefundBalance balance;
     private final RefundProtection protection;
+    private final MockPgOutageService mockPgOutages;
+    private final MockPaymentStorageService mockPaymentStorage;
 
     public AdminOrderController(OrderRepository orders, PaymentRepository payments, IssuanceService issuances,
             RefundRepository refunds,AdminActionRepository actions,OrderConflicts conflicts,InboundEventRepository inboundEvents,
-            RecoveryRepository recoveryActions,RecoveryTargets recoveryTargets,RefundBalance balance,RefundProtection protection) {
+            RecoveryRepository recoveryActions,RecoveryTargets recoveryTargets,RefundBalance balance,RefundProtection protection,MockPgOutageService mockPgOutages,MockPaymentStorageService mockPaymentStorage) {
+        this.mockPaymentStorage=mockPaymentStorage;
+        this.mockPgOutages=mockPgOutages;
         this.balance=balance; this.protection=protection; this.orders = orders; this.payments = payments; this.issuances = issuances; this.refunds=refunds; this.actions=actions; this.conflicts=conflicts;
         this.inboundEvents=inboundEvents;
         this.recoveryActions=recoveryActions; this.recoveryTargets=recoveryTargets;
@@ -69,7 +73,7 @@ public class AdminOrderController {
                 () -> new OrderService.OrderException(404, "ORDER_NOT_FOUND", "주문을 찾을 수 없습니다."));
         return ResponseEntity.ok().header("Cache-Control", "no-store").body(new Detail(order, payments.list(orderId), issuances.forOrder(orderId),
             refunds.find(orderId).orElse(null),actions.list(orderId),actions.events(orderId),timeline(orderId,null,50),Instant.now(),conflicts.list(orderId),inboundEvents.forOrder(orderId),
-            recoveryTargets.list(orderId),recoveryActions.list(orderId),refunds.list(orderId),balance.summary(orderId),protection.list(orderId)));
+            recoveryTargets.list(orderId),recoveryActions.list(orderId),refunds.list(orderId),balance.summary(orderId),protection.list(orderId),mockPgOutages.enabled(),mockPgOutages.list(orderId),mockPaymentStorage.list(orderId),mockPaymentStorage.payments(orderId)));
     }
 
     @GetMapping("/{orderId}/history")
@@ -88,5 +92,7 @@ public class AdminOrderController {
     public record Detail(OrderRepository.AdminOrder order, List<PaymentAttempt> payments, IssuanceService.View issuance,
         Refund refund,List<AdminActionRepository.Action> actions,List<AdminActionRepository.Event> actionEvents,HistoryPage timeline,Instant checkedAt,
         List<OrderConflicts.Conflict> conflicts,List<InboundEventRepository.View> inboundEvents,
-        List<RecoveryTargets.View> recoveryTargets,List<RecoveryRepository.Action> recoveryActions,List<Refund> refunds,RefundBalance.Summary refundBalance,List<RefundProtection.Job> protectionJobs) {}
+        List<RecoveryTargets.View> recoveryTargets,List<RecoveryRepository.Action> recoveryActions,List<Refund> refunds,RefundBalance.Summary refundBalance,List<RefundProtection.Job> protectionJobs,
+        boolean mockPgEnabled,List<MockPgOutageService.Release> mockPgOutageReleases,List<MockPaymentStorageService.Action> mockPaymentStorageActions,
+        List<MockPaymentStorageService.PgPayment> mockPaymentStoragePayments) {}
 }

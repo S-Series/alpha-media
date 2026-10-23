@@ -14,7 +14,7 @@ import service.OrderService.OrderException;
         PgWebhookController.class, MockPgController.class, AdminOrderController.class, IssuanceController.class,
         SupplierWebhookController.class, MockSupplierController.class, AdminActionController.class,
         MockProfileController.class,ProfileTrackingController.class,AdminConcurrencyController.class,ScenarioController.class,RecoveryController.class,
-        MockLedgerController.class,ReconciliationController.class })
+        MockLedgerController.class,ReconciliationController.class,MockPgOutageController.class,MockPaymentStorageController.class,MockReconciliationController.class })
 public class OrderExceptionHandler {
 
     @ExceptionHandler(OrderException.class)
